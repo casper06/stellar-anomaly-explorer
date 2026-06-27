@@ -15,6 +15,15 @@ npm run dev    # localhost:3000
 npm run build  # production build
 ```
 
+## Branch workflow
+- **`dev`** is the working branch — all day-to-day commits land here.
+- **`main`** holds the latest stable snapshot only.
+- Merge `dev` → `main` when the working state is verified stable
+  (typecheck clean, app boots, the feature being shipped actually works
+  in the browser). Don't fast-forward unverified work into `main`.
+- Don't commit directly to `main`. If a fix is urgent enough to go
+  straight there, branch off `main`, fix, merge back, then sync `dev`.
+
 ## File architecture
 ```
 src/
@@ -93,8 +102,7 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 - (none currently tracked)
 
 ### Next features 🚀
-- Depth feel: stars slightly larger when zoomed in
-- More Kepler/K2/TESS anomaly seeds beyond the current 5
+- More Kepler/K2/TESS anomaly seeds beyond the current 11
 
 ## Real-data integration
 
@@ -207,24 +215,54 @@ animation is gone since the chart no longer renders inline.
   replaced with `null` before any drawing or range calculation. The draw
   loop treats nulls as pen-up so the line skips outliers cleanly rather
   than spiking to NaN.
-- **Y range**: percentile-based, NOT min/max. We take p5 and p95 of the
-  non-null flux samples, add 20% padding, then HARD CAP the result to
-  `median ± 0.15`. This guarantees the chart never gets squashed by
-  surviving sub-threshold outliers (the failure mode that made KIC
-  6543674 look like a solid filled blob).
+- **Y range**: percentile-based, NOT min/max. We take p2 and p98 of the
+  non-null flux samples and add 10% padding. NO hard cap. The earlier
+  `median ± 0.15` cap defended against outliers that slipped past the
+  >1.05/<0.5 filter, but it also clipped legitimate stellar variability
+  on intrinsic variables. With ~60k samples, the p2/p98 cushion already
+  excludes >1200 samples on each side — way more than the handful of
+  cosmic-ray hits that survive the outlier filter — so real variations
+  show through faithfully.
 - **Stroke-only**: the line uses `ctx.stroke()` exclusively; there is no
   fill under the curve. The canvas is also `ctx.clip()`-ed to the plot
   rect so partial segments at the edges (when zoomed in) don't bleed
   into the axis padding.
+- **Time axis units**: raw BKJD (Barycentric Kepler Julian Date), 6
+  evenly-spaced ticks across the visible window. We tried calendar-date
+  ticks ("Jan 2010", "Jun 2011") but reverted — it caused rendering
+  glitches and the BKJD numbers are what the dip detector and tooltips
+  use anyway, so keeping the axis in BKJD makes the whole UI
+  internally consistent.
+- **Dip label collision**: when multiple dip markers cluster (e.g.
+  periodic dips on KIC 11610797), only the highest-scoring dip in any
+  40-px x-window gets a text label. All dots still draw — only the
+  text is suppressed. Implemented as two passes: build visible-dips
+  list, sort copy by score desc, walk picking labels that don't
+  collide with already-picked labels.
 
 ### Interactive LightCurve mode
 `<LightCurve interactive />` (used in the fullscreen overlay) adds:
 - **Wheel zoom** on the X axis, centered on the cursor. Min window =
   0.1% of full range. Implemented via a native `wheel` listener with
   `{ passive: false }` because React's synthetic `onWheel` is passive in
-  modern browsers and `preventDefault` becomes a no-op there.
+  modern browsers and `preventDefault` becomes a no-op there. We
+  ALWAYS preventDefault — no Ctrl-key gate — so the user can zoom
+  freely without holding modifiers. `LightCurveFullscreen` also sets
+  `document.body.style.overflow = 'hidden'` while mounted and restores
+  the previous value on unmount, so even wheel events outside the
+  canvas (e.g. on the legend) can't scroll the page underneath.
 - **Drag-to-pan**: pointer down + move pans the X window in time-space.
   Uses pointer capture so a drag that exits the canvas still tracks.
+  Movement below ~5 px is NOT treated as a drag, so a small wiggle
+  during a click doesn't pan the chart.
+- **Click on a dip marker**: pin the dip and zoom to it. Hit-test
+  radius is ~12 CSS px around each marker center. A successful hit
+  pins the dip (sticky tooltip with label, score, depth, duration,
+  peak time, and provenance line), centers the view on `dip.peakTime`
+  with a window width of `max(dip.duration * 8, fullSpan * 0.02)` so
+  even short dips show context. Clicking empty chart space dismisses
+  the pinned dip. The hover tooltip is suppressed while a dip is
+  pinned to avoid two tooltips fighting for the user's attention.
 - **Double-click**: resets to full data range.
 - **Minimap strip** below the main chart: a downsampled rendering of
   the full curve with a translucent cyan rectangle highlighting the
@@ -237,26 +275,53 @@ animation is gone since the chart no longer renders inline.
 When `interactive` is on, the built-in legend is suppressed because the
 fullscreen overlay renders its own larger legend below the chart.
 
-### Performance: adaptive downsampling + rAF debounce
-Real Kepler curves are ~60,000 samples. Stroking that many `lineTo`
-calls into a 1500-pixel-wide canvas every wheel tick (a) tanks frame
-rate and (b) visually piles the line into a solid-looking band because
-every horizontal pixel gets multiple antialiased strokes. Two
-mitigations:
+The `provenance` prop is optional but should be passed alongside
+`interactive` (`LightCurveFullscreen` forwards `lightcurve.provenance`)
+so the pinned-dip tooltip can show the source/mission/dataType line.
 
-1. **Adaptive stride** in the main draw loop based on the visible zoom
-   fraction `zoomFrac = viewSpan / fullSpan`:
-   - `zoomFrac <= 0.1` (zoomed in past 10%) → stride 1, full resolution.
-   - `zoomFrac > 0.1` → `stride = floor(times.length * zoomFrac / 2000)`
-     so the rendered point count caps at ~2000 regardless of how far
-     zoomed out.
-2. **rAF-debounced redraw**: the view-change effect schedules the draw
-   via `requestAnimationFrame` and cancels any pending callback when
-   the view changes again. A burst of wheel events collapses to one
-   paint per frame.
+### Performance: LTTB downsampling + rAF debounce
+Real Kepler curves are ~60,000 samples. Stroking one `lineTo` per
+sample into a ~1400-pixel-wide canvas tanks frame rate during wheel
+zoom and (depending on how the algorithm groups points) can produce
+visual fill artifacts.
 
-The minimap uses its own simple stride (`floor(times.length / W)`) since
-it always shows the full range.
+We use **LTTB** (Largest Triangle Three Buckets, Steinarsson 2013) —
+the standard time-series downsampling algorithm used by Grafana,
+Plotly, and similar tools. It reduces N points to ~`LTTB_TARGET_POINTS`
+(2000) by picking, in each bucket, the point that forms the largest
+triangle with the previous selected point and the average of the next
+bucket. Preserves visual peaks (so dips stay visible) and produces a
+clean line — no fill artifact, deterministic, O(N).
+
+We previously tried min/max-per-column envelope rendering and a
+heuristic oscillation fallback (toggling envelope vs per-column
+average based on column-range stats). Both produced fill artifacts in
+practice — envelope stacks vertical strokes per column, and the
+average heuristic was hard to tune. LTTB replaces both.
+
+**Segmentation**: LTTB assumes a continuous series. The visible
+window is split into contiguous segments at every null (outlier)
+sample and at every `> GAP_DAYS` time jump. Each segment runs LTTB
+independently with its proportional share of the 2000-point budget,
+and is stroked as its own sub-path (`moveTo` at the start, `lineTo`
+for the rest). No connection across segment breaks → quarter gaps
+render as empty canvas, astronomically correct.
+
+**Fast path**: when a segment has few enough samples (≤ plotW/2) LTTB
+has nothing to gain and we just stroke every sample directly.
+
+**Quarter-gap detection**: `GAP_DAYS = 5`. Kepler quarters have 1–4
+day inter-quarter gaps (data downlink + reorientation); intra-quarter
+cadence is ~30 minutes. The 5-day threshold cleanly separates real
+observation windows. Both the main chart and the minimap respect this.
+
+**Minimap** uses the same LTTB+segmentation, targeting `W * 2` total
+output points across the strip width.
+
+**rAF-debounced redraw**: the view-change effect schedules the draw
+via `requestAnimationFrame` and cancels any pending callback when the
+view changes again. A burst of wheel events collapses to one paint
+per frame.
 
 ### Fullscreen overlay layout invariants
 `<LightCurveFullscreen />` must obey these to keep the legend visible:
@@ -308,6 +373,24 @@ When source is `'unavailable'`:
 - Zoom is implemented via `camera.fov` (range 20°–75°), not by translating the camera
 - Fly-to: convert target RA/Dec to a unit vector D, place camera at `-D * CAMERA_RADIUS`, lookAt origin (so the user sees `+D`)
 
+### Depth feel on zoom
+Point sizes scale with FOV to fake "getting closer to the stars" — at
+FOV 75° points render at their base size, at FOV 20° they're scaled up
+linearly. Implemented via `depthScale(fov, maxScale)` helper, applied
+each frame in `useFrame`:
+- Catalog star points: base 3 px, max scale **2.5×**.
+- Anomaly rings (outer/mid/core): max scale **3.0×**, multiplied INTO
+  the existing pulse animation so the pulse stays visible but at a
+  larger amplitude when zoomed in.
+
+This is per-frame scalar mutation of `pointsMaterial.size`, not a
+per-vertex buffer rebuild, so it costs ~nothing. Note: the default
+`pointsMaterial` shader ignores the per-vertex `attributes-size` buffer
+in `StarPoints` — that buffer is dead code; only `material.size`
+controls rendered size. A future improvement would be a custom shader
+that honors the per-vertex sizes so brighter stars actually render
+bigger; until then, all catalog stars render at the same scaled size.
+
 ### Real B-V colors
 ```
 B-V < 0      → bright blue   #a0c4ff  (young, very hot stars)
@@ -336,13 +419,21 @@ const StarField = dynamic(() => import('@/components/StarField'), { ssr: false }
 ```
 
 ## Known anomalies (seed data)
-| ID | Name | RA | Dec | Score |
-|---|---|---|---|---|
-| KIC8462852 | Tabby's Star | 301.5642 | 44.4567 | 0.94 |
-| KIC6543674 | KIC 6543674 | 291.12 | 41.88 | 0.67 |
-| KIC4150804 | KIC 4150804 | 288.55 | 39.42 | 0.72 |
-| KIC11610797 | KIC 11610797 | 298.77 | 49.21 | 0.61 |
-| EPIC201637175 | EPIC 201637175 | 174.32 | -4.67 | 0.58 |
+Source of truth: `KNOWN_ANOMALIES` in `src/lib/starCatalog.ts`. Keep this table in sync when adding seeds.
+
+| ID | Name | RA | Dec | Mag | B-V | Score | Notes |
+|---|---|---|---|---|---|---|---|
+| KIC8462852 | Tabby's Star | 301.5642 | 44.4567 | 11.7 | 0.64 | 0.94 | Famous irregular dips (Boyajian's Star) |
+| KIC6543674 | KIC 6543674 | 291.12 | 41.88 | 12.3 | 0.71 | 0.67 |  |
+| KIC4150804 | KIC 4150804 | 288.55 | 39.42 | 13.1 | 0.58 | 0.72 |  |
+| KIC11610797 | KIC 11610797 | 298.77 | 49.21 | 12.8 | 0.81 | 0.61 |  |
+| EPIC201637175 | EPIC 201637175 | 174.32 | -4.67 | 12.1 | 0.55 | 0.58 |  |
+| KIC11852982 | KIC 11852982 | 294.87 | 47.48 | 12.4 | 0.71 | 0.63 |  |
+| KIC3542116 | KIC 3542116 | 284.22 | 38.71 | 13.1 | 0.58 | 0.61 |  |
+| KIC8548587 | KIC 8548587 | 296.34 | 44.82 | 11.9 | 0.82 | 0.59 |  |
+| KIC5955033 | KIC 5955033 | 290.11 | 41.23 | 12.7 | 0.65 | 0.57 |  |
+| KIC12557548 | KIC 12557548 | 295.54 | 51.09 | 15.7 | 0.95 | 0.71 | Disintegrating-planet candidate |
+| KIC10195478 | KIC 10195478 | 291.78 | 47.35 | 13.2 | 0.73 | 0.58 |  |
 
 ## Citizen-science report links
 The AnomalyPanel offers these external links (open in new tab):

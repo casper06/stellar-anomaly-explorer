@@ -321,6 +321,7 @@ function LightCurveFullscreen({
   times,
   flux,
   dips,
+  provenance,
   onClose,
 }: {
   starName: string
@@ -328,6 +329,7 @@ function LightCurveFullscreen({
   times: number[]
   flux: number[]
   dips: Anomaly[]
+  provenance?: LightcurveProvenance
   onClose: () => void
 }) {
   useEffect(() => {
@@ -337,6 +339,18 @@ function LightCurveFullscreen({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
+
+  // Lock body scroll while the overlay is open so wheel-zoom on the chart
+  // doesn't accidentally scroll the page underneath. The chart's own
+  // non-passive wheel listener calls preventDefault, but a stray scroll
+  // outside the canvas (e.g. on the legend) would still bubble up; this
+  // is the belt-and-suspenders fix. We preserve and restore whatever
+  // `body.style.overflow` was before mount so nested overlays compose.
+  useEffect(() => {
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => { document.body.style.overflow = prev }
+  }, [])
 
   // Chart pixel buffer for rasterization. CSS sizing fills the flex
   // container; this number only controls how crisp the line looks when
@@ -439,6 +453,7 @@ function LightCurveFullscreen({
             height={canvasH}
             interactive
             fillContainer
+            provenance={provenance}
           />
         </div>
 
@@ -895,6 +910,7 @@ export default function AnomalyPanel() {
         times={lightcurve.times}
         flux={lightcurve.flux}
         dips={lightcurve.dips}
+        provenance={lightcurve.provenance}
         onClose={() => setShowLightcurve(false)}
       />
     )}

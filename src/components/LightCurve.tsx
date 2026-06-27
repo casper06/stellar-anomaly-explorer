@@ -1,12 +1,98 @@
 'use client'
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
-import { Anomaly } from '@/lib/store'
+import { Anomaly, type LightcurveProvenance } from '@/lib/store'
 
 const LABEL_COLOR: Record<string, string> = {
   WOW: '#ff4d6d',
   INTERESTING: '#f4a261',
   NOTABLE: '#4cc9f0',
   NORMAL: 'rgba(255,255,255,0.3)',
+}
+
+/**
+ * @description Time gap (in days) above which two consecutive samples are
+ * treated as belonging to different observation runs — the line lifts
+ * the pen rather than drawing a diagonal stroke across the gap. Kepler
+ * intra-quarter cadence is ~30 minutes; inter-quarter gaps are 1–4
+ * days; longer gaps (data outages, safe-mode events) also qualify. 5
+ * days cleanly separates real observation windows from cadence noise.
+ */
+const GAP_DAYS = 5
+
+/**
+ * @description Target output point count when LTTB-downsampling the visible
+ * window. Standard recommendation is ~2× the canvas width in pixels;
+ * 2000 reads well on both the inline 460-px chart and the fullscreen
+ * ~1400-px one.
+ */
+const LTTB_TARGET_POINTS = 2000
+
+/**
+ * @description Largest-Triangle-Three-Buckets downsampling (Steinarsson 2013).
+ * Reduces a series of (x, y) points to roughly `threshold` points while
+ * preserving the visual shape — picks the point in each bucket that
+ * forms the largest triangle with the previous selected point and the
+ * average of the next bucket. Standard algorithm for time-series viz
+ * (used by Grafana, Plotly, etc); doesn't produce the per-column fill
+ * artifact that min/max envelope rendering does.
+ *
+ * Expects a single contiguous segment — callers handle splitting around
+ * nulls and quarter gaps so each segment renders as its own sub-path.
+ * @param xs x coordinates of the source samples (must be monotonic).
+ * @param ys y coordinates of the source samples (same length as xs).
+ * @param threshold Target output count (returns input unchanged if <= 2 or >= xs.length).
+ * @returns Indices into the source arrays of the selected samples.
+ */
+function lttbIndices(xs: number[], ys: number[], threshold: number): number[] {
+  const n = xs.length
+  if (threshold >= n || threshold <= 2) {
+    const all = new Array<number>(n)
+    for (let i = 0; i < n; i++) all[i] = i
+    return all
+  }
+  const out: number[] = new Array(threshold)
+  let outIdx = 0
+  const bucketSize = (n - 2) / (threshold - 2)
+  let aIdx = 0
+  out[outIdx++] = 0
+
+  for (let i = 0; i < threshold - 2; i++) {
+    // Average x/y of the NEXT bucket — used as the third triangle vertex.
+    const nbStart = Math.floor((i + 1) * bucketSize) + 1
+    const nbEnd = Math.min(n, Math.floor((i + 2) * bucketSize) + 1)
+    let avgX = 0
+    let avgY = 0
+    const nbLen = nbEnd - nbStart
+    if (nbLen > 0) {
+      for (let j = nbStart; j < nbEnd; j++) {
+        avgX += xs[j]
+        avgY += ys[j]
+      }
+      avgX /= nbLen
+      avgY /= nbLen
+    } else {
+      avgX = xs[n - 1]
+      avgY = ys[n - 1]
+    }
+
+    // Pick the point in the CURRENT bucket that forms the largest triangle
+    // with (aIdx, avg).
+    const bStart = Math.floor(i * bucketSize) + 1
+    const bEnd = Math.min(n, Math.floor((i + 1) * bucketSize) + 1)
+    const ax = xs[aIdx]
+    const ay = ys[aIdx]
+    let maxArea = -1
+    let pickedIdx = bStart
+    for (let j = bStart; j < bEnd; j++) {
+      // Triangle area = 0.5 * | (ax - avgX)(ys[j] - ay) - (ax - xs[j])(avgY - ay) |
+      const area = Math.abs((ax - avgX) * (ys[j] - ay) - (ax - xs[j]) * (avgY - ay))
+      if (area > maxArea) { maxArea = area; pickedIdx = j }
+    }
+    out[outIdx++] = pickedIdx
+    aIdx = pickedIdx
+  }
+  out[outIdx++] = n - 1
+  return out
 }
 
 interface Props {
@@ -37,6 +123,13 @@ interface Props {
    * Minimap + hint remain at their fixed sizes anchored to the bottom.
    */
   fillContainer?: boolean
+  /**
+   * Provenance shown in the pinned tooltip when a dip marker is clicked
+   * (interactive mode only). Optional because the inline panel chart
+   * doesn't surface a pinned tooltip — the panel already lists dips
+   * with their own provenance line beside the chart.
+   */
+  provenance?: LightcurveProvenance
 }
 
 interface Tooltip {
@@ -55,12 +148,17 @@ interface Tooltip {
  * @param dips Detected dips to shade and mark.
  * @returns Canvas + tooltip overlay + color legend.
  */
-export default function LightCurve({ times, flux, dips, width = 460, height = 200, interactive = false, fillContainer = false }: Props) {
+export default function LightCurve({ times, flux, dips, width = 460, height = 200, interactive = false, fillContainer = false, provenance }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const minimapRef = useRef<HTMLCanvasElement>(null)
   const animRef = useRef<number>(0)
   const progressRef = useRef(0)
   const [tooltip, setTooltip] = useState<Tooltip | null>(null)
+  // Sticky tooltip pinned by clicking a dip marker. Independent of the
+  // hover tooltip so panning/moving doesn't blow it away.
+  const [pinnedDip, setPinnedDip] = useState<Anomaly | null>(null)
+  // Reset pinned tooltip whenever the dataset changes (new star selected).
+  useEffect(() => { setPinnedDip(null) }, [times, flux])
 
   // Time window currently visible on the X axis. Defaults to the full data
   // range. Wheel/drag mutate this; double-click resets to full.
@@ -95,25 +193,23 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
     [flux],
   )
 
-  // Percentile-based Y range. Min/max is fragile on raw Kepler PDC data:
-  // even after dropping >1.05 / <0.5 outliers, a handful of survivors at
-  // ~1.04 or ~0.55 still squash the legitimate ±1% flux band into a
-  // hairline. Take p5/p95 with 20% padding for breathing room, then HARD
-  // CAP the half-window to ±0.15 around the median so the visible range
-  // can never exceed 0.30 regardless of how weird the data is. A normal
-  // star has p5/p95 much tighter than ±0.15, so the cap is dormant.
+  // Percentile-based Y range using p2/p98. The previous version capped
+  // the range to median ± 0.15 to defend against cosmic-ray survivors,
+  // but that also clipped legitimate stellar variability on intrinsic
+  // variables. With p2/p98 we exclude the top/bottom 2% — out of ~60k
+  // samples that's >1200 samples on each side, more than enough cushion
+  // for the few cosmic rays that pass the outlier filter. Real
+  // variations are never clipped.
   const fluxRange = useMemo(() => {
     const finite = cleanedFlux.filter((f): f is number => f != null)
     if (finite.length === 0) return { minF: 0.95, maxF: 1.05, median: 1.0 }
     const sorted = [...finite].sort((a, b) => a - b)
     const pick = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]
-    const p5 = pick(0.05)
-    const p95 = pick(0.95)
+    const p2 = pick(0.02)
+    const p98 = pick(0.98)
     const median = pick(0.5)
-    const pad = (p95 - p5) * 0.20
-    const lo = Math.max(p5 - pad, median - 0.15)
-    const hi = Math.min(p95 + pad, median + 0.15)
-    return { minF: lo, maxF: hi, median }
+    const pad = (p98 - p2) * 0.10
+    return { minF: p2 - pad, maxF: p98 + pad, median }
   }, [cleanedFlux])
 
   const getCanvasCoords = useCallback(
@@ -240,45 +336,83 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       ctx.shadowColor = '#4cc9f0'
       ctx.shadowBlur = 4
 
-      // Adaptive downsampling: at full zoom-out, render at most ~2000
-      // points (stroking 60k points into 1500 horizontal pixels makes the
-      // line look like a solid filled band AND tanks the wheel-zoom frame
-      // rate). When zoomed in below 10% of the total range we render at
-      // full resolution since each sample then occupies more than one
-      // pixel and detail matters. Between 10% and 100% the stride scales
-      // linearly so the perceived density stays roughly constant.
+      // LTTB downsampling per contiguous segment.
+      //
+      // Splitting strategy: walk the visible window once, collecting
+      // contiguous segments — break wherever a sample is null (outlier)
+      // OR where two consecutive non-null samples are > GAP_DAYS apart
+      // (Kepler inter-quarter gap). Each segment is then LTTB-reduced
+      // to its proportional share of LTTB_TARGET_POINTS and stroked as
+      // its own sub-path. No connection across breaks → gaps render as
+      // empty canvas, which is astronomically correct.
+      //
+      // When a segment has few enough points (< ~plotW/2 samples) we
+      // skip LTTB and just stroke every sample directly.
       const viewSpan = maxT - minT
-      const fullSpan = fullEnd - fullStart || 1
-      const zoomFrac = viewSpan / fullSpan
-      const MAX_RENDERED = 2000
-      let stride: number
-      if (zoomFrac <= 0.1) {
-        stride = 1
-      } else {
-        // At zoomFrac=1 → stride ≈ N/MAX_RENDERED. At zoomFrac=0.1 → stride 1.
-        const desired = (times.length * zoomFrac) / MAX_RENDERED
-        stride = Math.max(1, Math.floor(desired))
-      }
+      const xMargin = viewSpan * 0.02
+      const winLo = minT - xMargin
+      const winHi = maxT + xMargin
 
-      let penDown = false
-      for (let i = 0; i < revealIdx; i += stride) {
-        const t = times[i]
-        // Skip samples outside the visible time window with a small margin
-        // so partial line segments at the edges still draw correctly.
-        if (t < minT - viewSpan * 0.02 || t > maxT + viewSpan * 0.02) {
-          penDown = false
-          continue
-        }
+      // Locate the first/last in-window indices to bound the loop.
+      let firstIdx = 0
+      while (firstIdx < revealIdx && times[firstIdx] < winLo) firstIdx++
+      let lastIdx = revealIdx - 1
+      while (lastIdx > firstIdx && times[lastIdx] > winHi) lastIdx--
+
+      // Build segments: each segment is a (xs, ys) pair of arrays for
+      // LTTB. We push xs in pixel-x space so the LTTB area calculation
+      // uses the same units the user perceives.
+      const segments: { xs: number[]; ys: number[] }[] = []
+      let curXs: number[] = []
+      let curYs: number[] = []
+      let prevT: number | null = null
+      const startNewSegment = () => {
+        if (curXs.length > 0) segments.push({ xs: curXs, ys: curYs })
+        curXs = []
+        curYs = []
+      }
+      for (let i = firstIdx; i <= lastIdx; i++) {
         const f = cleanedFlux[i]
         if (f == null) {
-          // Outlier or gap → lift the pen; next valid point starts a new sub-path
-          penDown = false
+          startNewSegment()
+          prevT = null
           continue
         }
-        const x = toX(t)
-        const y = toY(f)
-        if (!penDown) { ctx.moveTo(x, y); penDown = true }
-        else ctx.lineTo(x, y)
+        const t = times[i]
+        if (prevT !== null && t - prevT > GAP_DAYS) startNewSegment()
+        curXs.push(toX(t))
+        curYs.push(toY(f))
+        prevT = t
+      }
+      startNewSegment()
+
+      // Allocate the LTTB point budget proportionally to segment size.
+      const totalPoints = segments.reduce((s, seg) => s + seg.xs.length, 0)
+      if (totalPoints > 0) {
+        for (const seg of segments) {
+          const segLen = seg.xs.length
+          if (segLen < 2) continue
+          let segBudget: number
+          if (segLen <= plotW / 2 || totalPoints <= LTTB_TARGET_POINTS) {
+            // Few enough samples that LTTB has nothing to gain — stroke
+            // every point directly.
+            segBudget = segLen
+          } else {
+            segBudget = Math.max(2, Math.round((segLen / totalPoints) * LTTB_TARGET_POINTS))
+          }
+          const picked = segBudget >= segLen
+            ? null // sentinel: draw all
+            : lttbIndices(seg.xs, seg.ys, segBudget)
+          ctx.moveTo(seg.xs[0], seg.ys[0])
+          if (picked === null) {
+            for (let k = 1; k < segLen; k++) ctx.lineTo(seg.xs[k], seg.ys[k])
+          } else {
+            for (let k = 1; k < picked.length; k++) {
+              const idx = picked[k]
+              ctx.lineTo(seg.xs[idx], seg.ys[idx])
+            }
+          }
+        }
       }
       ctx.stroke()
       ctx.shadowBlur = 0
@@ -286,15 +420,42 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
 
       // Dip markers (only after curve has passed them). Skip dips outside
       // the visible time window so the chart doesn't draw off-screen labels.
+      //
+      // Label collision: when many dips cluster within a short time span
+      // (e.g. periodic dips in KIC 11610797), their text labels overlap
+      // into an unreadable pile. We always draw the dot, but suppress the
+      // text label if another HIGHER-scoring dip already has a label
+      // within LABEL_COLLISION_PX of this dip's x position. Sort by
+      // descending score so winners get processed first.
       if (progress > 0.5) {
-        dips.forEach(dip => {
-          if (dip.peakTime < minT || dip.peakTime > maxT) return
+        const LABEL_COLLISION_PX = 40
+        const visible: { dip: Anomaly; x: number; y: number }[] = []
+        for (const dip of dips) {
+          if (dip.peakTime < minT || dip.peakTime > maxT) continue
           const x = toX(dip.peakTime)
           const dipFluxIdx = times.findIndex(t => t >= dip.peakTime)
           const dipFlux = dipFluxIdx >= 0 ? flux[dipFluxIdx] : 0.98
           const y = toY(dipFlux)
+          visible.push({ dip, x, y })
+        }
+        // Sort copy by score desc so the highest-scoring dip in any cluster
+        // wins the label; we keep `visible` for the dot pass so original
+        // chronological order is irrelevant.
+        const ranked = [...visible].sort((a, b) => b.dip.score - a.dip.score)
+        const labeledXs: number[] = []
+        const dipsWithLabel = new Set<Anomaly>()
+        for (const { dip, x } of ranked) {
+          let blocked = false
+          for (const lx of labeledXs) {
+            if (Math.abs(lx - x) < LABEL_COLLISION_PX) { blocked = true; break }
+          }
+          if (!blocked) {
+            labeledXs.push(x)
+            dipsWithLabel.add(dip)
+          }
+        }
+        for (const { dip, x, y } of visible) {
           const color = LABEL_COLOR[dip.label]
-
           ctx.beginPath()
           ctx.arc(x, y, 4, 0, Math.PI * 2)
           ctx.fillStyle = color
@@ -302,16 +463,16 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
           ctx.shadowBlur = 8
           ctx.fill()
           ctx.shadowBlur = 0
-
-          // Label above
-          ctx.fillStyle = color
-          ctx.font = '8px JetBrains Mono, monospace'
-          ctx.textAlign = 'center'
-          ctx.fillText(dip.label, x, y - 10)
-        })
+          if (dipsWithLabel.has(dip)) {
+            ctx.fillStyle = color
+            ctx.font = '8px JetBrains Mono, monospace'
+            ctx.textAlign = 'center'
+            ctx.fillText(dip.label, x, y - 10)
+          }
+        }
       }
     },
-    [times, flux, cleanedFlux, dips, getCanvasCoords, fullStart, fullEnd, PAD.top, PAD.right, PAD.bottom, PAD.left],
+    [times, flux, cleanedFlux, dips, getCanvasCoords, PAD.top, PAD.right, PAD.bottom, PAD.left],
   )
 
   // Reveal animation: drive `progressRef` 0→1 over 1.8s when the underlying
@@ -390,7 +551,16 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
 
   // Drag state lives in a ref so the rAF-driven redraw doesn't re-render
   // the component on every pointermove (we just mutate viewStartT/viewEndT).
-  const dragRef = useRef<{ startClientX: number; startViewT0: number; startViewT1: number } | null>(null)
+  // `moved` and `startedAt` let pointer-up distinguish a click (no
+  // movement, short) from a real drag — clicks trigger dip hit-testing.
+  const dragRef = useRef<{
+    startClientX: number
+    startClientY: number
+    startViewT0: number
+    startViewT1: number
+    moved: boolean
+    startedAt: number
+  } | null>(null)
 
   /**
    * @description Finds the dip nearest the cursor's X position (within ~20 px) and sets it
@@ -442,8 +612,11 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       canvas.setPointerCapture(e.pointerId)
       dragRef.current = {
         startClientX: e.clientX,
+        startClientY: e.clientY,
         startViewT0: viewStartT,
         startViewT1: viewEndT,
+        moved: false,
+        startedAt: performance.now(),
       }
       setTooltip(null)
     },
@@ -455,6 +628,14 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       if (!dragRef.current) return
       const canvas = canvasRef.current
       if (!canvas) return
+      // Threshold: any movement >5 CSS px from the down position counts as
+      // a drag (so we DON'T treat the pointer-up as a click).
+      const dxAbs = Math.abs(e.clientX - dragRef.current.startClientX)
+      const dyAbs = Math.abs(e.clientY - dragRef.current.startClientY)
+      if (!dragRef.current.moved && (dxAbs > 5 || dyAbs > 5)) {
+        dragRef.current.moved = true
+      }
+      if (!dragRef.current.moved) return // sub-threshold wiggle — don't pan yet
       const rect = canvas.getBoundingClientRect()
       const cssPerPx = canvas.width / rect.width
       const dxCss = e.clientX - dragRef.current.startClientX
@@ -474,14 +655,62 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
     [fullStart, fullEnd, PAD.left, PAD.right],
   )
 
+  /**
+   * @description Pointer-up handler. If the gesture was a click (no movement
+   * past threshold, short duration), runs dip-marker hit-testing: a hit
+   * pins the dip + zooms to it; a miss dismisses any currently-pinned dip.
+   * If it was a real drag, just releases pointer capture.
+   */
   const handlePointerUp = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
       if (!dragRef.current) return
       const canvas = canvasRef.current
       canvas?.releasePointerCapture(e.pointerId)
+      const wasClick =
+        !dragRef.current.moved &&
+        performance.now() - dragRef.current.startedAt < 300
       dragRef.current = null
+      if (!wasClick || !canvas) return
+
+      // Hit-test against visible dip markers. The draw loop places a marker
+      // at (toX(dip.peakTime), toY(fluxAtPeak)) with radius 4 px; we accept
+      // clicks within HIT_RADIUS_PX of that center.
+      const rect = canvas.getBoundingClientRect()
+      const cssPerPx = canvas.width / rect.width
+      const cx = (e.clientX - rect.left) * cssPerPx
+      const cy = (e.clientY - rect.top) * cssPerPx
+      const { toX, toY } = getCanvasCoords(canvas)
+      const HIT_RADIUS_PX = 12 * cssPerPx
+      let best: Anomaly | null = null
+      let bestD2 = HIT_RADIUS_PX * HIT_RADIUS_PX
+      for (const dip of dips) {
+        if (dip.peakTime < viewStartT || dip.peakTime > viewEndT) continue
+        const idx = times.findIndex(t => t >= dip.peakTime)
+        const fluxAtPeak = idx >= 0 ? flux[idx] : 0.98
+        const dx = toX(dip.peakTime) - cx
+        const dy = toY(fluxAtPeak) - cy
+        const d2 = dx * dx + dy * dy
+        if (d2 < bestD2) { bestD2 = d2; best = dip }
+      }
+      if (best) {
+        setPinnedDip(best)
+        // Zoom to center the dip with context. Window width is at least
+        // 8× the dip duration, never tighter than 2% of the full range.
+        const fullSpan = fullEnd - fullStart
+        const desired = Math.max(best.duration * 8, fullSpan * 0.02)
+        const span = Math.min(desired, fullSpan)
+        let s = best.peakTime - span / 2
+        let en = best.peakTime + span / 2
+        if (s < fullStart) { en += fullStart - s; s = fullStart }
+        if (en > fullEnd) { s -= en - fullEnd; en = fullEnd }
+        setViewStartT(s)
+        setViewEndT(en)
+      } else {
+        // Click on empty chart space dismisses any pinned dip
+        setPinnedDip(null)
+      }
     },
-    [],
+    [dips, times, flux, viewStartT, viewEndT, fullStart, fullEnd, getCanvasCoords],
   )
 
   /**
@@ -521,20 +750,59 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
     const toMx = (t: number) => ((t - fullStart) / (fullEnd - fullStart)) * W
     const toMy = (f: number) => (1 - (f - minF) / (maxF - minF)) * H
 
-    // Line — sample every Nth point so we don't push 60K verts for a strip
-    // that's only ~80 px tall.
-    const stride = Math.max(1, Math.floor(times.length / W))
+    // LTTB downsampling per segment, same algorithm as the main chart.
+    // Quarter-scale gaps (>GAP_DAYS) split segments so the minimap
+    // shows empty space between Kepler observation runs instead of a
+    // diagonal bridge.
     ctx.beginPath()
     ctx.strokeStyle = 'rgba(76,201,240,0.55)'
     ctx.lineWidth = 1
-    let penDown = false
-    for (let i = 0; i < times.length; i += stride) {
+
+    const segments: { xs: number[]; ys: number[] }[] = []
+    let curXs: number[] = []
+    let curYs: number[] = []
+    let prevSampleT: number | null = null
+    const startNewSegment = () => {
+      if (curXs.length > 0) segments.push({ xs: curXs, ys: curYs })
+      curXs = []
+      curYs = []
+    }
+    for (let i = 0; i < times.length; i++) {
       const f = cleanedFlux[i]
-      if (f == null) { penDown = false; continue }
-      const x = toMx(times[i])
-      const y = toMy(f)
-      if (!penDown) { ctx.moveTo(x, y); penDown = true }
-      else ctx.lineTo(x, y)
+      if (f == null) {
+        startNewSegment()
+        prevSampleT = null
+        continue
+      }
+      const t = times[i]
+      if (prevSampleT !== null && t - prevSampleT > GAP_DAYS) startNewSegment()
+      curXs.push(toMx(t))
+      curYs.push(toMy(f))
+      prevSampleT = t
+    }
+    startNewSegment()
+
+    // The minimap is small — target ~W output points total, so each
+    // segment gets its proportional share. Below that, LTTB is overkill;
+    // just stroke every point.
+    const totalPoints = segments.reduce((s, seg) => s + seg.xs.length, 0)
+    const target = Math.min(totalPoints, W * 2)
+    for (const seg of segments) {
+      const segLen = seg.xs.length
+      if (segLen < 2) continue
+      const segBudget = totalPoints <= target
+        ? segLen
+        : Math.max(2, Math.round((segLen / totalPoints) * target))
+      const picked = segBudget >= segLen ? null : lttbIndices(seg.xs, seg.ys, segBudget)
+      ctx.moveTo(seg.xs[0], seg.ys[0])
+      if (picked === null) {
+        for (let k = 1; k < segLen; k++) ctx.lineTo(seg.xs[k], seg.ys[k])
+      } else {
+        for (let k = 1; k < picked.length; k++) {
+          const idx = picked[k]
+          ctx.lineTo(seg.xs[idx], seg.ys[idx])
+        }
+      }
     }
     ctx.stroke()
 
@@ -634,10 +902,10 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
             textAlign: 'center',
           }}
         >
-          SCROLL TO ZOOM · DRAG TO PAN · DOUBLE-CLICK TO RESET · CLICK MINIMAP TO JUMP
+          SCROLL TO ZOOM · DRAG TO PAN · CLICK DIP TO INSPECT · DOUBLE-CLICK TO RESET · CLICK MINIMAP TO JUMP
         </div>
       )}
-      {tooltip && (
+      {tooltip && !pinnedDip && (
         <div
           style={{
             position: 'absolute',
@@ -665,6 +933,13 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
           </div>
         </div>
       )}
+      {pinnedDip && (
+        <PinnedDipTooltip
+          dip={pinnedDip}
+          provenance={provenance}
+          onDismiss={() => setPinnedDip(null)}
+        />
+      )}
       {/* Legend — only shown for the inline (non-interactive) chart. The
           fullscreen overlay renders its own larger legend below the chart
           so we'd otherwise duplicate it. */}
@@ -676,6 +951,91 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
               <span style={{ fontSize: 8, color: 'rgba(255,255,255,0.35)', letterSpacing: 1 }}>{label}</span>
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * @description Sticky tooltip card pinned by clicking a dip marker in
+ * the interactive chart. Anchored top-right of the chart so it stays
+ * visible regardless of where the dip moves to after the zoom-to. Shows
+ * the full dip summary (label, score, depth, duration, peak time) plus
+ * the data provenance line when available. Click the ✕ to dismiss.
+ * @param dip The pinned anomaly.
+ * @param provenance Optional source/mission/dataType labels.
+ * @param onDismiss Called when the user closes the tooltip.
+ * @returns Absolutely-positioned card inside the chart container.
+ */
+function PinnedDipTooltip({
+  dip,
+  provenance,
+  onDismiss,
+}: {
+  dip: Anomaly
+  provenance?: LightcurveProvenance
+  onDismiss: () => void
+}) {
+  const accent = LABEL_COLOR[dip.label]
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: 12,
+        right: 12,
+        background: 'rgba(0,0,0,0.92)',
+        border: `1px solid ${accent}88`,
+        borderRadius: 6,
+        padding: '10px 12px 10px 14px',
+        fontSize: 10,
+        fontFamily: 'JetBrains Mono, monospace',
+        zIndex: 99,
+        minWidth: 200,
+        boxShadow: `0 0 16px ${accent}33`,
+        pointerEvents: 'auto',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+        <span style={{ color: accent, fontWeight: 700, letterSpacing: 1 }}>
+          {dip.label}
+        </span>
+        <button
+          onClick={onDismiss}
+          aria-label="Dismiss pinned dip"
+          style={{
+            background: 'none',
+            border: 'none',
+            color: 'rgba(255,255,255,0.5)',
+            fontSize: 13,
+            cursor: 'pointer',
+            lineHeight: 1,
+            padding: 0,
+            marginLeft: 12,
+          }}
+        >
+          ✕
+        </button>
+      </div>
+      <div style={{ color: 'rgba(255,255,255,0.75)', lineHeight: 1.7 }}>
+        Score: {Math.round(dip.score * 100)}%<br />
+        Depth: −{(dip.depth * 100).toFixed(2)}%<br />
+        Duration: {dip.duration.toFixed(2)} d<br />
+        Peak: {dip.peakTime.toFixed(2)} BKJD
+      </div>
+      {provenance && (
+        <div
+          style={{
+            marginTop: 8,
+            paddingTop: 6,
+            borderTop: '1px solid rgba(255,255,255,0.1)',
+            fontSize: 8,
+            color: 'rgba(255,255,255,0.45)',
+            letterSpacing: 0.5,
+            lineHeight: 1.5,
+          }}
+        >
+          Source: {provenance.sourceName} · {provenance.mission} · {provenance.dataType}
         </div>
       )}
     </div>

@@ -153,8 +153,21 @@ async function selectStar(
  * @param sprite Circular alpha sprite for round-looking points.
  * @returns A `<points>` element with packed buffer attributes.
  */
+/**
+ * @description Base pixel size of catalog star points at FOV_MAX. Scaled up
+ * by `depthScale(fov, STAR_DEPTH_MAX_SCALE)` each frame to give a sense
+ * of getting closer when the user zooms in.
+ */
+const STAR_BASE_SIZE = 3
+const STAR_DEPTH_MAX_SCALE = 2.5
+
 const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite: THREE.Texture }>(
   function StarPoints({ stars, sprite }, ref) {
+    // Internal ref so this component can mutate its own material in useFrame
+    // independently of the parent's ref (which is used for click raycasting).
+    const internalRef = useRef<THREE.Points>(null)
+    const { camera } = useThree()
+
     const { positions, colors, sizes } = useMemo(() => {
       const positions = new Float32Array(stars.length * 3)
       const colors = new Float32Array(stars.length * 3)
@@ -188,8 +201,28 @@ const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite
       return { positions, colors, sizes }
     }, [stars])
 
+    // Depth-feel: scale point size by FOV each frame. Default
+    // `pointsMaterial` ignores the per-vertex `attributes-size` buffer
+    // (no custom shader), so the single `material.size` scalar is what
+    // actually controls rendered size; we modulate that here.
+    useFrame(() => {
+      const mesh = internalRef.current
+      if (!mesh) return
+      const fov = (camera as THREE.PerspectiveCamera).fov ?? FOV_MAX
+      const mat = mesh.material as THREE.PointsMaterial
+      mat.size = STAR_BASE_SIZE * depthScale(fov, STAR_DEPTH_MAX_SCALE)
+    })
+
+    // Compose the forwarded ref with our internal one so the parent's
+    // raycaster still sees the mesh while we keep direct access here.
+    const setRef = (node: THREE.Points | null) => {
+      internalRef.current = node
+      if (typeof ref === 'function') ref(node)
+      else if (ref) ref.current = node
+    }
+
     return (
-      <points ref={ref}>
+      <points ref={setRef}>
         <bufferGeometry>
           <bufferAttribute attach="attributes-position" args={[positions, 3]} />
           <bufferAttribute attach="attributes-color" args={[colors, 3]} />
@@ -200,7 +233,7 @@ const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite
           sizeAttenuation={false}
           transparent
           opacity={0.95}
-          size={3}
+          size={STAR_BASE_SIZE}
           map={sprite}
           alphaTest={0.01}
           depthWrite={false}
@@ -270,6 +303,21 @@ function ClickRaycastBridge({
 const ANOMALY_PULSE_OMEGA = (2 * Math.PI) / 1.5
 
 /**
+ * @description "Depth feel" multiplier for point sizes as the user zooms in
+ * (FOV shrinks). At FOV_MAX → 1.0 (current sizes). At FOV_MIN → `maxScale`.
+ * Linear interpolation in FOV-space — narrower FOV = bigger points,
+ * giving the impression of getting closer to the stars.
+ * @param fov Current camera field of view (degrees).
+ * @param maxScale Multiplier applied when fov reaches FOV_MIN.
+ * @returns Size multiplier in [1, maxScale].
+ */
+function depthScale(fov: number, maxScale: number): number {
+  const t = (FOV_MAX - fov) / (FOV_MAX - FOV_MIN) // 0 at max-FOV, 1 at min-FOV
+  const clamped = Math.max(0, Math.min(1, t))
+  return 1 + clamped * (maxScale - 1)
+}
+
+/**
  * @description Three-layer red halo overlay drawn on top of anomaly stars,
  * styled as a radar ping. Two outer rings pulse at offset phases so they
  * read as expanding/contracting waves, and a hot pure-red core marks the
@@ -279,29 +327,45 @@ const ANOMALY_PULSE_OMEGA = (2 * Math.PI) / 1.5
  * @param sprite Shared circular alpha sprite.
  * @returns Three stacked `<points>` elements, or null if there are no anomalies.
  */
+/**
+ * @description Max size multiplier for anomaly rings as FOV reaches FOV_MIN.
+ * Anomalies scale slightly more aggressively than catalog stars (3× vs
+ * 2.5×) so they pop more strongly when the user zooms in on them.
+ */
+const ANOMALY_DEPTH_MAX_SCALE = 3.0
+const ANOMALY_CORE_BASE_SIZE = 8
+
 function AnomalyMarkers({ stars, sprite }: { stars: CatalogStar[]; sprite: THREE.Texture }) {
   const outerRef = useRef<THREE.Points>(null)
   const midRef = useRef<THREE.Points>(null)
   const coreRef = useRef<THREE.Points>(null)
   const anomalies = useMemo(() => stars.filter(s => s.hasAnomaly), [stars])
+  const { camera } = useThree()
 
   useFrame(({ clock }) => {
     const t = clock.elapsedTime * ANOMALY_PULSE_OMEGA
+    // Depth scale: makes rings grow as the user zooms in (FOV shrinks).
+    // Multiplied INTO the pulse so the pulse animation still works but at
+    // a larger amplitude when close.
+    const fov = (camera as THREE.PerspectiveCamera).fov ?? FOV_MAX
+    const scale = depthScale(fov, ANOMALY_DEPTH_MAX_SCALE)
     // Outer ring: largest, slowest visible swing, low opacity (~#ff000044)
     if (outerRef.current) {
       const mat = outerRef.current.material as THREE.PointsMaterial
-      mat.size = 36 + 14 * Math.sin(t)
+      mat.size = (36 + 14 * Math.sin(t)) * scale
       mat.opacity = 0.18 + 0.12 * Math.sin(t)
     }
     // Mid ring: offset phase so it reads as a second ping chasing the first
     if (midRef.current) {
       const mat = midRef.current.material as THREE.PointsMaterial
-      mat.size = 22 + 9 * Math.sin(t + Math.PI * 0.6)
+      mat.size = (22 + 9 * Math.sin(t + Math.PI * 0.6)) * scale
       mat.opacity = 0.45 + 0.25 * Math.sin(t + Math.PI * 0.6)
     }
-    // Core: faster brightness wobble, stays small and hot
+    // Core: faster brightness wobble, stays small and hot. Size scales
+    // with depth too so it stays proportional to the rings around it.
     if (coreRef.current) {
       const mat = coreRef.current.material as THREE.PointsMaterial
+      mat.size = ANOMALY_CORE_BASE_SIZE * scale
       mat.opacity = 0.85 + 0.15 * Math.sin(t * 1.5)
     }
   })
