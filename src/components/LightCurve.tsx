@@ -36,12 +36,22 @@ const LTTB_TARGET_POINTS = 2000
  * (used by Grafana, Plotly, etc); doesn't produce the per-column fill
  * artifact that min/max envelope rendering does.
  *
+ * **Min/max guarantee**: standard LTTB can miss the global extremes
+ * of a segment if they fall in a bucket whose largest triangle is
+ * formed by a different point. For light curves this can hide deep
+ * narrow dips (Tabby's −22% events span <50 samples out of ~60k). We
+ * post-process the picked indices to splice in the global y-min and
+ * y-max indices if they're not already present, preserving their
+ * chronological position. Cost: O(N) one extra pass.
+ *
  * Expects a single contiguous segment — callers handle splitting around
  * nulls and quarter gaps so each segment renders as its own sub-path.
  * @param xs x coordinates of the source samples (must be monotonic).
  * @param ys y coordinates of the source samples (same length as xs).
  * @param threshold Target output count (returns input unchanged if <= 2 or >= xs.length).
- * @returns Indices into the source arrays of the selected samples.
+ * @returns Indices into the source arrays of the selected samples,
+ * monotonically increasing, including the segment's global y-min and
+ * y-max indices.
  */
 function lttbIndices(xs: number[], ys: number[], threshold: number): number[] {
   const n = xs.length
@@ -55,6 +65,15 @@ function lttbIndices(xs: number[], ys: number[], threshold: number): number[] {
   const bucketSize = (n - 2) / (threshold - 2)
   let aIdx = 0
   out[outIdx++] = 0
+
+  // Track the segment's global y-min and y-max indices in the SAME pass
+  // so we don't need a second loop later.
+  let yMinIdx = 0
+  let yMaxIdx = 0
+  for (let i = 1; i < n; i++) {
+    if (ys[i] < ys[yMinIdx]) yMinIdx = i
+    if (ys[i] > ys[yMaxIdx]) yMaxIdx = i
+  }
 
   for (let i = 0; i < threshold - 2; i++) {
     // Average x/y of the NEXT bucket — used as the third triangle vertex.
@@ -92,6 +111,25 @@ function lttbIndices(xs: number[], ys: number[], threshold: number): number[] {
     aIdx = pickedIdx
   }
   out[outIdx++] = n - 1
+
+  // Min/max preservation. Endpoints (0, n-1) are already in `out` so we
+  // only need to splice when the extreme is interior. Use a Set for O(1)
+  // membership; insert with binary search to keep `out` monotonic.
+  const present = new Set<number>(out)
+  const insertInOrder = (idx: number) => {
+    if (idx === 0 || idx === n - 1 || present.has(idx)) return
+    let lo = 0
+    let hi = out.length
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1
+      if (out[mid] < idx) lo = mid + 1
+      else hi = mid
+    }
+    out.splice(lo, 0, idx)
+    present.add(idx)
+  }
+  insertInOrder(yMinIdx)
+  insertInOrder(yMaxIdx)
   return out
 }
 
@@ -157,6 +195,10 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
   // Sticky tooltip pinned by clicking a dip marker. Independent of the
   // hover tooltip so panning/moving doesn't blow it away.
   const [pinnedDip, setPinnedDip] = useState<Anomaly | null>(null)
+  // Tooltip shown when the cursor is over an inter-quarter gap region —
+  // the empty black bands between Kepler observation runs confuse users
+  // ("is my data corrupted?"), so a short explanation helps.
+  const [gapHover, setGapHover] = useState<{ x: number; y: number; days: number } | null>(null)
   // Reset pinned tooltip whenever the dataset changes (new star selected).
   useEffect(() => { setPinnedDip(null) }, [times, flux])
 
@@ -166,10 +208,19 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
   const fullEnd = times[times.length - 1]
   const [viewStartT, setViewStartT] = useState(fullStart)
   const [viewEndT, setViewEndT] = useState(fullEnd)
-  // Reset window when the underlying data changes (selecting a different star)
+  // Flux window currently visible on the Y axis. Defaults to the data's
+  // p2/p98 percentile range (computed in `fluxRange` below). Shift+wheel
+  // zooms this; double-click resets BOTH X and Y to their auto-fit
+  // defaults. Kept as nullable: null means "use the auto fluxRange".
+  // Once the user interacts with Y zoom, this becomes concrete numbers.
+  const [viewYMin, setViewYMin] = useState<number | null>(null)
+  const [viewYMax, setViewYMax] = useState<number | null>(null)
+  // Reset all view state when the underlying data changes (new star)
   useEffect(() => {
     setViewStartT(times[0])
     setViewEndT(times[times.length - 1])
+    setViewYMin(null)
+    setViewYMax(null)
   }, [times])
 
   const PAD = { top: 20, right: 16, bottom: 36, left: 48 }
@@ -182,16 +233,59 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
    * @returns Plot box, data ranges, and `toX`/`toY` conversion helpers.
    */
   // Outlier-filtered view of the flux array. Raw Kepler PDC data contains
-  // occasional cosmic-ray hits and spacecraft artifacts that read as flux
-  // values 50× the median or near-zero — keeping them collapses the entire
-  // legitimate flux range to a hairline at the bottom of the chart (which
-  // is what made KIC 6543674 look like a solid filled blob). Replacing
-  // them with null lets the draw loop skip those samples and start a new
-  // sub-path so the line itself stays gap-aware.
-  const cleanedFlux = useMemo(
-    () => flux.map(f => (f > 1.05 || f < 0.5 ? null : f)),
-    [flux],
-  )
+  // single-point cosmic-ray hits and spacecraft artifacts; they're
+  // visually distracting (upward spikes on the chart) but also poison
+  // any min/max-based statistics. We replace outliers with `null` so the
+  // draw loop skips them, lifts the pen, and starts a new sub-path —
+  // no NaN spikes, no fake "data gaps".
+  //
+  // **Asymmetric MAD filter** (this was a real bug for months):
+  // cosmic-ray hits in Kepler PDC photometry are UPWARD spikes
+  // (photon pile-up adds counts; it never subtracts them). Real
+  // astrophysical events — planetary transits, KIC 8462852's deep
+  // mystery dips, KIC 12557548's dust-tail occultations — are
+  // DOWNWARD excursions. A symmetric MAD filter using the global
+  // noise scale (~0.0003 for a quiet star) treats a 22% downward
+  // transit identically to a 22% upward spike: both get rejected. We
+  // therefore only apply the MAD bound on the UPPER side; downward
+  // excursions are bounded only by the absolute floor (0.5, defends
+  // against truly broken negative-flux values from instrument errors).
+  //
+  // Cascade:
+  //   1. Absolute hard bounds: `f > 1.05 || f < 0.5`. Defends against
+  //      truly broken values that would otherwise inflate the MAD
+  //      estimate below.
+  //   2. Asymmetric MAD: `f > median + MAD_K * MAD` rejects upward
+  //      spikes (cosmic rays). NO lower MAD bound.
+  //
+  // K=5 catches single-point cosmic rays without touching real stellar
+  // variations on the upper side (continuous variability rarely spikes
+  // a single sample >5×MAD above the median).
+  const cleanedFlux = useMemo(() => {
+    const MAD_K = 5
+    // Pass 1: absolute bounds. Skip null/non-finite entries.
+    const survivors: number[] = []
+    for (const f of flux) {
+      if (f != null && Number.isFinite(f) && f <= 1.05 && f >= 0.5) survivors.push(f)
+    }
+    if (survivors.length === 0) return flux.map(() => null as number | null)
+    // Median of survivors
+    const sortedSurv = [...survivors].sort((a, b) => a - b)
+    const median = sortedSurv[Math.floor(sortedSurv.length / 2)]
+    // MAD = median(|x - median|)
+    const absDevs = survivors.map(f => Math.abs(f - median))
+    absDevs.sort((a, b) => a - b)
+    const mad = absDevs[Math.floor(absDevs.length / 2)]
+    // Guard against pathological MAD=0 (constant flux). Fall back to a
+    // tiny floor so the filter doesn't reject every sample.
+    const upperThreshold = median + MAD_K * Math.max(mad, 1e-5)
+    return flux.map(f => {
+      if (f == null || !Number.isFinite(f)) return null
+      if (f > 1.05 || f < 0.5) return null // absolute bounds
+      if (f > upperThreshold) return null   // asymmetric MAD: reject upward spikes only
+      return f
+    })
+  }, [flux])
 
   // Percentile-based Y range using p2/p98. The previous version capped
   // the range to median ± 0.15 to defend against cosmic-ray survivors,
@@ -200,16 +294,35 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
   // samples that's >1200 samples on each side, more than enough cushion
   // for the few cosmic rays that pass the outlier filter. Real
   // variations are never clipped.
+  // Time-domain gap regions (where consecutive samples are > GAP_DAYS
+  // apart). Memoized once per dataset; independent of view zoom so the
+  // hit-test below is just two number comparisons per gap. The draw
+  // loop already breaks the line at these boundaries; this is purely
+  // for the hover tooltip.
+  const gapRegions = useMemo(() => {
+    const out: { start: number; end: number; days: number }[] = []
+    for (let i = 1; i < times.length; i++) {
+      const dt = times[i] - times[i - 1]
+      if (dt > GAP_DAYS) {
+        out.push({ start: times[i - 1], end: times[i], days: dt })
+      }
+    }
+    return out
+  }, [times])
+
   const fluxRange = useMemo(() => {
     const finite = cleanedFlux.filter((f): f is number => f != null)
     if (finite.length === 0) return { minF: 0.95, maxF: 1.05, median: 1.0 }
     const sorted = [...finite].sort((a, b) => a - b)
     const pick = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]
-    const p2 = pick(0.02)
-    const p98 = pick(0.98)
+    // p1/p99 (was p2/p98) — wider tails so genuine variability is less
+    // likely to be clipped. The bottom 1% of ~60k samples is still ~600
+    // points of cushion against surviving cosmic-ray hits.
+    const p1 = pick(0.01)
+    const p99 = pick(0.99)
     const median = pick(0.5)
-    const pad = (p98 - p2) * 0.10
-    return { minF: p2 - pad, maxF: p98 + pad, median }
+    const pad = (p99 - p1) * 0.10
+    return { minF: p1 - pad, maxF: p99 + pad, median }
   }, [cleanedFlux])
 
   const getCanvasCoords = useCallback(
@@ -222,14 +335,62 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       // X axis uses the current zoom/pan window, not the full data range.
       const minT = viewStartT
       const maxT = viewEndT
-      const { minF, maxF } = fluxRange
+
+      // Y axis: when the user has explicitly set viewYMin/Max we honor
+      // them verbatim. Otherwise auto-fit starts from the global
+      // p1/p99 `fluxRange` and is extended DOWNWARD to include any
+      // sample in the current X window that falls below it. Reason:
+      // deep narrow dips (Tabby's −22%, KIC 12557548) are sub-1% of
+      // total samples, so even p1 misses them — the bottom of the
+      // chart would just show the noise band. We extend with 5%
+      // padding so the dip lands clearly above the axis line.
+      let minF: number
+      let maxF: number
+      if (viewYMin !== null && viewYMax !== null) {
+        minF = viewYMin
+        maxF = viewYMax
+      } else {
+        minF = fluxRange.minF
+        maxF = fluxRange.maxF
+        // Find the first/last in-window indices via binary search
+        // (times array is monotonic post-concatenation by the route).
+        const t0 = viewStartT
+        const t1 = viewEndT
+        let lo = 0
+        let hi = times.length
+        while (lo < hi) {
+          const mid = (lo + hi) >>> 1
+          if (times[mid] < t0) lo = mid + 1
+          else hi = mid
+        }
+        const firstIdx = lo
+        lo = firstIdx
+        hi = times.length
+        while (lo < hi) {
+          const mid = (lo + hi) >>> 1
+          if (times[mid] <= t1) lo = mid + 1
+          else hi = mid
+        }
+        const lastIdx = lo // exclusive
+        // Scan the window for any flux below the auto-fit minF.
+        let windowMin = Infinity
+        for (let i = firstIdx; i < lastIdx; i++) {
+          const f = cleanedFlux[i]
+          if (f == null) continue
+          if (f < windowMin) windowMin = f
+        }
+        if (windowMin < minF) {
+          const range = maxF - windowMin
+          minF = windowMin - range * 0.05
+        }
+      }
 
       const toX = (t: number) => PAD.left + ((t - minT) / (maxT - minT)) * plotW
       const toY = (f: number) => PAD.top + (1 - (f - minF) / (maxF - minF)) * plotH
 
       return { W, H, plotW, plotH, minT, maxT, minF, maxF, toX, toY }
     },
-    [viewStartT, viewEndT, fluxRange, PAD.top, PAD.right, PAD.bottom, PAD.left],
+    [viewStartT, viewEndT, viewYMin, viewYMax, fluxRange, times, cleanedFlux, PAD.top, PAD.right, PAD.bottom, PAD.left],
   )
 
   /**
@@ -425,10 +586,19 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       // (e.g. periodic dips in KIC 11610797), their text labels overlap
       // into an unreadable pile. We always draw the dot, but suppress the
       // text label if another HIGHER-scoring dip already has a label
-      // within LABEL_COLLISION_PX of this dip's x position. Sort by
+      // within LABEL_COLLISION_CSS_PX of this dip's x position. Sort by
       // descending score so winners get processed first.
+      //
+      // The threshold is specified in CSS pixels (what the user sees),
+      // not canvas pixels — `toX` returns canvas pixels, which differ
+      // from CSS pixels by `canvas.width / rect.width` (varies with the
+      // 460-px inline chart vs the 1600-px fullscreen chart). Converting
+      // keeps perceived label spacing consistent across both contexts.
       if (progress > 0.5) {
-        const LABEL_COLLISION_PX = 40
+        const LABEL_COLLISION_CSS_PX = 60
+        const rect = canvas.getBoundingClientRect()
+        const cssPxToCanvasPx = rect.width > 0 ? canvas.width / rect.width : 1
+        const collisionThresholdCanvas = LABEL_COLLISION_CSS_PX * cssPxToCanvasPx
         const visible: { dip: Anomaly; x: number; y: number }[] = []
         for (const dip of dips) {
           if (dip.peakTime < minT || dip.peakTime > maxT) continue
@@ -447,7 +617,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
         for (const { dip, x } of ranked) {
           let blocked = false
           for (const lx of labeledXs) {
-            if (Math.abs(lx - x) < LABEL_COLLISION_PX) { blocked = true; break }
+            if (Math.abs(lx - x) < collisionThresholdCanvas) { blocked = true; break }
           }
           if (!blocked) {
             labeledXs.push(x)
@@ -527,27 +697,55 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
     const onNativeWheel = (e: WheelEvent) => {
       e.preventDefault()
       const rect = canvas.getBoundingClientRect()
-      const mx = (e.clientX - rect.left) * (canvas.width / rect.width)
+      const cssPerPxX = canvas.width / rect.width
+      const cssPerPxY = canvas.height / rect.height
+      const mx = (e.clientX - rect.left) * cssPerPxX
+      const my = (e.clientY - rect.top) * cssPerPxY
       const plotW = canvas.width - PAD.left - PAD.right
-      const cursorFrac = Math.max(0, Math.min(1, (mx - PAD.left) / plotW))
-      const cursorT = viewStartT + cursorFrac * (viewEndT - viewStartT)
+      const plotH = canvas.height - PAD.top - PAD.bottom
 
-      const factor = e.deltaY < 0 ? 1 / 1.25 : 1.25
-      const newSpan = (viewEndT - viewStartT) * factor
-      const minSpan = (fullEnd - fullStart) * 0.001
-      const maxSpan = fullEnd - fullStart
-      const clampedSpan = Math.max(minSpan, Math.min(maxSpan, newSpan))
-
-      let newStart = cursorT - cursorFrac * clampedSpan
-      let newEnd = newStart + clampedSpan
-      if (newStart < fullStart) { newStart = fullStart; newEnd = newStart + clampedSpan }
-      if (newEnd > fullEnd) { newEnd = fullEnd; newStart = newEnd - clampedSpan }
-      setViewStartT(newStart)
-      setViewEndT(newEnd)
+      if (e.shiftKey) {
+        // Y zoom uses a much gentler 1.05/tick factor — at the typical
+        // flux scale (range ~0.01) a 1.25/tick step felt like jumping
+        // an entire pane per scroll click. 1.05 gives ~14 ticks to
+        // halve the visible range, which is comfortable.
+        const yFactor = e.deltaY < 0 ? 1 / 1.05 : 1.05
+        const curMin = viewYMin ?? fluxRange.minF
+        const curMax = viewYMax ?? fluxRange.maxF
+        const cursorFracY = Math.max(0, Math.min(1, (my - PAD.top) / plotH))
+        // Higher pixel y = lower flux (chart is y-flipped)
+        const cursorF = curMax - cursorFracY * (curMax - curMin)
+        const span = curMax - curMin
+        // Y zoom range is generous on both ends — let the user inspect
+        // 0.0001-scale wiggles AND zoom out to see the full data.
+        const dataSpan = Math.max(fluxRange.maxF - fluxRange.minF, 1e-6)
+        const minYSpan = dataSpan * 0.001
+        const maxYSpan = dataSpan * 10
+        const newSpan = Math.max(minYSpan, Math.min(maxYSpan, span * yFactor))
+        const newMax = cursorF + cursorFracY * newSpan
+        const newMin = newMax - newSpan
+        setViewYMin(newMin)
+        setViewYMax(newMax)
+      } else {
+        // X zoom around the cursor (existing behavior).
+        const xFactor = e.deltaY < 0 ? 1 / 1.25 : 1.25
+        const cursorFrac = Math.max(0, Math.min(1, (mx - PAD.left) / plotW))
+        const cursorT = viewStartT + cursorFrac * (viewEndT - viewStartT)
+        const newSpan = (viewEndT - viewStartT) * xFactor
+        const minSpan = (fullEnd - fullStart) * 0.001
+        const maxSpan = fullEnd - fullStart
+        const clampedSpan = Math.max(minSpan, Math.min(maxSpan, newSpan))
+        let newStart = cursorT - cursorFrac * clampedSpan
+        let newEnd = newStart + clampedSpan
+        if (newStart < fullStart) { newStart = fullStart; newEnd = newStart + clampedSpan }
+        if (newEnd > fullEnd) { newEnd = fullEnd; newStart = newEnd - clampedSpan }
+        setViewStartT(newStart)
+        setViewEndT(newEnd)
+      }
     }
     canvas.addEventListener('wheel', onNativeWheel, { passive: false })
     return () => canvas.removeEventListener('wheel', onNativeWheel)
-  }, [interactive, viewStartT, viewEndT, fullStart, fullEnd, PAD.left, PAD.right])
+  }, [interactive, viewStartT, viewEndT, viewYMin, viewYMax, fluxRange, fullStart, fullEnd, PAD.left, PAD.right, PAD.top, PAD.bottom])
 
   // Drag state lives in a ref so the rAF-driven redraw doesn't re-render
   // the component on every pointermove (we just mutate viewStartT/viewEndT).
@@ -558,14 +756,22 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
     startClientY: number
     startViewT0: number
     startViewT1: number
+    // Y baseline captured at down-time; only consulted when the drag is a
+    // Y-pan (shiftKey held at pointerdown). Stored as concrete numbers
+    // even when the user is in auto-fit mode so the pan is grounded.
+    startViewY0: number
+    startViewY1: number
+    // True if the user held shift when pressing down. We lock the mode at
+    // press time so releasing shift mid-drag doesn't flip-flop the axis.
+    panY: boolean
     moved: boolean
     startedAt: number
   } | null>(null)
 
   /**
-   * @description Finds the dip nearest the cursor's X position (within ~20 px) and sets it
-   * as the active tooltip, or clears the tooltip if no dip is close enough.
-   * Suppressed while a drag-to-pan is in flight.
+   * @description Hover handler: hit-tests against (a) dip markers for the
+   * standard dip tooltip and (b) inter-quarter gap regions for the gap
+   * explanation tooltip. Suppressed while a drag-to-pan is in flight.
    * @param e React mouse event from the canvas.
    */
   const handleMouseMove = useCallback(
@@ -574,27 +780,47 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       const canvas = canvasRef.current
       if (!canvas) return
       const rect = canvas.getBoundingClientRect()
-      const mx = (e.clientX - rect.left) * (canvas.width / rect.width)
+      const cssPerPxX = canvas.width / rect.width
+      const cssPerPxY = canvas.height / rect.height
+      const mx = (e.clientX - rect.left) * cssPerPxX
+      const my = (e.clientY - rect.top) * cssPerPxY
 
       const { toX } = getCanvasCoords(canvas)
+      const cssX = e.clientX - rect.left
+      const cssY = e.clientY - rect.top
 
+      // Dip hit-test (existing behavior)
       let nearest: Tooltip | null = null
       let minDist = 20
-
       dips.forEach(dip => {
         const dx = Math.abs(toX(dip.peakTime) - mx)
         if (dx < minDist) {
           minDist = dx
-          nearest = {
-            x: e.clientX - rect.left,
-            y: e.clientY - rect.top,
-            dip,
-          }
+          nearest = { x: cssX, y: cssY, dip }
         }
       })
       setTooltip(nearest)
+
+      // Gap hit-test: cursor inside the plot rect AND between the start/
+      // end pixel-x of an inter-quarter gap. A dip tooltip takes priority
+      // (already shown above) so we don't double up.
+      const plotH = canvas.height - PAD.top - PAD.bottom
+      const insidePlotY = my >= PAD.top && my <= PAD.top + plotH
+      const insidePlotX = mx >= PAD.left && mx <= canvas.width - PAD.right
+      let gap: { x: number; y: number; days: number } | null = null
+      if (insidePlotX && insidePlotY && !nearest) {
+        for (const g of gapRegions) {
+          const gx0 = toX(g.start)
+          const gx1 = toX(g.end)
+          if (mx >= gx0 && mx <= gx1) {
+            gap = { x: cssX, y: cssY, days: g.days }
+            break
+          }
+        }
+      }
+      setGapHover(gap)
     },
-    [dips, getCanvasCoords],
+    [dips, gapRegions, getCanvasCoords, PAD.top, PAD.bottom, PAD.left, PAD.right],
   )
 
   /**
@@ -615,12 +841,18 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
         startClientY: e.clientY,
         startViewT0: viewStartT,
         startViewT1: viewEndT,
+        // Snapshot the current EFFECTIVE Y range (auto-fit or user-set).
+        // If the user is in auto-fit and shift-drags, we capture the
+        // p2/p98 numbers so the pan starts smoothly from what's on screen.
+        startViewY0: viewYMin ?? fluxRange.minF,
+        startViewY1: viewYMax ?? fluxRange.maxF,
+        panY: e.shiftKey,
         moved: false,
         startedAt: performance.now(),
       }
       setTooltip(null)
     },
-    [interactive, viewStartT, viewEndT],
+    [interactive, viewStartT, viewEndT, viewYMin, viewYMax, fluxRange],
   )
 
   const handlePointerMove = useCallback(
@@ -637,22 +869,40 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       }
       if (!dragRef.current.moved) return // sub-threshold wiggle — don't pan yet
       const rect = canvas.getBoundingClientRect()
-      const cssPerPx = canvas.width / rect.width
-      const dxCss = e.clientX - dragRef.current.startClientX
-      const dxCanvas = dxCss * cssPerPx
-      const plotW = canvas.width - PAD.left - PAD.right
-      const span = dragRef.current.startViewT1 - dragRef.current.startViewT0
-      // Drag right = move window LEFT in time (panning the content)
-      const dt = -(dxCanvas / plotW) * span
+      const cssPerPxX = canvas.width / rect.width
+      const cssPerPxY = canvas.height / rect.height
 
-      let newStart = dragRef.current.startViewT0 + dt
-      let newEnd = dragRef.current.startViewT1 + dt
-      if (newStart < fullStart) { const adj = fullStart - newStart; newStart += adj; newEnd += adj }
-      if (newEnd > fullEnd) { const adj = newEnd - fullEnd; newStart -= adj; newEnd -= adj }
-      setViewStartT(newStart)
-      setViewEndT(newEnd)
+      if (dragRef.current.panY) {
+        // Y pan: drag down → window moves DOWN in flux (so the content
+        // visually scrolls up under the cursor). No clamping to data
+        // bounds — the user is free to pan into empty space, same as
+        // most chart tools. RESET Y / double-click brings them back.
+        const dyCss = e.clientY - dragRef.current.startClientY
+        const dyCanvas = dyCss * cssPerPxY
+        const plotH = canvas.height - PAD.top - PAD.bottom
+        const yspan = dragRef.current.startViewY1 - dragRef.current.startViewY0
+        // Pixel y grows downward; flux grows upward → drag-down = flux-down
+        const df = (dyCanvas / plotH) * yspan
+        setViewYMin(dragRef.current.startViewY0 + df)
+        setViewYMax(dragRef.current.startViewY1 + df)
+      } else {
+        // X pan (default).
+        const dxCss = e.clientX - dragRef.current.startClientX
+        const dxCanvas = dxCss * cssPerPxX
+        const plotW = canvas.width - PAD.left - PAD.right
+        const span = dragRef.current.startViewT1 - dragRef.current.startViewT0
+        // Drag right = move window LEFT in time (panning the content)
+        const dt = -(dxCanvas / plotW) * span
+
+        let newStart = dragRef.current.startViewT0 + dt
+        let newEnd = dragRef.current.startViewT1 + dt
+        if (newStart < fullStart) { const adj = fullStart - newStart; newStart += adj; newEnd += adj }
+        if (newEnd > fullEnd) { const adj = newEnd - fullEnd; newStart -= adj; newEnd -= adj }
+        setViewStartT(newStart)
+        setViewEndT(newEnd)
+      }
     },
-    [fullStart, fullEnd, PAD.left, PAD.right],
+    [fullStart, fullEnd, PAD.left, PAD.right, PAD.top, PAD.bottom],
   )
 
   /**
@@ -714,14 +964,32 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
   )
 
   /**
-   * @description Double-click anywhere on the chart resets the view to the
-   * full data range.
+   * @description Double-click anywhere on the chart resets the view —
+   * both the X (time) window and the Y (flux) zoom — to their auto-fit
+   * defaults. Setting Y back to null makes `getCanvasCoords` fall back
+   * to the p2/p98 `fluxRange`.
    */
   const handleDoubleClick = useCallback(() => {
     if (!interactive) return
     setViewStartT(fullStart)
     setViewEndT(fullEnd)
+    setViewYMin(null)
+    setViewYMax(null)
   }, [interactive, fullStart, fullEnd])
+
+  /**
+   * @description Resets just the Y zoom back to auto-fit (p2/p98). Used
+   * by the explicit "RESET Y" button so the user can rescale flux
+   * without losing their current X zoom.
+   */
+  const handleResetY = useCallback(() => {
+    setViewYMin(null)
+    setViewYMax(null)
+  }, [])
+
+  // Convenience: is Y currently auto-fit? Drives whether to show the
+  // RESET Y affordance as enabled/highlighted.
+  const isYAutoFit = viewYMin === null && viewYMax === null
 
   /**
    * @description Renders the minimap strip below the main chart: a tiny
@@ -868,7 +1136,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
           touchAction: interactive ? 'none' : 'auto',
         }}
         onMouseMove={handleMouseMove}
-        onMouseLeave={() => setTooltip(null)}
+        onMouseLeave={() => { setTooltip(null); setGapHover(null) }}
         onPointerDown={interactive ? handlePointerDown : undefined}
         onPointerMove={interactive ? handlePointerMove : undefined}
         onPointerUp={interactive ? handlePointerUp : undefined}
@@ -895,14 +1163,41 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       {interactive && (
         <div
           style={{
-            fontSize: 8,
-            color: 'rgba(255,255,255,0.4)',
-            letterSpacing: 1.5,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 12,
             marginTop: 4,
-            textAlign: 'center',
           }}
         >
-          SCROLL TO ZOOM · DRAG TO PAN · CLICK DIP TO INSPECT · DOUBLE-CLICK TO RESET · CLICK MINIMAP TO JUMP
+          <div
+            style={{
+              fontSize: 8,
+              color: 'rgba(255,255,255,0.4)',
+              letterSpacing: 1.5,
+              textAlign: 'center',
+            }}
+          >
+            SCROLL = ZOOM X · SHIFT+SCROLL = ZOOM Y · DRAG = PAN X · SHIFT+DRAG = PAN Y · CLICK DIP TO INSPECT · DOUBLE-CLICK TO RESET
+          </div>
+          <button
+            type="button"
+            onClick={handleResetY}
+            disabled={isYAutoFit}
+            style={{
+              fontSize: 8,
+              letterSpacing: 1.5,
+              padding: '2px 8px',
+              borderRadius: 3,
+              border: '1px solid rgba(76,201,240,0.4)',
+              background: isYAutoFit ? 'rgba(76,201,240,0.06)' : 'rgba(76,201,240,0.18)',
+              color: isYAutoFit ? 'rgba(255,255,255,0.3)' : '#4cc9f0',
+              cursor: isYAutoFit ? 'default' : 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            RESET Y
+          </button>
         </div>
       )}
       {tooltip && !pinnedDip && (
@@ -931,6 +1226,32 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
             Duration: {tooltip.dip.duration.toFixed(2)}d<br />
             Peak: {tooltip.dip.peakTime.toFixed(2)} BKJD
           </div>
+        </div>
+      )}
+      {gapHover && !tooltip && !pinnedDip && (
+        <div
+          style={{
+            position: 'absolute',
+            left: gapHover.x + 12,
+            top: gapHover.y - 10,
+            background: 'rgba(0,0,0,0.88)',
+            border: '1px solid rgba(255,255,255,0.15)',
+            borderRadius: 4,
+            padding: '6px 9px',
+            fontSize: 9,
+            fontFamily: 'JetBrains Mono, monospace',
+            color: 'rgba(255,255,255,0.7)',
+            letterSpacing: 0.5,
+            pointerEvents: 'none',
+            zIndex: 98,
+            maxWidth: 220,
+            lineHeight: 1.5,
+          }}
+        >
+          Kepler observation gap<br />
+          <span style={{ color: 'rgba(255,255,255,0.4)' }}>
+            telescope reorientation · {gapHover.days.toFixed(1)} days
+          </span>
         </div>
       )}
       {pinnedDip && (

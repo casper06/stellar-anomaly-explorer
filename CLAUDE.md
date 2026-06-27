@@ -133,12 +133,31 @@ so the browser never talks to external archives directly (CORS).
   returns 400 Bad Request as of 2026 — we extract the embedded `uri=`
   param and download directly from `archive.stsci.edu` over HTTPS.
 - Response shape: `{ times: number[], flux: number[], source: 'real' | 'unavailable' | 'synthetic', provenance: { sourceName, mission, dataType } }`
-- Cached in-process per id (Kepler PDC files are static; only successful
-  full-concatenation results are cached, never empty arrays)
+- **Two-level cache** (Kepler PDC files are static, so caching is safe):
+  - **L1 in-process** `Map<id, {times, flux}>` — instant, but lost on
+    every dev-server restart.
+  - **L2 disk** at `<os.tmpdir()>/stellar-cache/{id}.json` with a
+    **7-day TTL** (`stat.mtimeMs` vs `Date.now()`). Survives restarts.
+    Atomic writes via temp-file + rename so a crash mid-write can't
+    leave a corrupt JSON on disk. The id is sanitized
+    (`/[^A-Za-z0-9_-]/g → _`) so unexpected characters can't escape
+    the cache directory.
+  - Request order: L1 → L2 (promotes to L1 on hit) → MAST. Only
+    successful full-concatenation results are written; never empty
+    arrays or partial fetches. The disk write is fire-and-forget
+    (`void writeDiskCache(...)`) so it doesn't delay the response.
 - First real fetch can take 30–90s (parallel download of ~17 FITS files,
-  ~80KB each); subsequent ones are instant from cache
+  ~80KB each); subsequent ones are instant from cache — even after a
+  dev-server restart, thanks to L2.
 - Do NOT use the legacy `mast.stsci.edu/api/v0/invoke` Mashup endpoint — it
   hangs indefinitely as of 2026. The VO-TAP service is the replacement.
+- **Per-quarter diagnostic logging**: when a quarter fails to download
+  or parse, the log line names it by filename
+  (`kplrNNNNNNNNN-YYYYDDDHHMMSS_llc.fits`) plus the failure reason
+  (HTTP status, parse error, or "too few valid rows"). Aggregate
+  success log also lists the *failed* filenames when any drop out, so
+  "missing quarters" can be diagnosed from a single log read without
+  cross-referencing per-quarter errors with the input list.
 
 ### Fallback policy (important)
 **Synthetic data is never shown to production users.** When the real MAST
@@ -211,18 +230,44 @@ The side panel width is fixed at 300px; the prior 300↔520 width
 animation is gone since the chart no longer renders inline.
 
 ### LightCurve rendering details
-- **Outlier filter**: any sample with `flux > 1.05` or `flux < 0.5` is
-  replaced with `null` before any drawing or range calculation. The draw
-  loop treats nulls as pen-up so the line skips outliers cleanly rather
-  than spiking to NaN.
-- **Y range**: percentile-based, NOT min/max. We take p2 and p98 of the
-  non-null flux samples and add 10% padding. NO hard cap. The earlier
-  `median ± 0.15` cap defended against outliers that slipped past the
-  >1.05/<0.5 filter, but it also clipped legitimate stellar variability
-  on intrinsic variables. With ~60k samples, the p2/p98 cushion already
-  excludes >1200 samples on each side — way more than the handful of
-  cosmic-ray hits that survive the outlier filter — so real variations
-  show through faithfully.
+- **Outlier filter** (asymmetric — this was a real bug for months):
+  two cascaded filters replace bad samples with `null` before any
+  drawing or range calculation. The draw loop treats nulls as pen-up
+  so the line skips cleanly rather than spiking to NaN.
+  1. **Absolute hard bounds**: drop `flux > 1.05 || flux < 0.5`.
+     Defends against truly broken values (negative flux, ~10× baseline
+     spikes) that would otherwise inflate the MAD estimate below.
+  2. **ASYMMETRIC MAD filter** (`MAD_K = 5`): compute the median of
+     the survivors, then their MAD (median absolute deviation), then
+     drop any sample where `f > median + 5 * MAD`. **No lower MAD
+     bound** — only the upper side. Cosmic-ray hits in Kepler PDC
+     photometry are upward spikes (photon pile-up); real
+     astrophysical events (transits, KIC 8462852's dips, KIC 12557548
+     dust occultations) are downward. The previous symmetric filter
+     rejected the famous −22% Tabby's dips because, in a quiet noise
+     band with MAD ≈ 0.0002, a 22% downward excursion was 1100×
+     larger than the threshold and looked identical to a cosmic ray.
+     The asymmetric form catches upward spikes (which adapt to each
+     star's noise level) while leaving downward dips of any depth
+     untouched.
+- **Y range** (auto-fit, when the user hasn't shift-scrolled): two-stage.
+  1. Start from **p1/p99** of the full non-null `cleanedFlux` array
+     with 10% padding. (Was p2/p98 — bumped because the 2% cutoff was
+     still clipping the noise band on stars with broad intrinsic
+     variability.) NO hard cap. With ~60k samples, p1/p99 leaves ~600
+     samples of cushion on each side — way more than the few cosmic
+     rays that survive the MAD filter.
+  2. **Window-aware downward extension**: deep narrow dips (Tabby's
+     −22%, KIC 12557548) are sub-1% of total samples, so even p1
+     misses them. After computing the percentile range, `getCanvasCoords`
+     scans the CURRENT visible X window (via binary search into the
+     monotonic `times` array) for any sample below `minF`. If found,
+     extends `minF` down to that value with 5% padding. The user
+     always sees the deepest dip in their current view.
+
+  When the user has explicitly set `viewYMin`/`viewYMax` (shift+scroll
+  or shift+drag), this auto-fit logic is skipped entirely — manual Y
+  overrides verbatim.
 - **Stroke-only**: the line uses `ctx.stroke()` exclusively; there is no
   fill under the curve. The canvas is also `ctx.clip()`-ed to the plot
   rect so partial segments at the edges (when zoomed in) don't bleed
@@ -235,26 +280,46 @@ animation is gone since the chart no longer renders inline.
   internally consistent.
 - **Dip label collision**: when multiple dip markers cluster (e.g.
   periodic dips on KIC 11610797), only the highest-scoring dip in any
-  40-px x-window gets a text label. All dots still draw — only the
-  text is suppressed. Implemented as two passes: build visible-dips
-  list, sort copy by score desc, walk picking labels that don't
-  collide with already-picked labels.
+  60-CSS-px x-window gets a text label. All dots still draw — only
+  the text is suppressed. Implemented as two passes: build
+  visible-dips list, sort copy by score desc, walk picking labels
+  that don't collide with already-picked labels. The 60-px threshold
+  is converted to canvas pixels per render (via
+  `canvas.width / rect.width`) so perceived spacing stays consistent
+  across the 460-px inline chart and the 1600-px fullscreen chart.
 
 ### Interactive LightCurve mode
 `<LightCurve interactive />` (used in the fullscreen overlay) adds:
-- **Wheel zoom** on the X axis, centered on the cursor. Min window =
-  0.1% of full range. Implemented via a native `wheel` listener with
-  `{ passive: false }` because React's synthetic `onWheel` is passive in
-  modern browsers and `preventDefault` becomes a no-op there. We
-  ALWAYS preventDefault — no Ctrl-key gate — so the user can zoom
-  freely without holding modifiers. `LightCurveFullscreen` also sets
+- **Wheel zoom**: plain scroll zooms the X axis around the cursor (factor
+  1.25/tick); **Shift + scroll** zooms the Y axis around the cursor at
+  the much gentler 1.05/tick — at typical flux scale (~0.01) the
+  1.25/tick step felt like jumping an entire pane per click, while
+  1.05 gives ~14 ticks to halve the range. Min X window = 0.1% of full
+  range. Y zoom is anchored to the cursor's flux value and can go from
+  0.1% of the data range (deep flux inspection) up to 10× (zoomed out
+  to see context beyond the auto-fit range). Both implemented via a
+  single native `wheel` listener with `{ passive: false }` because
+  React's synthetic `onWheel` is passive in modern browsers and
+  `preventDefault` becomes a no-op there. We ALWAYS preventDefault —
+  no Ctrl-key gate. `LightCurveFullscreen` also sets
   `document.body.style.overflow = 'hidden'` while mounted and restores
   the previous value on unmount, so even wheel events outside the
   canvas (e.g. on the legend) can't scroll the page underneath.
-- **Drag-to-pan**: pointer down + move pans the X window in time-space.
-  Uses pointer capture so a drag that exits the canvas still tracks.
-  Movement below ~5 px is NOT treated as a drag, so a small wiggle
-  during a click doesn't pan the chart.
+- **Y zoom state**: `viewYMin`/`viewYMax` are nullable. `null` means
+  "auto-fit to the p2/p98 `fluxRange`"; the moment the user
+  shift-scrolls or shift-drags, both become concrete numbers that
+  override the auto-fit. The auto-fit is per-dataset so quiet stars
+  and noisy variables both start with a sensible default.
+- **RESET Y button** next to the hint line: clears `viewYMin`/`Max`
+  back to null (auto-fit) without touching the current X zoom.
+  Disabled visually when Y is already auto-fit.
+- **Drag-to-pan**: pointer down + move pans the chart. Plain drag pans
+  the X window in time-space; **Shift+drag** pans the Y window in
+  flux-space (and pulls `viewYMin`/`Max` out of auto-fit, same as
+  shift+scroll). Mode is locked at pointerdown — releasing shift
+  mid-drag doesn't flip the axis. Uses pointer capture so a drag that
+  exits the canvas still tracks. Movement below ~5 px is NOT treated
+  as a drag, so a small wiggle during a click doesn't pan the chart.
 - **Click on a dip marker**: pin the dip and zoom to it. Hit-test
   radius is ~12 CSS px around each marker center. A successful hit
   pins the dip (sticky tooltip with label, score, depth, duration,
@@ -263,7 +328,17 @@ animation is gone since the chart no longer renders inline.
   even short dips show context. Clicking empty chart space dismisses
   the pinned dip. The hover tooltip is suppressed while a dip is
   pinned to avoid two tooltips fighting for the user's attention.
-- **Double-click**: resets to full data range.
+- **Double-click**: resets BOTH X (full data range) and Y (auto-fit).
+  This is the "I'm lost, take me back to the overview" gesture.
+- **Hover over an inter-quarter gap**: shows a subtle monospace tooltip
+  ("Kepler observation gap — telescope reorientation · N.N days") so
+  users understand the black bands aren't missing/corrupted data. The
+  gap regions are memoized once per dataset from the existing `times`
+  array (any `times[i+1] - times[i] > GAP_DAYS` qualifies). Tooltip is
+  suppressed when a dip tooltip is also active, so the two never
+  collide. NOTE: copy intentionally avoids quoting "~90 days" — that
+  was a misconception. Kepler QUARTERS are ~90 days; inter-quarter
+  GAPS are typically 1–4 days. The actual gap size is shown.
 - **Minimap strip** below the main chart: a downsampled rendering of
   the full curve with a translucent cyan rectangle highlighting the
   current visible window. Clicking the minimap centers the view there
@@ -292,6 +367,15 @@ Plotly, and similar tools. It reduces N points to ~`LTTB_TARGET_POINTS`
 triangle with the previous selected point and the average of the next
 bucket. Preserves visual peaks (so dips stay visible) and produces a
 clean line — no fill artifact, deterministic, O(N).
+
+**Min/max preservation** (custom extension): standard LTTB can still
+miss the segment's global y-extremes if they fall in a bucket whose
+largest triangle is formed by a different point. For Kepler curves
+that can hide deep narrow dips (Tabby's −22% events span <50 samples
+out of ~60k). After the standard pass, `lttbIndices` splices in the
+global y-min and y-max indices of the segment if not already present,
+preserving chronological order via binary-search insertion. Cost: one
+extra O(N) pass to find the extremes, +0–2 spliced entries.
 
 We previously tried min/max-per-column envelope rendering and a
 heuristic oscillation fallback (toggling envelope vs per-column

@@ -1,4 +1,7 @@
 import { NextResponse } from 'next/server'
+import { promises as fs } from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import { KNOWN_ANOMALIES } from '@/lib/starCatalog'
 import {
   generateSyntheticLightcurve,
@@ -10,10 +13,93 @@ import { readKeplerLightcurveColumns } from '@/lib/fitsReader'
 
 /**
  * @description Cache successful real fetches for the lifetime of the server
- * process. Kepler PDC files are static so this is safe; first request pays
- * the network cost, subsequent ones are instant.
+ * process. L1 cache — instant, but lost on restart. The L2 disk cache
+ * below survives restarts.
  */
 const cache = new Map<string, { times: number[]; flux: number[] }>()
+
+/**
+ * @description Two-week TTL for the disk cache. Kepler PDC files are static
+ * so we could cache forever, but expiring lets us retry occasionally
+ * in case MAST publishes corrected data, and bounds local disk usage.
+ */
+const DISK_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+/** @description Directory under OS temp where parsed light curves are cached. */
+const DISK_CACHE_DIR = path.join(os.tmpdir(), 'stellar-cache')
+
+/**
+ * @description Returns the cache file path for a given star id. Sanitizes
+ * the id so unexpected characters can't escape the cache directory.
+ * @param id Catalog id (e.g. "KIC8462852").
+ */
+function diskCachePath(id: string): string {
+  const safe = id.replace(/[^A-Za-z0-9_-]/g, '_')
+  return path.join(DISK_CACHE_DIR, `${safe}.json`)
+}
+
+/**
+ * @description Reads the disk cache for a star id. Returns null if the file
+ * doesn't exist, is older than TTL, or fails to parse. Logs the reason
+ * either way so cache misses are visible alongside hits.
+ * @param id Catalog id.
+ * @param tag Log prefix.
+ */
+async function readDiskCache(
+  id: string,
+  tag: string,
+): Promise<{ times: number[]; flux: number[] } | null> {
+  const file = diskCachePath(id)
+  try {
+    const stat = await fs.stat(file)
+    const ageMs = Date.now() - stat.mtimeMs
+    if (ageMs > DISK_CACHE_TTL_MS) {
+      console.error(`${tag} disk cache for ${id} is stale (${Math.round(ageMs / 86400000)}d old); ignoring`)
+      return null
+    }
+    const raw = await fs.readFile(file, 'utf8')
+    const parsed = JSON.parse(raw) as { times: number[]; flux: number[] }
+    if (!Array.isArray(parsed.times) || !Array.isArray(parsed.flux) || parsed.times.length < 10) {
+      console.error(`${tag} disk cache for ${id} parsed but malformed; ignoring`)
+      return null
+    }
+    console.error(`${tag} disk cache HIT for ${id} (${parsed.times.length} samples, age ${Math.round(ageMs / 3600000)}h)`)
+    return parsed
+  } catch (e) {
+    // ENOENT is the common case — file doesn't exist yet. Don't spam logs.
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.error(`${tag} disk cache read error for ${id}:`, e)
+    }
+    return null
+  }
+}
+
+/**
+ * @description Writes a successful MAST fetch to the disk cache. Uses
+ * write-to-temp + rename so a crash mid-write can't leave a corrupted
+ * file that would then be returned on next read.
+ * @param id Catalog id.
+ * @param data Parsed light curve (times + flux).
+ * @param tag Log prefix.
+ */
+async function writeDiskCache(
+  id: string,
+  data: { times: number[]; flux: number[] },
+  tag: string,
+): Promise<void> {
+  const file = diskCachePath(id)
+  const tmp = `${file}.${process.pid}.tmp`
+  try {
+    await fs.mkdir(DISK_CACHE_DIR, { recursive: true })
+    await fs.writeFile(tmp, JSON.stringify(data), 'utf8')
+    await fs.rename(tmp, file)
+    console.error(`${tag} disk cache WROTE ${id} (${data.times.length} samples) → ${file}`)
+  } catch (e) {
+    console.error(`${tag} disk cache write error for ${id}:`, e)
+    // Best-effort cleanup of the temp file
+    try { await fs.unlink(tmp) } catch { /* ignore */ }
+  }
+}
 
 /**
  * @description Returns true if the given id is a known anomaly we'll try to
@@ -95,10 +181,15 @@ async function fetchAndParseQuarter(
     downloadUrl = decodeURIComponent(uriMatch[1]).replace(/^http:\/\//, 'https://')
   }
 
+  // Short-name label for per-quarter logs so a long URL doesn't dominate
+  // the line. Filenames look like `kplrNNNNNNNNN-YYYYDDDHHMMSS_llc.fits`;
+  // the timestamp suffix is the only part that varies per quarter.
+  const fname = downloadUrl.split('/').pop() ?? downloadUrl
+
   try {
     const fitsRes = await fetch(downloadUrl, { signal: AbortSignal.timeout(60000) })
     if (!fitsRes.ok) {
-      console.error(`${tag} FITS ${downloadUrl} → ${fitsRes.status} ${fitsRes.statusText}`)
+      console.error(`${tag} quarter ${fname} → HTTP ${fitsRes.status} ${fitsRes.statusText}`)
       return null
     }
     const fitsBuf = Buffer.from(await fitsRes.arrayBuffer())
@@ -110,7 +201,7 @@ async function fetchAndParseQuarter(
       rawTimes = cols.col1
       rawFlux = cols.col2
     } catch (e) {
-      console.error(`${tag} FITS parse error for ${downloadUrl}:`, e)
+      console.error(`${tag} quarter ${fname} → FITS parse error:`, e)
       return null
     }
 
@@ -123,7 +214,13 @@ async function fetchAndParseQuarter(
         pairs.push([t, f])
       }
     }
-    if (pairs.length < 50) return null
+    if (pairs.length < 50) {
+      // Used to silently return null here. Make the drop visible so a
+      // missing quarter shows up in the log instead of just shrinking
+      // the success count.
+      console.error(`${tag} quarter ${fname} → only ${pairs.length} valid rows (need 50); dropping`)
+      return null
+    }
 
     // Per-quarter median normalization so concatenated quarters join smoothly
     const sortedFlux = pairs.map(p => p[1]).sort((a, b) => a - b)
@@ -133,7 +230,7 @@ async function fetchAndParseQuarter(
       flux: pairs.map(p => p[1] / median),
     }
   } catch (e) {
-    console.error(`${tag} fetchAndParseQuarter caught:`, e)
+    console.error(`${tag} quarter ${fname} → caught:`, e)
     return null
   }
 }
@@ -187,13 +284,34 @@ async function tryFetchRealLightcurve(
       const u = row[accessUrlIdx]
       if (typeof u === 'string' && u.includes('_llc.fits')) lcUrls.push(u)
     }
-    console.error(`${tag} ${lcUrls.length} _llc.fits quarters to download in parallel`)
+    // Resolve each TAP `access_url` to its underlying archive filename so
+    // logs identify quarters by their kplrNNNNNNNNN-YYYYDDDHHMMSS_llc.fits
+    // name. Helps diagnose "missing quarters" — if TAP returned only N
+    // rows you'll see exactly which timestamps came back.
+    const lcFilenames = lcUrls.map(u => {
+      const m = u.match(/[?&]uri=([^&]+)/)
+      const inner = m ? decodeURIComponent(m[1]) : u
+      return inner.split('/').pop() ?? inner
+    })
+    console.error(
+      `${tag} ${lcUrls.length} _llc.fits quarters to download in parallel: ${lcFilenames.join(', ')}`,
+    )
     if (lcUrls.length === 0) return null
 
     // Download + parse all quarters in parallel
     const quarters = await Promise.all(lcUrls.map(fetchAndParseQuarter))
     const ok = quarters.filter((q): q is { times: number[]; flux: number[] } => q !== null)
-    console.error(`${tag} ${ok.length}/${quarters.length} quarters parsed successfully`)
+    if (ok.length < quarters.length) {
+      // Identify which inputs failed so the user doesn't have to cross-
+      // reference per-quarter error logs with the input list manually.
+      const failed: string[] = []
+      quarters.forEach((q, i) => { if (q === null) failed.push(lcFilenames[i]) })
+      console.error(
+        `${tag} ${ok.length}/${quarters.length} quarters parsed successfully; failed: ${failed.join(', ')}`,
+      )
+    } else {
+      console.error(`${tag} ${ok.length}/${quarters.length} quarters parsed successfully`)
+    }
     if (ok.length === 0) return null
 
     // Sort quarters by first timestamp, then flatten. Within each quarter the
@@ -236,11 +354,23 @@ export async function GET(
   const tag = '[lightcurve]'
   console.error(`${tag} GET /api/lightcurve/${id} (NODE_ENV=${process.env.NODE_ENV})`)
 
+  // L1: in-process cache (instant, lost on restart)
   if (cache.has(id)) {
-    console.error(`${tag} cache hit for ${id}`)
+    console.error(`${tag} in-process cache HIT for ${id}`)
     const cached = cache.get(id)!
     return NextResponse.json({
       ...cached,
+      source: 'real' as const,
+      provenance: KEPLER_PROVENANCE,
+    })
+  }
+
+  // L2: disk cache (survives restarts; 7-day TTL)
+  const onDisk = await readDiskCache(id, tag)
+  if (onDisk) {
+    cache.set(id, onDisk) // promote to L1 for the rest of this process
+    return NextResponse.json({
+      ...onDisk,
       source: 'real' as const,
       provenance: KEPLER_PROVENANCE,
     })
@@ -253,6 +383,9 @@ export async function GET(
     if (real) {
       console.error(`${tag} returning REAL data for ${id}`)
       cache.set(id, real)
+      // Fire-and-forget the disk write so we don't delay the response.
+      // Failures inside writeDiskCache are logged but don't bubble up.
+      void writeDiskCache(id, real, tag)
       return NextResponse.json({
         ...real,
         source: 'real' as const,
