@@ -1,0 +1,990 @@
+'use client'
+import { useEffect, useState } from 'react'
+import { useStore, type Anomaly, type LightcurveProvenance } from '@/lib/store'
+import LightCurve from './LightCurve'
+
+/**
+ * @description Glossary of plain-English explanations for technical astronomy
+ * terms shown in the panel. Hovering the (?) badge next to a term reveals the
+ * matching entry. Kept in one map so it stays trivial to add/edit terms.
+ */
+const GLOSSARY: Record<string, string> = {
+  MAG: 'Magnitude: how bright the star appears from Earth. Lower number = brighter.',
+  RA: 'Right Ascension: the celestial equivalent of longitude, measured in degrees.',
+  DEC: 'Declination: the celestial equivalent of latitude, measured in degrees.',
+  COLOR: 'Spectral type: derived from the B-V color index. Blue = hot and young, red = cool or giant.',
+  DIP: 'Brightness dip: a moment when the star dimmed unexpectedly.',
+  SCORE: 'How rare the event is. WOW = extremely anomalous, with no known explanation.',
+  DEPTH: 'Dip depth: percentage of light lost relative to normal brightness.',
+  DURATION: 'Dip duration in days.',
+  BKJD: 'Barycentric Kepler Julian Date: time system used by the Kepler telescope.',
+}
+
+/**
+ * @description Color used to fill the central glow of the SVG star visualization, based on
+ * the B-V color index. Mirrors the palette used in StarField but tuned for the
+ * larger sphere where saturation reads stronger.
+ * @param bv B-V color index (negative = hot, positive = cool).
+ * @returns Core (inner) and halo (outer) hex colors for the radial gradient.
+ */
+function bvToVisualColor(bv: number): { core: string; halo: string } {
+  if (bv < 0) return { core: '#cfe2ff', halo: '#5b8def' }
+  if (bv < 0.3) return { core: '#f0f6ff', halo: '#9ab8e8' }
+  if (bv < 0.6) return { core: '#fffaf0', halo: '#f5d97c' }
+  if (bv < 1.0) return { core: '#ffe5a8', halo: '#f4a261' }
+  return { core: '#ffd0c2', halo: '#e76f51' }
+}
+
+const LABEL_COLOR: Record<string, string> = {
+  WOW: '#ff4d6d',
+  INTERESTING: '#f4a261',
+  NOTABLE: '#4cc9f0',
+  NORMAL: 'rgba(255,255,255,0.3)',
+}
+
+/**
+ * @description Donut-style SVG ring that fills clockwise in proportion to an anomaly
+ * score (0–1). Stroke color shifts at WOW/INTERESTING/NOTABLE thresholds
+ * to give the user an at-a-glance read on severity.
+ * @param score Anomaly score in [0, 1].
+ * @returns SVG element ~70×70 px.
+ */
+function ScoreRing({ score }: { score: number }) {
+  const r = 28
+  const circ = 2 * Math.PI * r
+  const dash = circ * score
+  const color =
+    score >= 0.60 ? '#ff4d6d'
+    : score >= 0.40 ? '#f4a261'
+    : score >= 0.20 ? '#4cc9f0'
+    : 'rgba(255,255,255,0.3)'
+
+  return (
+    <svg width={70} height={70} viewBox="0 0 70 70">
+      <circle cx={35} cy={35} r={r} fill="none" stroke="rgba(255,255,255,0.07)" strokeWidth={4} />
+      <circle
+        cx={35}
+        cy={35}
+        r={r}
+        fill="none"
+        stroke={color}
+        strokeWidth={4}
+        strokeDasharray={`${dash} ${circ}`}
+        strokeLinecap="round"
+        transform="rotate(-90 35 35)"
+        style={{ transition: 'stroke-dasharray 0.8s ease' }}
+      />
+      <text x={35} y={35} textAnchor="middle" dominantBaseline="central" fill={color} fontSize={12} fontWeight={700} fontFamily="JetBrains Mono, monospace">
+        {Math.round(score * 100)}
+      </text>
+      <text x={35} y={47} textAnchor="middle" fill="rgba(255,255,255,0.3)" fontSize={7} fontFamily="JetBrains Mono, monospace">
+        SCORE
+      </text>
+    </svg>
+  )
+}
+
+/**
+ * @description SVG representation of how the selected star would look up close: a radial
+ * gradient sphere colored by B-V, an outer corona, and (for known anomalies)
+ * a pulsing red ring drawn via a CSS @keyframes animation injected once below.
+ * @param colorIndex B-V color index; selects the gradient palette.
+ * @param isAnomaly If true, adds the pulsing dashed red ring.
+ * @returns 140×140 SVG suitable for the panel header.
+ */
+function StarVisualization({
+  colorIndex,
+  isAnomaly,
+}: {
+  colorIndex: number
+  isAnomaly: boolean
+}) {
+  const { core, halo } = bvToVisualColor(colorIndex)
+  const gid = `star-grad-${Math.round(colorIndex * 1000)}`
+  const cid = `star-corona-${Math.round(colorIndex * 1000)}`
+
+  return (
+    <div style={{ position: 'relative', width: 140, height: 140, margin: '0 auto' }}>
+      <svg width={140} height={140} viewBox="0 0 140 140">
+        <defs>
+          <radialGradient id={gid} cx="40%" cy="40%" r="60%">
+            <stop offset="0%" stopColor="#ffffff" stopOpacity={0.95} />
+            <stop offset="35%" stopColor={core} stopOpacity={1} />
+            <stop offset="100%" stopColor={halo} stopOpacity={1} />
+          </radialGradient>
+          <radialGradient id={cid} cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor={halo} stopOpacity={0.45} />
+            <stop offset="60%" stopColor={halo} stopOpacity={0.12} />
+            <stop offset="100%" stopColor={halo} stopOpacity={0} />
+          </radialGradient>
+        </defs>
+
+        {/* Corona */}
+        <circle cx={70} cy={70} r={66} fill={`url(#${cid})`} />
+        {/* Star body */}
+        <circle cx={70} cy={70} r={36} fill={`url(#${gid})`} />
+
+        {/* Anomaly ring */}
+        {isAnomaly && (
+          <circle
+            cx={70}
+            cy={70}
+            r={52}
+            fill="none"
+            stroke="#ff4d6d"
+            strokeWidth={1.5}
+            strokeDasharray="3 5"
+            style={{
+              transformOrigin: 'center',
+              animation: 'anomaly-ring-pulse 2.4s ease-in-out infinite',
+            }}
+          />
+        )}
+      </svg>
+      <style jsx>{`
+        @keyframes anomaly-ring-pulse {
+          0%, 100% { opacity: 0.35; transform: scale(1); }
+          50%      { opacity: 0.9;  transform: scale(1.08); }
+        }
+      `}</style>
+    </div>
+  )
+}
+
+/**
+ * @description Small "?" badge next to a label. On hover/focus, shows a tooltip with the
+ * matching glossary entry. Falls back silently if the term isn't in GLOSSARY.
+ * @param term Key into GLOSSARY (e.g. "MAG", "RA").
+ * @returns Inline badge, or null if the term has no glossary entry.
+ */
+function InfoBadge({ term }: { term: string }) {
+  const [open, setOpen] = useState(false)
+  const text = GLOSSARY[term]
+  if (!text) return null
+
+  return (
+    <span
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
+      tabIndex={0}
+      style={{
+        position: 'relative',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        width: 12,
+        height: 12,
+        marginLeft: 4,
+        borderRadius: '50%',
+        border: '1px solid rgba(255,255,255,0.25)',
+        color: 'rgba(255,255,255,0.5)',
+        fontSize: 8,
+        cursor: 'help',
+        userSelect: 'none',
+        outline: 'none',
+      }}
+    >
+      ?
+      {open && (
+        <span
+          style={{
+            position: 'absolute',
+            bottom: 'calc(100% + 6px)',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: 'rgba(0,0,0,0.95)',
+            border: '1px solid rgba(76,201,240,0.4)',
+            borderRadius: 4,
+            padding: '6px 10px',
+            fontSize: 9,
+            lineHeight: 1.5,
+            color: 'rgba(255,255,255,0.85)',
+            width: 200,
+            textAlign: 'left',
+            letterSpacing: 0.3,
+            pointerEvents: 'none',
+            zIndex: 100,
+          }}
+        >
+          {text}
+        </span>
+      )}
+    </span>
+  )
+}
+
+/**
+ * @description Pill-shaped provenance badge that tells the user where the
+ * light curve came from. Four states:
+ * - `'real'`     → green "REAL DATA" (Kepler PDC from MAST)
+ * - `'unavailable'` → grey "DATA UNAVAILABLE" (real fetch failed, no fake substitute)
+ * - `'synthetic'` → orange "DEV/SYNTHETIC" (dev-only stand-in, never in prod)
+ * - undefined    → faint "LOADING" while the fetch is in flight
+ * @param source Provenance string from the lightcurve API, or undefined while loading.
+ * @returns Small inline badge styled to match the panel chrome.
+ */
+function DataSourceBadge({ source }: { source?: 'real' | 'unavailable' | 'synthetic' }) {
+  const config =
+    source === 'real'
+      ? { label: 'REAL DATA', color: '#4ade80', bg: 'rgba(74,222,128,0.12)', border: 'rgba(74,222,128,0.5)' }
+      : source === 'unavailable'
+        ? { label: 'DATA UNAVAILABLE', color: 'rgba(255,255,255,0.55)', bg: 'rgba(255,255,255,0.05)', border: 'rgba(255,255,255,0.25)' }
+        : source === 'synthetic'
+          ? { label: 'DEV/SYNTHETIC', color: '#f4a261', bg: 'rgba(244,162,97,0.12)', border: 'rgba(244,162,97,0.5)' }
+          : { label: 'LOADING', color: 'rgba(255,255,255,0.4)', bg: 'rgba(255,255,255,0.04)', border: 'rgba(255,255,255,0.12)' }
+
+  return (
+    <span
+      style={{
+        display: 'inline-block',
+        fontSize: 8,
+        letterSpacing: 1.5,
+        padding: '2px 6px',
+        borderRadius: 3,
+        background: config.bg,
+        border: `1px solid ${config.border}`,
+        color: config.color,
+        fontWeight: 700,
+        lineHeight: 1.3,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {config.label}
+    </span>
+  )
+}
+
+/**
+ * @description Human-readable spectral classification label for a B-V color index, shown
+ * in the panel's COLOR row.
+ * @param bv B-V color index.
+ * @returns English descriptor with spectral class hint.
+ */
+function bvToColorName(bv: number): string {
+  if (bv < 0) return 'Bright blue (O/B)'
+  if (bv < 0.3) return 'Blue-white (A/F)'
+  if (bv < 0.6) return 'Yellow-white (F/G)'
+  if (bv < 1.0) return 'Yellow/Orange (G/K)'
+  return 'Red (M / Giant)'
+}
+
+/**
+ * @description Maps a 0–1 anomaly score to one of the four LABEL_COLOR keys,
+ * matching the same WOW / INTERESTING / NOTABLE / NORMAL thresholds the dip
+ * detector uses. Lets us render the catalog-recorded score in the panel
+ * with the same color language as live-detected dips.
+ * @param score Anomaly score in [0, 1].
+ * @returns Severity label string suitable for indexing LABEL_COLOR.
+ */
+function catalogLabelFor(score: number): 'WOW' | 'INTERESTING' | 'NOTABLE' | 'NORMAL' {
+  if (score >= 0.60) return 'WOW'
+  if (score >= 0.40) return 'INTERESTING'
+  if (score >= 0.20) return 'NOTABLE'
+  return 'NORMAL'
+}
+
+/**
+ * @description Returns the best Zooniverse destination for a given star id.
+ * Tabby's Star (KIC8462852) gets a dedicated variable-star project; everything
+ * else falls back to the generic "stars" tag listing.
+ * @param starId Catalog id, e.g. "KIC8462852".
+ * @returns Absolute Zooniverse URL.
+ */
+function zooniverseLinkFor(starId: string): string {
+  if (starId === 'KIC8462852') {
+    return 'https://www.zooniverse.org/projects/zookeeper/variable-star-zoo'
+  }
+  return 'https://www.zooniverse.org/projects?tag=stars'
+}
+
+/**
+ * @description Full-viewport modal that displays the selected star's light
+ * curve at a much larger size than the side panel allows. Fades in over
+ * 0.2s, closes on Escape or by clicking the dark backdrop outside the
+ * content card. The chart canvas is sized to ~70% of viewport height.
+ *
+ * `LABEL_COLOR` (declared above) is reused for the legend swatches so the
+ * fullscreen chart matches the side panel's color language.
+ * @param starName Star to show in the top bar.
+ * @param source Provenance state — drives the badge next to the name.
+ * @param times BKJD timestamps from the lightcurve payload.
+ * @param flux Normalized flux values, paired 1:1 with `times`.
+ * @param dips Detected dips with labels/scores used to render markers and the legend.
+ * @param onClose Called when the user dismisses the overlay.
+ * @returns A fixed-position fullscreen overlay.
+ */
+function LightCurveFullscreen({
+  starName,
+  source,
+  times,
+  flux,
+  dips,
+  onClose,
+}: {
+  starName: string
+  source: 'real' | 'unavailable' | 'synthetic'
+  times: number[]
+  flux: number[]
+  dips: Anomaly[]
+  onClose: () => void
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  // Chart pixel buffer for rasterization. CSS sizing fills the flex
+  // container; this number only controls how crisp the line looks when
+  // stretched. 1600 is a reasonable middle ground for 1080p–4k.
+  const canvasW = 1600
+  const canvasH = 720
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.92)',
+        zIndex: 100,
+        display: 'flex',
+        flexDirection: 'column',
+        height: '100vh',
+        overflow: 'hidden',
+        animation: 'lc-fs-fade 0.2s ease',
+        fontFamily: 'JetBrains Mono, monospace',
+      }}
+    >
+      {/* Inner content card — fills the viewport as a flex column. Click
+          here is stopped so chart interactions don't dismiss the overlay;
+          backdrop clicks (outside this card) still close. */}
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          width: 'min(1600px, 96vw)',
+          height: '100%',
+          margin: '0 auto',
+          padding: '20px 0 16px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 12,
+          minHeight: 0,
+          overflow: 'hidden',
+        }}
+      >
+        {/* Top bar — fixed-height header */}
+        <div
+          style={{
+            flex: '0 0 auto',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            paddingBottom: 12,
+            borderBottom: '1px solid rgba(255,255,255,0.1)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: 'white', letterSpacing: 1 }}>
+              {starName}
+            </div>
+            <DataSourceBadge source={source} />
+            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 2 }}>
+              LIGHT CURVE
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            aria-label="Close light curve"
+            style={{
+              background: 'none',
+              border: '1px solid rgba(255,255,255,0.2)',
+              borderRadius: 4,
+              width: 32,
+              height: 32,
+              color: 'rgba(255,255,255,0.7)',
+              fontSize: 16,
+              cursor: 'pointer',
+              lineHeight: 1,
+            }}
+          >
+            ✕
+          </button>
+        </div>
+
+        {/* Chart — flexes to fill remaining vertical space. The chart
+            component itself uses `fillContainer` so its main canvas is
+            flex:1 and the minimap+hint stay anchored to the bottom. */}
+        <div
+          style={{
+            flex: '1 1 auto',
+            minHeight: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            background: 'rgba(255,255,255,0.02)',
+            borderRadius: 8,
+            padding: 12,
+            overflow: 'hidden',
+          }}
+        >
+          <LightCurve
+            times={times}
+            flux={flux}
+            dips={dips}
+            width={canvasW}
+            height={canvasH}
+            interactive
+            fillContainer
+          />
+        </div>
+
+        {/* Legend — fixed-height footer, never clipped */}
+        <div
+          style={{
+            flex: '0 0 auto',
+            display: 'flex',
+            gap: 24,
+            justifyContent: 'center',
+          }}
+        >
+          {(['WOW', 'INTERESTING', 'NOTABLE', 'NORMAL'] as const).map(label => (
+            <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: '50%',
+                  background: LABEL_COLOR[label],
+                  boxShadow: label === 'WOW' ? `0 0 8px ${LABEL_COLOR[label]}` : undefined,
+                }}
+              />
+              <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', letterSpacing: 2 }}>
+                {label}
+              </span>
+            </div>
+          ))}
+        </div>
+        <div
+          style={{
+            flex: '0 0 auto',
+            fontSize: 9,
+            color: 'rgba(255,255,255,0.35)',
+            textAlign: 'center',
+            letterSpacing: 1,
+          }}
+        >
+          Click outside or press Esc to close
+        </div>
+      </div>
+
+      <style jsx>{`
+        @keyframes lc-fs-fade {
+          from { opacity: 0; }
+          to   { opacity: 1; }
+        }
+      `}</style>
+    </div>
+  )
+}
+
+/**
+ * @description Ordered pipeline steps shown to the user while the real MAST
+ * fetch is in flight. We don't have per-step events from the server, so
+ * this is a believable narration of what the route is actually doing
+ * (see `/api/lightcurve/[id]/route.ts`). Each step holds for at least
+ * `LOADING_STEP_MS` so the user can read it; the cycle loops if the
+ * fetch is still in flight when we hit the last step.
+ */
+const LOADING_STEPS = [
+  'Querying NASA/MAST catalog…',
+  'Found Kepler quarters for this target',
+  'Downloading photometry files…',
+  'Parsing FITS data…',
+  'Running anomaly detection…',
+]
+const LOADING_STEP_MS = 900
+
+/**
+ * @description Cycling progress indicator shown while the lightcurve fetch is
+ * in flight. The MAST cold-cache path can take 30–60s (parallel download of
+ * ~17 Kepler quarters); without this the panel looks frozen. Cycles through
+ * `LOADING_STEPS` so the user knows real work is happening. The bar uses a
+ * CSS keyframes sweep so it stays cheap (no JS per frame).
+ * @returns A bordered card with cycling copy + animated bar.
+ */
+function LoadingProgress() {
+  const [stepIdx, setStepIdx] = useState(0)
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setStepIdx(i => (i + 1) % LOADING_STEPS.length)
+    }, LOADING_STEP_MS)
+    return () => clearInterval(id)
+  }, [])
+
+  return (
+    <div
+      style={{
+        background: 'rgba(76,201,240,0.06)',
+        border: '1px solid rgba(76,201,240,0.3)',
+        borderRadius: 6,
+        padding: '12px 14px',
+        marginBottom: 16,
+      }}
+    >
+      <div
+        key={stepIdx}
+        style={{
+          fontSize: 10,
+          color: '#4cc9f0',
+          letterSpacing: 1,
+          lineHeight: 1.6,
+          animation: 'lc-step-fade 0.4s ease',
+        }}
+      >
+        {LOADING_STEPS[stepIdx]}
+      </div>
+      <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.5)', marginTop: 4, lineHeight: 1.5 }}>
+        First load can take up to 60s. Subsequent loads are instant.
+      </div>
+      <div
+        style={{
+          position: 'relative',
+          height: 3,
+          marginTop: 10,
+          background: 'rgba(255,255,255,0.06)',
+          borderRadius: 2,
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            height: '100%',
+            width: '35%',
+            background: 'linear-gradient(90deg, transparent, #4cc9f0, transparent)',
+            animation: 'lc-loading-sweep 1.4s ease-in-out infinite',
+          }}
+        />
+      </div>
+      <style jsx>{`
+        @keyframes lc-step-fade {
+          from { opacity: 0.3; transform: translateY(-2px); }
+          to   { opacity: 1;   transform: translateY(0); }
+        }
+        @keyframes lc-loading-sweep {
+          0%   { transform: translateX(-100%); }
+          100% { transform: translateX(370%); }
+        }
+      `}</style>
+    </div>
+  )
+}
+
+/**
+ * @description One-line citation under each dip card showing where the
+ * underlying time-series came from. Pulls labels straight from the
+ * lightcurve's `provenance` so adding a new mission (TESS, K2) doesn't
+ * require touching this component.
+ * @param provenance The provenance bundle from the API response.
+ * @returns Inline text node, or null if provenance is missing.
+ */
+function DipProvenanceLine({ provenance }: { provenance?: LightcurveProvenance }) {
+  if (!provenance) return null
+  return (
+    <div
+      style={{
+        fontSize: 7,
+        color: 'rgba(255,255,255,0.3)',
+        letterSpacing: 0.5,
+        marginTop: 6,
+        lineHeight: 1.5,
+      }}
+    >
+      Source: {provenance.sourceName} · {provenance.mission} · {provenance.dataType}
+    </div>
+  )
+}
+
+/**
+ * @description Right-side slide-in panel that appears whenever a star is selected. Shows
+ * the star visualization, coordinate/magnitude metadata, the score ring, a
+ * list of detected dips, an expandable light curve, and (for known anomalies)
+ * external citizen-science report links.
+ * @returns The panel, or null when no star is selected.
+ */
+export default function AnomalyPanel() {
+  const { selectedStar, lightcurve, lightcurveLoading, setSelectedStar, setMode } = useStore()
+  const [showLightcurve, setShowLightcurve] = useState(false)
+
+  if (!selectedStar) return null
+
+  /**
+
+
+   * @description Closes the panel and returns the app to explore mode.
+
+
+   */
+  function close() {
+    setSelectedStar(null)
+    setMode('explore')
+    setShowLightcurve(false)
+  }
+
+  return (
+    <>
+    <div
+      style={{
+        position: 'fixed',
+        top: 0,
+        right: 0,
+        bottom: 0,
+        width: 300,
+        background: 'rgba(0,0,0,0.88)',
+        backdropFilter: 'blur(12px)',
+        borderLeft: '1px solid rgba(255,255,255,0.08)',
+        zIndex: 20,
+        display: 'flex',
+        flexDirection: 'column',
+        fontFamily: 'JetBrains Mono, monospace',
+        overflowY: 'auto',
+      }}
+    >
+      {/* Header */}
+      <div
+        style={{
+          padding: '20px 20px 0',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'flex-start',
+          flexShrink: 0,
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.3)', letterSpacing: 2 }}>
+            {selectedStar.hasAnomaly ? '⚠ KNOWN ANOMALY' : 'STAR'}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: 'white', lineHeight: 1.3 }}>
+              {selectedStar.name}
+            </div>
+            <DataSourceBadge source={lightcurve?.source} />
+          </div>
+        </div>
+        <button
+          onClick={close}
+          style={{
+            background: 'none',
+            border: 'none',
+            color: 'rgba(255,255,255,0.4)',
+            fontSize: 18,
+            cursor: 'pointer',
+            lineHeight: 1,
+            padding: 4,
+          }}
+        >
+          ×
+        </button>
+      </div>
+
+      <div style={{ padding: '16px 20px', flexShrink: 0 }}>
+        {/* Star visualization */}
+        <div style={{ marginBottom: 12 }}>
+          <StarVisualization
+            colorIndex={selectedStar.colorIndex}
+            isAnomaly={selectedStar.hasAnomaly}
+          />
+        </div>
+
+        {/* Score ring + star info */}
+        <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 16 }}>
+          <ScoreRing score={selectedStar.anomalyScore} />
+          <div style={{ flex: 1 }}>
+            <InfoRow label="RA" value={`${selectedStar.ra.toFixed(4)}°`} term="RA" />
+            <InfoRow label="DEC" value={`${selectedStar.dec.toFixed(4)}°`} term="DEC" />
+            <InfoRow label="MAG" value={selectedStar.magnitude.toFixed(2)} term="MAG" />
+            <InfoRow label="COLOR" value={bvToColorName(selectedStar.colorIndex)} small term="COLOR" />
+          </div>
+        </div>
+
+        <Divider />
+
+        {/* Loading state takes priority over dips/chart/explanation so a slow
+            MAST fetch doesn't make the panel look frozen. */}
+        {lightcurveLoading ? (
+          <LoadingProgress />
+        ) : lightcurve?.source === 'unavailable' && selectedStar.hasAnomaly ? (
+          <>
+            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.3)', letterSpacing: 2, marginBottom: 8, display: 'flex', alignItems: 'center' }}>
+              DOCUMENTED ANOMALY
+              <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <InfoBadge term="SCORE" />
+              </span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16 }}>
+              <div
+                style={{
+                  background: 'rgba(255,255,255,0.04)',
+                  borderRadius: 6,
+                  padding: '8px 12px',
+                  borderLeft: `3px solid ${LABEL_COLOR[catalogLabelFor(selectedStar.anomalyScore)]}`,
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 9, color: LABEL_COLOR[catalogLabelFor(selectedStar.anomalyScore)], letterSpacing: 1 }}>
+                    {catalogLabelFor(selectedStar.anomalyScore)}
+                  </span>
+                  <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.5)' }}>
+                    {Math.round(selectedStar.anomalyScore * 100)}%
+                  </span>
+                </div>
+                <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.35)', marginTop: 4 }}>
+                  Catalog-recorded anomaly score
+                </div>
+                <div style={{ height: 2, background: 'rgba(255,255,255,0.06)', borderRadius: 1, marginTop: 6 }}>
+                  <div
+                    style={{
+                      height: '100%',
+                      width: `${selectedStar.anomalyScore * 100}%`,
+                      background: LABEL_COLOR[catalogLabelFor(selectedStar.anomalyScore)],
+                      borderRadius: 1,
+                    }}
+                  />
+                </div>
+                <DipProvenanceLine
+                  provenance={{
+                    sourceName: 'Curated catalog',
+                    mission: 'Literature',
+                    dataType: 'Published anomaly score',
+                  }}
+                />
+              </div>
+            </div>
+            <Divider />
+          </>
+        ) : lightcurve && lightcurve.dips.length > 0 && (
+          <>
+            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.3)', letterSpacing: 2, marginBottom: 8, display: 'flex', alignItems: 'center' }}>
+              DIPS
+              <InfoBadge term="DIP" />
+              <span style={{ marginLeft: 6 }}>DETECTED ({lightcurve.dips.length})</span>
+              <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <InfoBadge term="SCORE" />
+              </span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16 }}>
+              {lightcurve.dips.slice(0, 6).map((dip, i) => (
+                <div
+                  key={i}
+                  style={{
+                    background: 'rgba(255,255,255,0.04)',
+                    borderRadius: 6,
+                    padding: '8px 12px',
+                    borderLeft: `3px solid ${LABEL_COLOR[dip.label]}`,
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: 9, color: LABEL_COLOR[dip.label], letterSpacing: 1 }}>
+                      {dip.label}
+                    </span>
+                    <span style={{ fontSize: 9, color: 'rgba(255,255,255,0.5)' }}>
+                      {Math.round(dip.score * 100)}%
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 12, marginTop: 4 }}>
+                    <span style={{ fontSize: 8, color: 'rgba(255,255,255,0.35)' }}>
+                      −{(dip.depth * 100).toFixed(2)}%
+                    </span>
+                    <span style={{ fontSize: 8, color: 'rgba(255,255,255,0.35)' }}>
+                      {dip.duration.toFixed(1)}d
+                    </span>
+                    <span style={{ fontSize: 8, color: 'rgba(255,255,255,0.35)' }}>
+                      t={dip.peakTime.toFixed(1)} BKJD
+                    </span>
+                  </div>
+                  {/* Score bar */}
+                  <div style={{ height: 2, background: 'rgba(255,255,255,0.06)', borderRadius: 1, marginTop: 6 }}>
+                    <div
+                      style={{
+                        height: '100%',
+                        width: `${dip.score * 100}%`,
+                        background: LABEL_COLOR[dip.label],
+                        borderRadius: 1,
+                        transition: 'width 0.5s ease',
+                      }}
+                    />
+                  </div>
+                  <DipProvenanceLine provenance={lightcurve.provenance} />
+                </div>
+              ))}
+            </div>
+
+            <Divider />
+          </>
+        )}
+
+        {/* Light curve toggle + chart — only when we actually have data to plot.
+            When the real MAST fetch failed we show an explanation instead so
+            the user knows the data is genuinely missing, not synthetic.
+            Hidden entirely while the fetch is in flight (the progress bar
+            above is covering that real estate). */}
+        {lightcurveLoading ? null : lightcurve?.source === 'unavailable' ? (
+          <div
+            style={{
+              background: 'rgba(255,255,255,0.03)',
+              border: '1px solid rgba(255,255,255,0.1)',
+              borderRadius: 6,
+              padding: '12px 14px',
+              fontSize: 10,
+              lineHeight: 1.6,
+              color: 'rgba(255,255,255,0.6)',
+            }}
+          >
+            Real light curve data could not be fetched from NASA/MAST. This
+            star exists and has documented anomalies, but the raw data is
+            temporarily unavailable.
+          </div>
+        ) : (
+          <ActionButton
+            label="VIEW LIGHT CURVE"
+            color="#4cc9f0"
+            onClick={() => setShowLightcurve(true)}
+          />
+        )}
+
+        {/* Report buttons */}
+        {selectedStar.hasAnomaly && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 12 }}>
+            <Divider />
+            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.3)', letterSpacing: 2, marginBottom: 4 }}>
+              REPORT TO CITIZEN SCIENCE
+            </div>
+            <ActionButton
+              label="ZOONIVERSE"
+              color="#f4a261"
+              onClick={() => window.open(zooniverseLinkFor(selectedStar.id), '_blank')}
+              external
+            />
+            <ActionButton
+              label="NASA EXOPLANET ARCHIVE"
+              color="#f4a261"
+              onClick={() => window.open('https://exoplanetarchive.ipac.caltech.edu/', '_blank')}
+              external
+            />
+            <ActionButton
+              label="SETI INSTITUTE"
+              color="#f4a261"
+              onClick={() => window.open('https://www.seti.org', '_blank')}
+              external
+            />
+          </div>
+        )}
+      </div>
+    </div>
+    {showLightcurve && lightcurve && lightcurve.flux.length > 0 && (
+      <LightCurveFullscreen
+        starName={selectedStar.name}
+        source={lightcurve.source}
+        times={lightcurve.times}
+        flux={lightcurve.flux}
+        dips={lightcurve.dips}
+        onClose={() => setShowLightcurve(false)}
+      />
+    )}
+    </>
+  )
+}
+
+/**
+ * @description One label/value row in the panel's metadata block. If `term` is provided
+ * and matches a GLOSSARY key, an `InfoBadge` is appended next to the label.
+ * @param label Short uppercase label, e.g. "RA".
+ * @param value Already-formatted value string.
+ * @param small Use a smaller value font (useful for long descriptors).
+ * @param term Optional glossary key for the help tooltip.
+ * @returns Flex row with label + value.
+ */
+function InfoRow({
+  label,
+  value,
+  small,
+  term,
+}: {
+  label: string
+  value: string
+  small?: boolean
+  term?: string
+}) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, alignItems: 'center' }}>
+      <span style={{ fontSize: 8, color: 'rgba(255,255,255,0.3)', letterSpacing: 1, display: 'inline-flex', alignItems: 'center' }}>
+        {label}
+        {term && <InfoBadge term={term} />}
+      </span>
+      <span style={{ fontSize: small ? 7 : 9, color: 'rgba(255,255,255,0.7)', textAlign: 'right', maxWidth: 150 }}>{value}</span>
+    </div>
+  )
+}
+
+/**
+ * @description Thin horizontal rule used between panel sections.
+ * @returns 1-px divider styled to match the panel chrome.
+ */
+function Divider() {
+  return <div style={{ height: 1, background: 'rgba(255,255,255,0.06)', margin: '12px 0' }} />
+}
+
+/**
+ * @description Themed button used for panel actions (view light curve, open external
+ * citizen-science links, etc). Hover lifts the background tint slightly.
+ * @param label Button text.
+ * @param color Accent color for border, text, and hover background.
+ * @param onClick Click handler.
+ * @param external If true, shows an "↗" indicator implying a new-tab link.
+ * @returns Styled `<button>`.
+ */
+function ActionButton({
+  label,
+  color,
+  onClick,
+  external,
+}: {
+  label: string
+  color: string
+  onClick: () => void
+  external?: boolean
+}) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: 'rgba(255,255,255,0.04)',
+        border: `1px solid ${color}44`,
+        borderRadius: 6,
+        padding: '10px 14px',
+        color,
+        fontSize: 9,
+        letterSpacing: 2,
+        cursor: 'pointer',
+        textAlign: 'left',
+        fontFamily: 'inherit',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        transition: 'background 0.2s',
+      }}
+      onMouseEnter={e => (e.currentTarget.style.background = `${color}11`)}
+      onMouseLeave={e => (e.currentTarget.style.background = 'rgba(255,255,255,0.04)')}
+    >
+      {label}
+      {external && <span style={{ opacity: 0.5 }}>↗</span>}
+    </button>
+  )
+}
