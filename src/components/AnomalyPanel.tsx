@@ -1,6 +1,7 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { useStore, type Anomaly, type LightcurveProvenance } from '@/lib/store'
+import type { CurveProfile, CurvePattern, DipShape } from '@/lib/curveClassifier'
 import LightCurve from './LightCurve'
 
 /**
@@ -321,6 +322,8 @@ function LightCurveFullscreen({
   times,
   flux,
   dips,
+  provenance,
+  profile,
   onClose,
 }: {
   starName: string
@@ -328,6 +331,8 @@ function LightCurveFullscreen({
   times: number[]
   flux: number[]
   dips: Anomaly[]
+  provenance?: LightcurveProvenance
+  profile: CurveProfile | null
   onClose: () => void
 }) {
   useEffect(() => {
@@ -337,6 +342,18 @@ function LightCurveFullscreen({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
+
+  // Lock body scroll while the overlay is open so wheel-zoom on the chart
+  // doesn't accidentally scroll the page underneath. The chart's own
+  // non-passive wheel listener calls preventDefault, but a stray scroll
+  // outside the canvas (e.g. on the legend) would still bubble up; this
+  // is the belt-and-suspenders fix. We preserve and restore whatever
+  // `body.style.overflow` was before mount so nested overlays compose.
+  useEffect(() => {
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => { document.body.style.overflow = prev }
+  }, [])
 
   // Chart pixel buffer for rasterization. CSS sizing fills the flex
   // container; this number only controls how crisp the line looks when
@@ -375,8 +392,15 @@ function LightCurveFullscreen({
           gap: 12,
           minHeight: 0,
           overflow: 'hidden',
+          position: 'relative',
         }}
       >
+        {/* Classifier readout — floats top-left over the chart corner.
+            Rendered AFTER the chart panel in source order so the
+            absolute positioning keeps it on top without z-index
+            gymnastics. Contains only measured features; no causal
+            interpretation. */}
+        {profile && <ClassifierReadout profile={profile} />}
         {/* Top bar — fixed-height header */}
         <div
           style={{
@@ -439,6 +463,7 @@ function LightCurveFullscreen({
             height={canvasH}
             interactive
             fillContainer
+            provenance={provenance}
           />
         </div>
 
@@ -487,6 +512,134 @@ function LightCurveFullscreen({
           to   { opacity: 1; }
         }
       `}</style>
+    </div>
+  )
+}
+
+/**
+ * @description Human-readable copy for each `CurvePattern`. STRICTLY
+ * DESCRIPTIVE — does not assert a physical cause. The IRREGULAR
+ * note is framed as a prompt for the user ("worth a closer look"),
+ * not a conclusion. Editing any of these strings: keep the same
+ * tone — measure, don't interpret.
+ */
+const PATTERN_COPY: Record<CurvePattern, { label: string; note: string; color: string }> = {
+  PERIODIC_UNIFORM: {
+    label: 'PERIODIC · UNIFORM',
+    note: 'Dips repeat at a steady interval with consistent depth.',
+    color: '#4cc9f0',
+  },
+  IRREGULAR: {
+    label: 'IRREGULAR',
+    note: 'Does not match a simple repeating pattern — worth a closer look.',
+    color: '#ff4d6d',
+  },
+  HIGH_VARIABILITY: {
+    label: 'HIGH VARIABILITY',
+    note: 'Baseline noise is large; any dips here are hard to trust.',
+    color: '#f4a261',
+  },
+  SPARSE: {
+    label: 'SPARSE',
+    note: 'Too few dips detected to characterize a pattern.',
+    color: 'rgba(255,255,255,0.4)',
+  },
+}
+
+/** @description Display text for each `DipShape` value. */
+const SHAPE_COPY: Record<DipShape, string> = {
+  U: 'U-shaped (flat bottom)',
+  V: 'V-shaped (sharp point)',
+  MIXED: 'mixed',
+  UNKNOWN: '—',
+}
+
+/**
+ * @description Floating top-left readout inside the fullscreen overlay
+ * that surfaces the descriptive `CurveProfile` measurements. Every
+ * field is a measurement the user can verify against the chart —
+ * the panel never says what the data MEANS, only what it IS. The
+ * pattern note is intentionally framed as a prompt ("worth a closer
+ * look") for the IRREGULAR case so the user owns the interpretation.
+ * @param profile Measurements from `classifyCurve`.
+ * @returns Absolutely-positioned panel; renders nothing if profile is null.
+ */
+function ClassifierReadout({ profile }: { profile: CurveProfile }) {
+  const copy = PATTERN_COPY[profile.pattern]
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: 72,
+        left: 16,
+        zIndex: 5,
+        background: 'rgba(0,0,0,0.78)',
+        border: `1px solid ${copy.color}55`,
+        borderRadius: 6,
+        padding: '10px 14px',
+        minWidth: 220,
+        maxWidth: 320,
+        pointerEvents: 'none',
+        backdropFilter: 'blur(4px)',
+      }}
+    >
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginBottom: 4 }}>
+        MEASURED PROFILE
+      </div>
+      <div style={{ fontSize: 12, fontWeight: 700, color: copy.color, letterSpacing: 1, marginBottom: 8 }}>
+        {copy.label}
+      </div>
+      <ReadoutRow label="Periodicity" value={`${Math.round(profile.periodicity * 100)}%`} />
+      <ReadoutRow label="Depth consistency" value={`${Math.round(profile.depthConsistency * 100)}%`} />
+      <ReadoutRow label="Dominant shape" value={SHAPE_COPY[profile.dipShape]} />
+      <ReadoutRow label="Baseline RMS" value={`${(profile.baselineRMS * 100).toFixed(2)}%`} />
+      {profile.bestFitPeriodDays !== null && (
+        <ReadoutRow
+          label="Best-fit period"
+          value={`${profile.bestFitPeriodDays.toFixed(profile.bestFitPeriodDays >= 10 ? 1 : 3)} d`}
+        />
+      )}
+      <ReadoutRow label="Dips counted" value={profile.dipCount.toLocaleString()} />
+      <div
+        style={{
+          marginTop: 8,
+          paddingTop: 8,
+          borderTop: '1px solid rgba(255,255,255,0.08)',
+          fontSize: 9,
+          color: 'rgba(255,255,255,0.6)',
+          letterSpacing: 0.5,
+          lineHeight: 1.4,
+        }}
+      >
+        {copy.note}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * @description One label/value row inside `ClassifierReadout`. Label
+ * uses the dim secondary color; value is white. Pulled out so the
+ * row spacing stays consistent across the variable-length list
+ * (period row only renders when present).
+ * @param label Field label (left side).
+ * @param value Measured value (right side).
+ */
+function ReadoutRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'baseline',
+        gap: 12,
+        fontSize: 10,
+        letterSpacing: 0.5,
+        padding: '2px 0',
+      }}
+    >
+      <span style={{ color: 'rgba(255,255,255,0.5)' }}>{label}</span>
+      <span style={{ color: 'white', fontFamily: 'inherit' }}>{value}</span>
     </div>
   )
 }
@@ -620,7 +773,7 @@ function DipProvenanceLine({ provenance }: { provenance?: LightcurveProvenance }
  * @returns The panel, or null when no star is selected.
  */
 export default function AnomalyPanel() {
-  const { selectedStar, lightcurve, lightcurveLoading, setSelectedStar, setMode } = useStore()
+  const { selectedStar, lightcurve, lightcurveLoading, setSelectedStar, setMode, flaggedIds, toggleFlagged } = useStore()
   const [showLightcurve, setShowLightcurve] = useState(false)
 
   if (!selectedStar) return null
@@ -675,6 +828,27 @@ export default function AnomalyPanel() {
             <div style={{ fontSize: 14, fontWeight: 700, color: 'white', lineHeight: 1.3 }}>
               {selectedStar.name}
             </div>
+            {/* Bookmark toggle. Filled white star = flagged (saved to
+                localStorage `sae_flagged`); outline = unflagged. Click
+                cycles the state. Title hint is a small accessibility
+                affordance — most users will recognize the icon. */}
+            <button
+              onClick={() => toggleFlagged(selectedStar.id)}
+              title={flaggedIds.has(selectedStar.id) ? 'Remove bookmark' : 'Bookmark this star'}
+              aria-pressed={flaggedIds.has(selectedStar.id)}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: flaggedIds.has(selectedStar.id) ? '#ffffff' : 'rgba(255,255,255,0.4)',
+                fontSize: 16,
+                lineHeight: 1,
+                cursor: 'pointer',
+                padding: '0 2px',
+                fontFamily: 'inherit',
+              }}
+            >
+              {flaggedIds.has(selectedStar.id) ? '★' : '☆'}
+            </button>
             <DataSourceBadge source={lightcurve?.source} />
           </div>
         </div>
@@ -895,6 +1069,8 @@ export default function AnomalyPanel() {
         times={lightcurve.times}
         flux={lightcurve.flux}
         dips={lightcurve.dips}
+        provenance={lightcurve.provenance}
+        profile={lightcurve.profile ?? null}
         onClose={() => setShowLightcurve(false)}
       />
     )}

@@ -15,6 +15,15 @@ npm run dev    # localhost:3000
 npm run build  # production build
 ```
 
+## Branch workflow
+- **`dev`** is the working branch — all day-to-day commits land here.
+- **`main`** holds the latest stable snapshot only.
+- Merge `dev` → `main` when the working state is verified stable
+  (typecheck clean, app boots, the feature being shipped actually works
+  in the browser). Don't fast-forward unverified work into `main`.
+- Don't commit directly to `main`. If a fix is urgent enough to go
+  straight there, branch off `main`, fix, merge back, then sync `dev`.
+
 ## File architecture
 ```
 src/
@@ -25,6 +34,8 @@ src/
     api/
       stars/route.ts            # Proxies VizieR Hipparcos catalog (avoids CORS)
       lightcurve/[id]/route.ts  # Fetches & parses Kepler PDC FITS from MAST
+      koi/route.ts              # Proxies NASA Exoplanet Archive KOI cumulative table
+      toi/route.ts              # Proxies NASA Exoplanet Archive TOI catalog (TESS)
   components/
     StarField.tsx         # 3D sky with Three.js — THE MAIN COMPONENT
     HUD.tsx               # Overlay UI (header, crosshair, counter, minimap, onboarding)
@@ -35,6 +46,9 @@ src/
     anomalyDetector.ts    # Dip detection + lightcurve client (calls /api/lightcurve)
     fitsReader.ts         # Minimal FITS BINTABLE reader (server-side, no deps)
     store.ts              # Global Zustand state
+    quadrants.ts          # 6×6 Kepler-field grid (A1–F6); RA/Dec ↔ quadrant id
+    persistence.ts        # localStorage Set helpers (visited / flagged)
+    curveClassifier.ts    # Descriptive light-curve profile (periodicity / shape / RMS)
 ```
 
 ## UI language
@@ -79,9 +93,13 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 ### What works ✅
 - Navigable 3D sky with ~8000 stars rendered as `Points` (WebGL)
 - Real star colors based on B-V index (blue=hot, red=cool)
-- 11 hardcoded known anomalies: Tabby's Star (KIC 8462852), KIC 6543674, KIC 4150804, KIC 11610797, EPIC 201637175, KIC 11852982, KIC 3542116, KIC 8548587, KIC 5955033, KIC 12557548 (disintegrating-planet candidate), KIC 10195478
+- 11 hardcoded known anomalies as seeds (Tabby's Star, KIC 6543674, KIC 4150804, KIC 11610797, EPIC 201637175, KIC 11852982, KIC 3542116, KIC 8548587, KIC 5955033, KIC 12557548 disintegrating-planet candidate, KIC 10195478) + ~6,000 unique KOI stars loaded from the NASA Exoplanet Archive
 - Hover-proximity labels over anomalies (one at a time, closest to cursor)
-- HUD with RA/Dec coordinates, crosshair, sky minimap, anomaly counter, "Go to nearest anomaly" button
+- HUD with RA/Dec coordinates, crosshair, sky minimap, per-mission anomaly counter card (KEPLER + TESS rows, red and cyan accents matching the marker themes), nav buttons: "GO TO NEAREST ANOMALY" (angular nearest via dot product, scans the merged catalog) and "NEXT ANOMALY ▸" (cycles by score desc through anomalies currently in the viewport; shows "N IN VIEW", flashes "NO ANOMALIES IN VIEW" when empty)
+- Quadrant exploration system: 6×6 grid (A1–F6) over the Kepler field with per-quadrant anomaly / visited / flagged counts in a HUD overlay (visible at FOV < 45°), click a quadrant to fly there
+- Persistent visited (`sae_visited`) and flagged (`sae_flagged`) sets in localStorage. Visited anomalies render at 0.5 opacity so unvisited ones stand out; flagged stars get a white ring overlay. Bookmark (★) toggle in the AnomalyPanel; collapsible FLAGGED list panel in the HUD with click-to-fly-and-select
+- Global progress bar in the header: `EXPLORED: N / TOTAL (P.P%)` based on intersection of visited set and anomaly subset
+- Light-curve classifier (`lib/curveClassifier.ts`): measures periodicity, depth consistency, dominant dip shape (U/V), and baseline RMS for each curve. Surfaces a descriptive pattern label (PERIODIC_UNIFORM / IRREGULAR / HIGH_VARIABILITY / SPARSE) in the fullscreen overlay's top-left readout. Strictly descriptive — never asserts a physical cause
 - First-run onboarding overlay (persists dismissal in localStorage)
 - FOV-based zoom (wheel changes camera FOV, telescope-style) with damping
 - Drag to rotate the view (OrbitControls, keyboard disabled)
@@ -93,8 +111,7 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 - (none currently tracked)
 
 ### Next features 🚀
-- Depth feel: stars slightly larger when zoomed in
-- More Kepler/K2/TESS anomaly seeds beyond the current 5
+- More Kepler/K2/TESS anomaly seeds beyond the current 11
 
 ## Real-data integration
 
@@ -109,12 +126,113 @@ so the browser never talks to external archives directly (CORS).
   client (`fetchHipparcosCatalog`) then pads with synthetic stars so the sky
   isn't sparse
 
+### `/api/koi`
+- Proxies the NASA Exoplanet Archive's KOI cumulative table via TAP
+  (`https://exoplanetarchive.ipac.caltech.edu/TAP/sync?...`) filtering to
+  `koi_disposition in ('CONFIRMED','CANDIDATE')`. Selects only the
+  columns we render/score against (kepid, kepoi_name, disposition,
+  period, depth, duration, score, ra, dec). Returns ~9,500 rows as of
+  2026 — one per Kepler Object of Interest (a single star can host
+  many KOIs; Kepler-90 has 8).
+- Response shape: `{ source: 'real' | 'cached' | 'unavailable', rows: KoiRow[], fetchedAt: number, error?: string }`.
+- **Disk cache** at `<os.tmpdir()>/stellar-cache/koi-catalog.json` with
+  24h TTL (vs the lightcurve route's 7-day TTL — the KOI catalog
+  changes more often). Same atomic-write pattern (temp + rename).
+- On failure returns `{ source: 'unavailable', rows: [], error }`. The
+  client surfaces this in the HUD counter as "CATALOG UNAVAILABLE"
+  rather than rendering a misleading 0.
+
+### KOI catalog merge (`fetchKOICatalog` + `mergeKoiIntoHipparcos`)
+The page loads Hipparcos and KOI in parallel and merges them in the
+browser after both resolve. `fetchKOICatalog` dedupes by kepid (keeping
+the highest-scoring KOI per star; secondary KOIs aren't lost — they're
+counted via `koiCount`). `mergeKoiIntoHipparcos` then:
+
+1. Looks up each KOI by id in the existing Hipparcos catalog (handles
+   `KNOWN_ANOMALIES` seeds like Tabby's that are already present).
+2. Falls back to position match within `KOI_HIPPARCOS_MATCH_DEG = 0.01°`
+   (~36 arcsec). Uses a sparse RA/Dec bucket grid (bucket size = match
+   threshold) so each KOI checks 9 buckets instead of all ~5,000
+   Hipparcos entries — O(N + M) instead of O(N × M).
+3. Matched: marks the existing entry `hasAnomaly: true` and bumps
+   `anomalyScore` if the KOI score is higher.
+4. Unmatched: adds the KOI as a new sky entry with default magnitude
+   (13.5) and color index (0.65, solar-yellow) since TAP doesn't return
+   photometry.
+
+In practice Hipparcos tops out at mag ~9 while Kepler PDC targets are
+mag 11–17, so they almost never overlap — the merge is mostly
+defensive correctness for the few overlap cases (the seeded
+`KNOWN_ANOMALIES` always match by id).
+
+`scoreFromKoi(koi)` = `koi.score * 0.5 + min(koi.depth/20000, 0.3) + (CONFIRMED ? 0.2 : 0)`,
+clamped to [0, 1]. CONFIRMED planets always score ≥ 0.2 (NOTABLE
+band); deep transits (depth ≫ 20,000 ppm = 2%) saturate the depth
+term at 0.3.
+
+**Catalog metadata ≠ rendered curve.** This is a gotcha worth
+calling out: `koi.depth` / `koi.duration` describe ONE PLANET's
+transit signature (e.g. K00526.01's 2,000 ppm × 4 h dip). The
+rendered light curve is the parent STAR's full-mission flux series
+(`KIC{kepid}` → `kplrNNNNNNNNN` → all ~17 quarters concatenated).
+If a star hosts multiple KOIs they all show the same curve but each
+has its own catalog row. A high anomalyScore therefore doesn't
+promise a visibly deep dip — a 0.5%-depth transit lasting 4 hours
+spans ~8 samples out of ~60k. Without zooming to the transit window
+or phase-folding, the planetary signal is below the noise band of
+the visual rendering. The id mapping (`KOI row → KIC{kepid} →
+kplrNNNNNNNNN`) was verified during the K00526.01 investigation and
+is correct; the apparent mismatch is interpretive, not a lookup
+bug.
+
+### `/api/toi`
+- Proxies the NASA Exoplanet Archive's TOI (TESS Object of Interest)
+  table via TAP. Selects `toi, tid, ra, dec, tfopwg_disp, pl_trandep,
+  pl_trandurh, pl_orbper, st_tmag`. Filters dispositions client-side
+  in the parser: kept = `CP` (Confirmed Planet), `KP` (Known Planet,
+  externally confirmed), `PC` (Planet Candidate). Dropped = `FP`,
+  `FA`, `APC`, etc.
+- **Heads-up on column names**: the user-supplied spec called the
+  TIC ID column `tic_id`. The actual schema uses **`tid`**. Confirmed
+  live; using `tic_id` returns `ORA-00904: invalid identifier`.
+- Same response shape and disk-cache pattern as `/api/koi`
+  (24h TTL, atomic temp+rename, separate file at
+  `<os.tmpdir()>/stellar-cache/toi-catalog.json`).
+
+### TOI catalog merge (`fetchTOICatalog` + `mergeToiIntoCatalog`)
+Same algorithm as KOI: dedupe by TIC id (keeping the highest-scoring
+TOI per star), then id-match + position-match into the working catalog.
+The merge runs AFTER the KOI merge in `page.tsx`, so when a star is in
+both KOI and TOI catalogs the TOI merge wins the `source` tag and the
+star renders as TESS-themed. This is a small minority and acceptable
+for visual distinction; documented in `mergeToiIntoCatalog`.
+
+`scoreFromToi(toi)` = `min(toi.depth/20000, 0.3) + (CP || KP ? 0.2 : 0)`,
+clamped to [0, 1]. Mirrors KOI's depth+confirmation structure (no
+`koi.score` equivalent in TOI, so the base score term is dropped).
+The literal spec asked for the per-dip detector formula
+(`depth*3 + sigma/8 + asymmetry*0.1`) but TOI doesn't carry sigma or
+asymmetry and `pl_trandep` is in ppm; that formula would give a 1%
+dip score 0.03 (NORMAL band). Using KOI's shape keeps score scales
+comparable across both missions.
+
+New TOI sky entries inherit `magnitude` from `st_tmag` when available
+(TESS magnitudes 6–13, brighter than Kepler PDC's 11–17) with a fallback
+of 11 when missing. `colorIndex` defaults to 0.65 (solar-yellow) since
+TAP doesn't return photometric color.
+
 ### `/api/lightcurve/[id]`
-- For known-anomaly KIC ids: maps `KIC8462852` → `kplr008462852` (9-digit
-  zero-padded), runs one ADQL query against the MAST VO-TAP service
-  (`https://mast.stsci.edu/vo-tap/api/v0.1/caom/sync`) on the `ivoa.obscore`
-  view filtering by `target_name`. Each row returns a direct `access_url`
-  to a Kepler quarter's `_llc.fits`.
+- For any parseable KIC id (`KIC{N}` string or numeric kepid): maps via
+  `kepidToTargetName(id)` to Kepler's archive convention
+  `kplrNNNNNNNNN` (9-digit zero-padded), then runs one ADQL query
+  against the MAST VO-TAP service
+  (`https://mast.stsci.edu/vo-tap/api/v0.1/caom/sync`) on the
+  `ivoa.obscore` view filtering by `target_name`. Each row returns a
+  direct `access_url` to a Kepler quarter's `_llc.fits`. The previous
+  `isKnownAnomaly` gate (limiting MAST fetches to the 11 hardcoded
+  seeds) was removed when the KOI catalog landed — any of the
+  ~6,000 KOIs can now return real Kepler PDC data. Stars that aren't
+  in MAST simply get the no-data fallback path.
 - **Downloads ALL quarters in parallel** (up to 100, capped in the TAP `TOP`),
   parses each FITS for `TIME` + `PDCSAP_FLUX` via `lib/fitsReader.ts`,
   normalizes each quarter by its own median (so seams don't jump), then
@@ -125,12 +243,31 @@ so the browser never talks to external archives directly (CORS).
   returns 400 Bad Request as of 2026 — we extract the embedded `uri=`
   param and download directly from `archive.stsci.edu` over HTTPS.
 - Response shape: `{ times: number[], flux: number[], source: 'real' | 'unavailable' | 'synthetic', provenance: { sourceName, mission, dataType } }`
-- Cached in-process per id (Kepler PDC files are static; only successful
-  full-concatenation results are cached, never empty arrays)
+- **Two-level cache** (Kepler PDC files are static, so caching is safe):
+  - **L1 in-process** `Map<id, {times, flux}>` — instant, but lost on
+    every dev-server restart.
+  - **L2 disk** at `<os.tmpdir()>/stellar-cache/{id}.json` with a
+    **7-day TTL** (`stat.mtimeMs` vs `Date.now()`). Survives restarts.
+    Atomic writes via temp-file + rename so a crash mid-write can't
+    leave a corrupt JSON on disk. The id is sanitized
+    (`/[^A-Za-z0-9_-]/g → _`) so unexpected characters can't escape
+    the cache directory.
+  - Request order: L1 → L2 (promotes to L1 on hit) → MAST. Only
+    successful full-concatenation results are written; never empty
+    arrays or partial fetches. The disk write is fire-and-forget
+    (`void writeDiskCache(...)`) so it doesn't delay the response.
 - First real fetch can take 30–90s (parallel download of ~17 FITS files,
-  ~80KB each); subsequent ones are instant from cache
+  ~80KB each); subsequent ones are instant from cache — even after a
+  dev-server restart, thanks to L2.
 - Do NOT use the legacy `mast.stsci.edu/api/v0/invoke` Mashup endpoint — it
   hangs indefinitely as of 2026. The VO-TAP service is the replacement.
+- **Per-quarter diagnostic logging**: when a quarter fails to download
+  or parse, the log line names it by filename
+  (`kplrNNNNNNNNN-YYYYDDDHHMMSS_llc.fits`) plus the failure reason
+  (HTTP status, parse error, or "too few valid rows"). Aggregate
+  success log also lists the *failed* filenames when any drop out, so
+  "missing quarters" can be diagnosed from a single log read without
+  cross-referencing per-quarter errors with the input list.
 
 ### Fallback policy (important)
 **Synthetic data is never shown to production users.** When the real MAST
@@ -190,6 +327,219 @@ step. The steps mirror what the API route is actually doing (TAP query,
 quarter download, FITS parse, anomaly detection) but are time-driven
 rather than event-driven — we don't have SSE from the server.
 
+### Anomaly counter semantics (three distinct counts)
+There are THREE different "anomaly counts" in this codebase; don't
+confuse them:
+
+1. **`koiCount`** (store, set by `page.tsx` after KOI merge): unique
+   Kepler-mission stars (Kepler Objects of Interest) loaded from
+   NASA. Drives the **KEPLER** row in the bottom-left HUD card; red
+   accent color (matching the Kepler marker theme). When the KOI
+   fetch fails the row shows "CATALOG UNAVAILABLE".
+2. **`toiCount`** (store, set by `page.tsx` after TOI merge): unique
+   TESS-mission stars (TESS Objects of Interest) loaded from NASA.
+   Drives the **TESS** row in the same card; cyan accent (matching
+   the TESS marker theme). Same "CATALOG UNAVAILABLE" treatment on
+   fetch failure.
+3. **`anomalies.length`** (store, set in `selectStar` after a
+   light-curve fetch): per-star detected-dip count for the
+   currently-selected star. Drives the header status color/label
+   (`ANOMALY DETECTED` / `EXPLORING`) — describes what's in the data
+   the user is currently looking at.
+
+All three are valid. The first two answer "how big is each mission's
+catalog?", the third answers "is there something interesting in this
+specific star's light curve?". HUD's `MissionCount` helper renders
+the per-mission rows.
+
+### Anomaly cycle navigation
+Two HUD buttons cycle through the merged KOI catalog. Both fall back
+to the 11 hardcoded `KNOWN_ANOMALIES` while the KOI fetch is still
+pending or if it failed.
+
+- **GO TO NEAREST ANOMALY**: scans `anomalyStars` (store, populated
+  by `page.tsx` after the KOI merge) for the angularly nearest entry
+  to the camera's current pointing direction. Uses dot product of
+  unit vectors so it works correctly near the celestial poles and
+  across the RA=0/360 seam. Scans the WHOLE catalog (not view-
+  filtered) — this button is for "take me to the nearest anomaly
+  even if I can't see one from here". After flying, syncs the
+  `nextAnomalyCursor` so a subsequent NEXT click advances from the
+  flown-to position rather than jumping somewhere arbitrary.
+- **NEXT ANOMALY ▸**: cycles through anomalies *currently in the
+  viewport* by score desc. View filter = dot product of camera and
+  anomaly unit vectors above `cos(halfFov * 1.3)` (the 1.3× covers
+  horizontal extent on typical aspect ratios; approximate but cheap
+  and doesn't need Three.js projection). Cursor stores the GLOBAL
+  rank index, not the in-view rank — so a pan-then-resume picks up
+  the user's place in the score ranking rather than restarting from
+  the top each time. Button label shows "N IN VIEW". When no
+  anomalies are visible, flashes a transient "NO ANOMALIES IN VIEW"
+  toast (1.5s) and does nothing.
+
+The cursor starts at -1 ("haven't started cycling"); the first NEXT
+click moves to the highest-ranked visible anomaly. Setting a new
+catalog via `setAnomalyStars` resets the cursor to -1.
+
+### Quadrant exploration + visited/flagged persistence
+A navigation layer on top of the catalog merges, plus persistent
+per-session state so users can pick up where they left off.
+
+**Quadrant grid** (`lib/quadrants.ts`): 6×6 grid covering the Kepler
+field (RA 290–305°, Dec 36–52°). Columns A–F map RA low→high; rows
+1–6 map Dec north→south (row 1 is the northernmost so the grid
+reads like a sky map with north up). Each anomaly star inside the
+field gets `quadrant: string` (e.g. "C4") assigned at merge time by
+`quadrantFor(ra, dec)` in BOTH `mergeKoiIntoHipparcos` and
+`mergeToiIntoCatalog` (all branches — id match, position match, and
+new entries). Stars outside the grid get `quadrant: undefined` —
+most TOI stars and seeds are off-field, which is fine.
+`quadrantCenter(id)` is the inverse (returns the RA/Dec at the
+quadrant center, for click-to-fly).
+
+**Persisted state** (`lib/persistence.ts`): two localStorage keys.
+- `sae_visited` (Set of star ids): every star whose light curve
+  the user has opened, including failed-fetch cases (the persisted
+  record is "I tried", not "I succeeded" — prevents pestering the
+  user to revisit dead targets). Written by `markVisited` (called
+  from `selectStar` in StarField).
+- `sae_flagged` (Set of star ids): every star the user has
+  explicitly bookmarked via the ★ button in `AnomalyPanel`.
+  Toggled by `toggleFlagged`.
+
+Both keys store JSON arrays. `loadIdSet` / `saveIdSet` swallow
+private-mode and quota throws — the in-memory state still works,
+it just doesn't survive a reload.
+
+Store fields `visitedIds` and `flaggedIds` start empty (Zustand
+runs during SSR; `window` isn't available there). `page.tsx` calls
+`hydratePersistedSets()` once on mount in a `useEffect` to load
+both from localStorage. Setters create new `Set` references so
+React subscribers see referential changes and recompute.
+
+**Visual reflection (StarField)**: `AnomalyMarkers` partitions
+each mission bucket by visited status and renders TWO
+`<ThemedAnomalyMarkers>` layers per mission — unvisited at full
+opacity, visited at `dimFactor = VISITED_DIM_FACTOR = 0.5`. Result:
+unvisited anomalies pop against a sea of dimmed visited ones,
+which is the whole point. The `dimFactor` prop scales every
+opacity term (outer pulse, mid pulse, core pulse, AND the static-
+overview core at wide FOV); a `useEffect([dimFactor])` resets
+`isStaticRef` so the next wide-FOV transition snaps the new dim
+value.
+
+Flagged stars get an additional `<FlaggedRingMarkers>` overlay — a
+single `<points>` layer at flagged positions with a white sprite,
+size ~14×detail (no pulse — flag is a status badge, not an
+animation). Hidden at FOV ≥ ANOMALY_TIER_HIGH_FOV so the wide
+view doesn't gain noise just because the user flagged things.
+Flagged+visited overlap shows BOTH effects: dim core + white ring.
+
+**HUD additions** (`components/HUD.tsx`):
+- **Global progress bar** in the header row: thin cyan bar +
+  `EXPLORED: N / TOTAL (P.P%)` label. Count is the INTERSECTION
+  of `anomalyStars` and `visitedIds` (`countVisitedAnomalies`) —
+  NOT `visitedIds.size`, because the user can visit Hipparcos
+  stars that aren't in the anomaly subset and we don't want those
+  to inflate "anomaly progress". Hidden while `anomalyStars` is
+  empty (catalog still loading; "0 / 0" is meaningless).
+- **`<QuadrantPanel>`** bottom-right above the minimap: lists
+  every quadrant intersecting the current view with per-quadrant
+  anomaly / visited / flagged counts. Visible only when `fov <
+  QUADRANT_PANEL_FOV_THRESHOLD = 45` — a quadrant only fills a
+  useful portion of the screen at narrower FOV. Clicking a row
+  calls `requestFlyTo(quadrantCenter(id))`. Quadrants render in
+  canonical A1..F6 order, not score-sorted, so the layout reads
+  like a grid index rather than shuffling on every visit.
+- **`<FlaggedPanel>`** bottom-right above the QuadrantPanel,
+  collapsible. Collapsed = a single `★ FLAGGED (N) ▸` button.
+  Expanded = a scrollable list of `name · score · quadrant` rows
+  sorted by score desc. Clicking a row both flies the camera AND
+  selects the star (sets `selectedStar` + `mode: 'analyze'`) so
+  the AnomalyPanel opens immediately.
+
+  **Stacking**: both panels are children of a single absolutely-
+  positioned column container (`bottom: 130`, `right: 24`, flex
+  column with `align-items: flex-end`). FlaggedPanel is rendered
+  FIRST in source order so it sits at the top of the column; the
+  QuadrantPanel sits below it. Neither panel sets its own
+  `position`/`bottom`/`right` anymore — the parent owns the stack.
+  Previous layout used two absolutely-positioned siblings with
+  hardcoded `bottom` swaps when expanded, which collided when both
+  were active.
+
+**Bookmark button in AnomalyPanel**: next to the star name in the
+header, before the data-source badge. Outline ☆ when unflagged,
+solid ★ (white) when flagged. Clicking toggles
+`flaggedIds.has(starId)` via `toggleFlagged`, which persists
+immediately.
+
+### Anomaly marker tiered rendering (per-mission themes)
+The KOI + TOI catalogs together plant thousands of anomaly markers,
+heavily concentrated in their respective survey fields. At wide FOV
+overlapping halos would fuse into an unusable blob. Solution: two
+render modes with a smooth cross-fade, driven by FOV. Then the same
+machinery is applied separately per mission with different color
+themes, so Kepler and TESS anomalies are visually distinguishable.
+
+**FOV tier behavior (applies to both missions):**
+- **FOV ≥ ANOMALY_HARD_CUTOFF_FOV (55°)** — *hard cutoff*. Outer +
+  mid rings rendered at size 0 / opacity 0 (effectively absent);
+  core is a 1px static dot at solid 0.7 opacity. The `useFrame`
+  body short-circuits — no trig, no lerp, no per-frame material
+  mutation. This is the performance fix for the wide-FOV blob: the
+  smear at wide FOV came from animating thousands of overlapping
+  rings every frame, not from the dot count itself. The latch
+  (`isStaticRef`) ensures the static-state snap happens ONCE on the
+  transition into wide FOV, not every frame.
+- **ANOMALY_TIER_HIGH_FOV (50°) ≤ FOV < 55°** — useFrame body is
+  ALSO gated off (`fov >= 50` triggers the early-return). Materials
+  hold the values the 40°–50° fade math drove them to as the user
+  crossed 50°, which by that math are already at overview state
+  (`detail = 0`). Render output is effectively identical to the
+  ≥55° region. The 50°–55° gap exists to honor both thresholds
+  named in the spec literally — useFrame off at ≥50, hard cutoff at
+  ≥55.
+- **ANOMALY_TIER_LOW_FOV (40°) ≤ FOV < 50°** — animation runs;
+  linear cross-fade via `detailAmount(fov)` (returns 0→1). Ring
+  opacities scale by `detail`, core size lerps from 1px to 8px,
+  core color lerps between overview and detail palettes, core
+  opacity blends between the static overview value and the pulsing
+  detail value.
+- **FOV ≤ 40°** — *detail mode*. Full three-layer pulse animation.
+
+Initial material props in JSX match the static-overview state
+(outer/mid size 0 opacity 0, core 1px opacity 0.7) so first paint
+is correct even when the camera starts wide. The useFrame body
+mutates these values only when FOV < 50°.
+
+**Per-mission color themes** (declared as `AnomalyTheme` objects;
+applied via `<ThemedAnomalyMarkers theme={…} />`):
+- **Kepler**: overview `#f4a261` (orange), detail core `#ff0000`
+  (red), mid ring `#ff4d6d`, outer ring `#ff0000`.
+- **TESS**: overview `#7df9ff` (pale cyan), detail core `#00e5ff`
+  (saturated cyan), mid ring `#00bcd4` (teal), outer ring `#00e5ff`.
+
+`AnomalyMarkers` partitions the catalog into two buckets by
+`star.source` (`'TESS'` → TESS theme; anything else, including
+`undefined` and `'Hipparcos'`, → Kepler theme — most legacy seeds
+ARE historically Kepler targets) and renders one `ThemedAnomalyMarkers`
+layer per mission. Dual-mission stars (in both KOI and TOI) end up
+tagged `'TESS'` because the TOI merge runs after KOI in `page.tsx`.
+
+### Initial loading screen
+`page.tsx` shows a multi-stage loader before the 3D view appears.
+Three catalogs fetch in parallel (Hipparcos via `/api/stars`, Kepler
+KOI via `/api/koi`, TESS TOI via `/api/toi`); the loader displays
+each as its own line with state markers (`…` pending, `✓` ready,
+`(unavailable)` failed). The sky renders as soon as Hipparcos
+resolves; KOI and TOI overlays are merged together once both mission
+fetches have completed (or were skipped silently if they failed —
+Hipparcos alone is still navigable). KOI merges first, then TOI on
+top, so dual-mission stars end up tagged as `'TESS'`. Cold first
+load: ~1s for Hipparcos via the proxy, ~5–15s for each mission
+catalog (then 24h disk-cached).
+
 ### Fullscreen light curve overlay
 Clicking VIEW LIGHT CURVE in the panel opens `<LightCurveFullscreen />`
 (declared in `AnomalyPanel.tsx`) instead of expanding the side panel.
@@ -203,29 +553,221 @@ The side panel width is fixed at 300px; the prior 300↔520 width
 animation is gone since the chart no longer renders inline.
 
 ### LightCurve rendering details
-- **Outlier filter**: any sample with `flux > 1.05` or `flux < 0.5` is
-  replaced with `null` before any drawing or range calculation. The draw
-  loop treats nulls as pen-up so the line skips outliers cleanly rather
-  than spiking to NaN.
-- **Y range**: percentile-based, NOT min/max. We take p5 and p95 of the
-  non-null flux samples, add 20% padding, then HARD CAP the result to
-  `median ± 0.15`. This guarantees the chart never gets squashed by
-  surviving sub-threshold outliers (the failure mode that made KIC
-  6543674 look like a solid filled blob).
+- **Outlier filter** (three cascaded passes — passes 1 and 2 were a
+  real bug for months; pass 3 caught regressions on KOI stars like
+  K00526.01): all three replace bad samples with `null` before any
+  drawing or range calculation. The draw loop treats nulls as pen-up
+  so the line skips cleanly rather than spiking to NaN.
+  1. **Absolute hard bounds**: drop `flux > 1.05 || flux < 0.5`.
+     Defends against truly broken values (negative flux, ~10× baseline
+     spikes) that would otherwise inflate the MAD estimate below.
+  2. **ASYMMETRIC MAD filter** (`MAD_K = 5`): compute the median of
+     the survivors, then their MAD (median absolute deviation), then
+     drop any sample where `f > median + 5 * MAD`. **No lower MAD
+     bound** — only the upper side. Cosmic-ray hits in Kepler PDC
+     photometry are upward spikes (photon pile-up); real
+     astrophysical events (transits, KIC 8462852's dips, KIC 12557548
+     dust occultations) are downward. The previous symmetric filter
+     rejected the famous −22% Tabby's dips because, in a quiet noise
+     band with MAD ≈ 0.0002, a 22% downward excursion was 1100×
+     larger than the threshold and looked identical to a cosmic ray.
+     The asymmetric form catches upward spikes (which adapt to each
+     star's noise level) while leaving downward dips of any depth
+     untouched.
+  3. **Neighbor-based single-point spike detector** (`SPIKE_K = 5`,
+     `NEIGHBOR_AGREE_K = 3`, **symmetric**): walks the array; for
+     each interior surviving sample, compare it to its immediate
+     previous and next surviving samples. If `|f[i] - f[i-1]| > 5 *
+     MAD` AND `|f[i] - f[i+1]| > 5 * MAD` AND `|f[i-1] - f[i+1]| < 3
+     * MAD`, null out `f[i]`. This is **symmetric** (both upward and
+     downward single-sample spikes get dropped) — safe because real
+     transits are multi-sample events (Kepler 30-min cadence ×
+     ~3-hour transit = at least 4–8 consecutive in-dip samples), so
+     the in/out-of-dip edges always have at least one neighbor in
+     agreement with the candidate. Time-gap aware: won't compare
+     across observation gaps > `GAP_DAYS` so quarter boundaries don't
+     trigger false detections at the seams. Added after K00526.01
+     showed a sharp single-point downward V-spike near BKJD 763 that
+     the asymmetric MAD doesn't catch (it's downward — a hot-pixel
+     masking artifact or similar instrument glitch). The asymmetric
+     MAD remains the primary global cleanup; this pass is the
+     targeted follow-up for sample-isolated artifacts of either sign.
+
+  **Diagnostic logging**: append `?debugStar=<any-string>` to the
+  page URL to get a one-shot console log per render with the
+  median, MAD, both thresholds, and the dropped-by-pass counts for
+  whichever star you select. The string doesn't have to match the
+  star id; the presence of the param turns logging on. Used during
+  the K00526.01 investigation; left in because the cost is one URL
+  param read per render.
+- **Y range** (auto-fit, when the user hasn't shift-scrolled): two-stage.
+  1. Start from **p1/p99** of the full non-null `cleanedFlux` array
+     with 10% padding. (Was p2/p98 — bumped because the 2% cutoff was
+     still clipping the noise band on stars with broad intrinsic
+     variability.) NO hard cap. With ~60k samples, p1/p99 leaves ~600
+     samples of cushion on each side — way more than the few cosmic
+     rays that survive the MAD filter.
+  2. **Window-aware downward extension**: deep narrow dips (Tabby's
+     −22%, KIC 12557548) are sub-1% of total samples, so even p1
+     misses them. After computing the percentile range, `getCanvasCoords`
+     scans the CURRENT visible X window (via binary search into the
+     monotonic `times` array) for any sample below `minF`. If found,
+     extends `minF` down to that value with 5% padding. The user
+     always sees the deepest dip in their current view.
+
+  When the user has explicitly set `viewYMin`/`viewYMax` (shift+scroll
+  or shift+drag), this auto-fit logic is skipped entirely — manual Y
+  overrides verbatim.
 - **Stroke-only**: the line uses `ctx.stroke()` exclusively; there is no
   fill under the curve. The canvas is also `ctx.clip()`-ed to the plot
   rect so partial segments at the edges (when zoomed in) don't bleed
   into the axis padding.
+- **Time axis units**: raw BKJD (Barycentric Kepler Julian Date), 6
+  evenly-spaced ticks across the visible window. We tried calendar-date
+  ticks ("Jan 2010", "Jun 2011") but reverted — it caused rendering
+  glitches and the BKJD numbers are what the dip detector and tooltips
+  use anyway, so keeping the axis in BKJD makes the whole UI
+  internally consistent.
+- **Dip label collision (bucket-winner selection)**: when many dip
+  markers cluster within a short time span (e.g. periodic transits
+  on KIC 11610797), labels could pile into an unreadable wall.
+  Algorithm:
+  1. Partition the canvas x-axis into fixed
+     `LABEL_BUCKET_CSS_PX = 80` wide buckets (CSS px, converted
+     per render so spacing is consistent across the 460-px inline
+     and the 1600-px fullscreen chart).
+  2. For each visible dip, compute `bucket = floor(x / bucketWidth)`.
+  3. Keep one winner per bucket: the highest-`score` dip in that
+     bucket gets its label rendered. All others render dot-only.
+
+  Guarantees ≤1 label per 80 CSS px of horizontal space → evenly-
+  spaced labels at any zoom level, no overlap math needed. Dots
+  still render for every visible dip so all transits remain
+  hover/click targets.
+
+  Earlier approaches and why they were replaced:
+  - **Suppress all but the highest-scoring in a 60-px x-window**:
+    same idea as the current bucket approach but with a sliding
+    window instead of fixed buckets; replaced by cascading because
+    the team wanted to keep more labels visible.
+  - **Cascade y against the immediately-previous label**: compared
+    only one neighbor, so a cluster of 8 transits stacked all the
+    way down to the bottom axis and still overlapped sideways.
+  - **Bounding-box retry + suppress (4 attempts)**: checked against
+    all placed neighbors but over-corrected — at wide zoom-out
+    every retry slot was also taken in dense regions, so almost
+    every label got suppressed and the chart had no labels at all.
+    Bucket-winner is the right balance: always shows at least one
+    label per 80-px region, never tries to fit more than fits.
+
+### Light-curve classifier (`lib/curveClassifier.ts`)
+`classifyCurve(times, flux, dips)` returns a `CurveProfile` — a set
+of MEASURED features of the data, plus a descriptive pattern label.
+
+**Hard rule: descriptive, never causal.** No string in this file or
+in the consuming UI is allowed to assert a physical cause. No
+"planet", "binary", "alien megastructure", "Dyson sphere". The
+classifier measures; the user interprets. Labels and notes are
+phrased as observations about the data, with the IRREGULAR copy
+explicitly framed as a prompt ("worth a closer look") rather than
+a conclusion.
+
+**Measurements:**
+- **Periodicity (0–1)**: candidate period = smallest non-trivial
+  consecutive interval between dip peaks (> 0.04 d to skip
+  same-transit double-counts). For each interval Δt, fold to
+  `[-P/2, P/2]` and take `|folded| / (P/2)` as the phase residual.
+  Score = `1 - median(residuals)`, clamped. Robust to missed
+  cycles because any integer multiple of P folds cleanly back to 0.
+- **Depth consistency (0–1)**: `1 - std(depths) / mean(depths)`,
+  clamped. Inverted coefficient of variation. 1 = all dips same
+  depth; 0 = depths vary by 100%+ relative to mean.
+- **Dip shape (U / V / MIXED / UNKNOWN)**: vote among the top
+  `SHAPE_VOTE_TOP_N = 5` deepest dips. For each, compute the mean
+  of `(flux[min±k] - flux[min]) / depth` for k=1..3 (~90 minutes
+  of Kepler 30-min cadence on each side of the minimum). Ratio <
+  `SHAPE_SPLIT_RATIO = 0.3` → U vote; ≥ → V vote. Returns the
+  dominant vote, MIXED on tie or near-tie (margin of 1 with ≥ 4
+  voters), UNKNOWN when no dip had usable flanking samples.
+- **Baseline RMS**: `std(flux outside dip ranges) / mean(flux
+  outside dip ranges)`. Excludes any sample whose index falls in
+  any `[dip.startIdx, dip.endIdx]`. Returned as a fraction, so
+  0.002 = 0.2% noise.
+
+**Pattern label priority:**
+1. `HIGH_VARIABILITY` if `baselineRMS ≥ 0.01` (1% noise floor).
+   Takes precedence — a noisy backdrop makes any pattern call
+   unreliable, so we surface the noise first.
+2. `PERIODIC_UNIFORM` if `periodicity ≥ 0.5` AND
+   `depthConsistency ≥ 0.5`. Both conditions required.
+3. `SPARSE` if dip count < `MIN_DIPS_FOR_PATTERN = 3`.
+4. `IRREGULAR` otherwise.
+
+`bestFitPeriodDays` is only surfaced when `periodicity ≥ 0.5` —
+reporting a period under that threshold would be more misleading
+than useful.
+
+**Flow:** `selectStar` in `StarField.tsx` calls `classifyCurve`
+after `detectDips`, stuffs the result into `lightcurve.profile`,
+which flows through the store to `LightCurveFullscreen` →
+`<ClassifierReadout>` (top-left floating panel inside the
+overlay). The readout shows pattern label + the four scalars +
+best-fit period when present + dips counted, with a one-line
+descriptive note keyed off the pattern. `profile` is `null` when
+the lightcurve source is `'unavailable'` (no data to classify) —
+the readout returns null in that case.
 
 ### Interactive LightCurve mode
 `<LightCurve interactive />` (used in the fullscreen overlay) adds:
-- **Wheel zoom** on the X axis, centered on the cursor. Min window =
-  0.1% of full range. Implemented via a native `wheel` listener with
-  `{ passive: false }` because React's synthetic `onWheel` is passive in
-  modern browsers and `preventDefault` becomes a no-op there.
-- **Drag-to-pan**: pointer down + move pans the X window in time-space.
-  Uses pointer capture so a drag that exits the canvas still tracks.
-- **Double-click**: resets to full data range.
+- **Wheel zoom**: plain scroll zooms the X axis around the cursor (factor
+  1.25/tick); **Shift + scroll** zooms the Y axis around the cursor at
+  the much gentler 1.05/tick — at typical flux scale (~0.01) the
+  1.25/tick step felt like jumping an entire pane per click, while
+  1.05 gives ~14 ticks to halve the range. Min X window = 0.1% of full
+  range. Y zoom is anchored to the cursor's flux value and can go from
+  0.1% of the data range (deep flux inspection) up to 10× (zoomed out
+  to see context beyond the auto-fit range). Both implemented via a
+  single native `wheel` listener with `{ passive: false }` because
+  React's synthetic `onWheel` is passive in modern browsers and
+  `preventDefault` becomes a no-op there. We ALWAYS preventDefault —
+  no Ctrl-key gate. `LightCurveFullscreen` also sets
+  `document.body.style.overflow = 'hidden'` while mounted and restores
+  the previous value on unmount, so even wheel events outside the
+  canvas (e.g. on the legend) can't scroll the page underneath.
+- **Y zoom state**: `viewYMin`/`viewYMax` are nullable. `null` means
+  "auto-fit to the p2/p98 `fluxRange`"; the moment the user
+  shift-scrolls or shift-drags, both become concrete numbers that
+  override the auto-fit. The auto-fit is per-dataset so quiet stars
+  and noisy variables both start with a sensible default.
+- **RESET Y button** next to the hint line: clears `viewYMin`/`Max`
+  back to null (auto-fit) without touching the current X zoom.
+  Disabled visually when Y is already auto-fit.
+- **Drag-to-pan**: pointer down + move pans the chart. Plain drag pans
+  the X window in time-space; **Shift+drag** pans the Y window in
+  flux-space (and pulls `viewYMin`/`Max` out of auto-fit, same as
+  shift+scroll). Mode is locked at pointerdown — releasing shift
+  mid-drag doesn't flip the axis. Uses pointer capture so a drag that
+  exits the canvas still tracks. Movement below ~5 px is NOT treated
+  as a drag, so a small wiggle during a click doesn't pan the chart.
+- **Click on a dip marker**: pin the dip and zoom to it. Hit-test
+  radius is ~12 CSS px around each marker center. A successful hit
+  pins the dip (sticky tooltip with label, score, depth, duration,
+  peak time, and provenance line), centers the view on `dip.peakTime`
+  with a window width of `max(dip.duration * 8, fullSpan * 0.02)` so
+  even short dips show context. Clicking empty chart space dismisses
+  the pinned dip. The hover tooltip is suppressed while a dip is
+  pinned to avoid two tooltips fighting for the user's attention.
+- **Double-click**: resets BOTH X (full data range) and Y (auto-fit).
+  This is the "I'm lost, take me back to the overview" gesture.
+- **Hover over an inter-quarter gap**: shows a subtle monospace tooltip
+  ("Kepler observation gap — telescope reorientation · N.N days") so
+  users understand the black bands aren't missing/corrupted data. The
+  gap regions are memoized once per dataset from the existing `times`
+  array (any `times[i+1] - times[i] > GAP_DAYS` qualifies). Tooltip is
+  suppressed when a dip tooltip is also active, so the two never
+  collide. NOTE: copy intentionally avoids quoting "~90 days" — that
+  was a misconception. Kepler QUARTERS are ~90 days; inter-quarter
+  GAPS are typically 1–4 days. The actual gap size is shown.
 - **Minimap strip** below the main chart: a downsampled rendering of
   the full curve with a translucent cyan rectangle highlighting the
   current visible window. Clicking the minimap centers the view there
@@ -237,26 +779,80 @@ animation is gone since the chart no longer renders inline.
 When `interactive` is on, the built-in legend is suppressed because the
 fullscreen overlay renders its own larger legend below the chart.
 
-### Performance: adaptive downsampling + rAF debounce
-Real Kepler curves are ~60,000 samples. Stroking that many `lineTo`
-calls into a 1500-pixel-wide canvas every wheel tick (a) tanks frame
-rate and (b) visually piles the line into a solid-looking band because
-every horizontal pixel gets multiple antialiased strokes. Two
-mitigations:
+The `provenance` prop is optional but should be passed alongside
+`interactive` (`LightCurveFullscreen` forwards `lightcurve.provenance`)
+so the pinned-dip tooltip can show the source/mission/dataType line.
 
-1. **Adaptive stride** in the main draw loop based on the visible zoom
-   fraction `zoomFrac = viewSpan / fullSpan`:
-   - `zoomFrac <= 0.1` (zoomed in past 10%) → stride 1, full resolution.
-   - `zoomFrac > 0.1` → `stride = floor(times.length * zoomFrac / 2000)`
-     so the rendered point count caps at ~2000 regardless of how far
-     zoomed out.
-2. **rAF-debounced redraw**: the view-change effect schedules the draw
-   via `requestAnimationFrame` and cancels any pending callback when
-   the view changes again. A burst of wheel events collapses to one
-   paint per frame.
+### Performance: LTTB downsampling + rAF debounce
+Real Kepler curves are ~60,000 samples. Stroking one `lineTo` per
+sample into a ~1400-pixel-wide canvas tanks frame rate during wheel
+zoom and (depending on how the algorithm groups points) can produce
+visual fill artifacts.
 
-The minimap uses its own simple stride (`floor(times.length / W)`) since
-it always shows the full range.
+We use **LTTB** (Largest Triangle Three Buckets, Steinarsson 2013) —
+the standard time-series downsampling algorithm used by Grafana,
+Plotly, and similar tools. It reduces N points to ~`LTTB_TARGET_POINTS`
+(2000) by picking, in each bucket, the point that forms the largest
+triangle with the previous selected point and the average of the next
+bucket. Preserves visual peaks (so dips stay visible), deterministic,
+O(N).
+
+**Min/max preservation** (custom extension): standard LTTB can still
+miss the segment's global y-extremes if they fall in a bucket whose
+largest triangle is formed by a different point. For Kepler curves
+that can hide deep narrow dips (Tabby's −22% events span <50 samples
+out of ~60k). After the standard pass, `lttbIndices` splices in the
+global y-min and y-max indices of the segment if not already present,
+preserving chronological order via binary-search insertion. Cost: one
+extra O(N) pass to find the extremes, +0–2 spliced entries.
+
+**Per-pixel-column dedupe** (custom extension): even after LTTB +
+min/max preservation, the budget allocation can leave multiple picked
+points in the same screen column on high-frequency oscillators (KIC
+6543674, KIC 11852982, etc). Each consecutive pair in the same
+column emits a near-vertical `lineTo`, and antialiasing bridges the
+gap between up/down strokes — the chart visually fills in as a solid
+block. The draw loop runs a single O(N) pass over the picked indices
+after LTTB: when `floor(x[k]) === floor(x[k+1])`, drop the point
+whose `y` is closer to `toY(median)` and keep the one further out
+(equivalent to "further from median in flux space" since `toY` is
+monotonic). Guarantees ≤ 2 points per column in the final stroke
+path — eliminates the fill artifact without touching the visible
+shape of the curve.
+
+We previously tried min/max-per-column envelope rendering and a
+heuristic oscillation fallback (toggling envelope vs per-column
+average based on column-range stats). Both produced fill artifacts in
+practice — envelope stacks vertical strokes per column, and the
+average heuristic was hard to tune. LTTB replaces both.
+
+**Segmentation**: LTTB assumes a continuous series. The visible
+window is split into contiguous segments at every null (outlier)
+sample and at every `> GAP_DAYS` time jump. Each segment runs LTTB
+independently with its proportional share of the 2000-point budget,
+and is stroked as its own sub-path (`moveTo` at the start, `lineTo`
+for the rest). No connection across segment breaks → quarter gaps
+render as empty canvas, astronomically correct.
+
+**Fast path**: when a segment has few enough samples (≤ plotW/2) LTTB
+has nothing to gain and we just stroke every sample directly.
+
+**Quarter-gap detection**: `GAP_DAYS = 5`. Kepler quarters have 1–4
+day inter-quarter gaps (data downlink + reorientation); intra-quarter
+cadence is ~30 minutes. The 5-day threshold cleanly separates real
+observation windows. Both the main chart and the minimap respect this.
+
+**Minimap** uses the same LTTB+segmentation, targeting `W * 2` total
+output points across the strip width. Does NOT apply the per-pixel-
+column dedupe — the strip is small enough that the fill artifact has
+never been observed there, and the dedupe was scoped to the main
+chart in the bug report that prompted it. If the minimap ever shows
+the same symptom, the dedupe pass would port over trivially.
+
+**rAF-debounced redraw**: the view-change effect schedules the draw
+via `requestAnimationFrame` and cancels any pending callback when the
+view changes again. A burst of wheel events collapses to one paint
+per frame.
 
 ### Fullscreen overlay layout invariants
 `<LightCurveFullscreen />` must obey these to keep the legend visible:
@@ -308,6 +904,24 @@ When source is `'unavailable'`:
 - Zoom is implemented via `camera.fov` (range 20°–75°), not by translating the camera
 - Fly-to: convert target RA/Dec to a unit vector D, place camera at `-D * CAMERA_RADIUS`, lookAt origin (so the user sees `+D`)
 
+### Depth feel on zoom
+Point sizes scale with FOV to fake "getting closer to the stars" — at
+FOV 75° points render at their base size, at FOV 20° they're scaled up
+linearly. Implemented via `depthScale(fov, maxScale)` helper, applied
+each frame in `useFrame`:
+- Catalog star points: base 3 px, max scale **2.5×**.
+- Anomaly rings (outer/mid/core): max scale **3.0×**, multiplied INTO
+  the existing pulse animation so the pulse stays visible but at a
+  larger amplitude when zoomed in.
+
+This is per-frame scalar mutation of `pointsMaterial.size`, not a
+per-vertex buffer rebuild, so it costs ~nothing. Note: the default
+`pointsMaterial` shader ignores the per-vertex `attributes-size` buffer
+in `StarPoints` — that buffer is dead code; only `material.size`
+controls rendered size. A future improvement would be a custom shader
+that honors the per-vertex sizes so brighter stars actually render
+bigger; until then, all catalog stars render at the same scaled size.
+
 ### Real B-V colors
 ```
 B-V < 0      → bright blue   #a0c4ff  (young, very hot stars)
@@ -336,13 +950,21 @@ const StarField = dynamic(() => import('@/components/StarField'), { ssr: false }
 ```
 
 ## Known anomalies (seed data)
-| ID | Name | RA | Dec | Score |
-|---|---|---|---|---|
-| KIC8462852 | Tabby's Star | 301.5642 | 44.4567 | 0.94 |
-| KIC6543674 | KIC 6543674 | 291.12 | 41.88 | 0.67 |
-| KIC4150804 | KIC 4150804 | 288.55 | 39.42 | 0.72 |
-| KIC11610797 | KIC 11610797 | 298.77 | 49.21 | 0.61 |
-| EPIC201637175 | EPIC 201637175 | 174.32 | -4.67 | 0.58 |
+Source of truth: `KNOWN_ANOMALIES` in `src/lib/starCatalog.ts`. Keep this table in sync when adding seeds.
+
+| ID | Name | RA | Dec | Mag | B-V | Score | Notes |
+|---|---|---|---|---|---|---|---|
+| KIC8462852 | Tabby's Star | 301.5642 | 44.4567 | 11.7 | 0.64 | 0.94 | Famous irregular dips (Boyajian's Star) |
+| KIC6543674 | KIC 6543674 | 291.12 | 41.88 | 12.3 | 0.71 | 0.67 |  |
+| KIC4150804 | KIC 4150804 | 288.55 | 39.42 | 13.1 | 0.58 | 0.72 |  |
+| KIC11610797 | KIC 11610797 | 298.77 | 49.21 | 12.8 | 0.81 | 0.61 |  |
+| EPIC201637175 | EPIC 201637175 | 174.32 | -4.67 | 12.1 | 0.55 | 0.58 |  |
+| KIC11852982 | KIC 11852982 | 294.87 | 47.48 | 12.4 | 0.71 | 0.63 |  |
+| KIC3542116 | KIC 3542116 | 284.22 | 38.71 | 13.1 | 0.58 | 0.61 |  |
+| KIC8548587 | KIC 8548587 | 296.34 | 44.82 | 11.9 | 0.82 | 0.59 |  |
+| KIC5955033 | KIC 5955033 | 290.11 | 41.23 | 12.7 | 0.65 | 0.57 |  |
+| KIC12557548 | KIC 12557548 | 295.54 | 51.09 | 15.7 | 0.95 | 0.71 | Disintegrating-planet candidate |
+| KIC10195478 | KIC 10195478 | 291.78 | 47.35 | 13.2 | 0.73 | 0.58 |  |
 
 ## Citizen-science report links
 The AnomalyPanel offers these external links (open in new tab):

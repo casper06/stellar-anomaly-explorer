@@ -7,6 +7,7 @@ import * as THREE from 'three'
 import { CatalogStar } from '@/lib/starCatalog'
 import { useStore } from '@/lib/store'
 import { fetchLightcurve, detectDips } from '@/lib/anomalyDetector'
+import { classifyCurve } from '@/lib/curveClassifier'
 
 const STAR_SPHERE_RADIUS = 500
 // Camera orbits the origin at a fixed radius — "zoom" is done via FOV, not by
@@ -115,6 +116,11 @@ async function selectStar(
 ) {
   setSelectedStar(star)
   setMode('analyze')
+  // Mark visited as soon as the user opens the curve — the persisted
+  // record is "I tried to look at this star", not "I successfully
+  // fetched data". A failed MAST fetch still counts as visited so the
+  // user isn't pestered to revisit dead targets.
+  useStore.getState().markVisited(star.id)
   // Clear stale data from the previously selected star and flip the loading
   // flag so the panel can render its progress indicator instead.
   const { setLightcurveLoading } = useStore.getState()
@@ -132,7 +138,14 @@ async function selectStar(
       peakTime: d.peakTime,
       label: d.label,
     }))
-    setLightcurve({ times, flux, dips: anomalyDips, source, provenance })
+    // Profile the curve only when we actually have data; the
+    // 'unavailable' path returns empty arrays and `classifyCurve`
+    // would just report SPARSE / zeros — clearer to surface null.
+    const profile =
+      source === 'unavailable' || times.length === 0
+        ? null
+        : classifyCurve(times, flux, dips)
+    setLightcurve({ times, flux, dips: anomalyDips, source, provenance, profile })
     setAnomalies(anomalyDips.filter(d => d.label !== 'NORMAL'))
   } finally {
     setLightcurveLoading(false)
@@ -153,8 +166,21 @@ async function selectStar(
  * @param sprite Circular alpha sprite for round-looking points.
  * @returns A `<points>` element with packed buffer attributes.
  */
+/**
+ * @description Base pixel size of catalog star points at FOV_MAX. Scaled up
+ * by `depthScale(fov, STAR_DEPTH_MAX_SCALE)` each frame to give a sense
+ * of getting closer when the user zooms in.
+ */
+const STAR_BASE_SIZE = 3
+const STAR_DEPTH_MAX_SCALE = 2.5
+
 const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite: THREE.Texture }>(
   function StarPoints({ stars, sprite }, ref) {
+    // Internal ref so this component can mutate its own material in useFrame
+    // independently of the parent's ref (which is used for click raycasting).
+    const internalRef = useRef<THREE.Points>(null)
+    const { camera } = useThree()
+
     const { positions, colors, sizes } = useMemo(() => {
       const positions = new Float32Array(stars.length * 3)
       const colors = new Float32Array(stars.length * 3)
@@ -188,8 +214,28 @@ const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite
       return { positions, colors, sizes }
     }, [stars])
 
+    // Depth-feel: scale point size by FOV each frame. Default
+    // `pointsMaterial` ignores the per-vertex `attributes-size` buffer
+    // (no custom shader), so the single `material.size` scalar is what
+    // actually controls rendered size; we modulate that here.
+    useFrame(() => {
+      const mesh = internalRef.current
+      if (!mesh) return
+      const fov = (camera as THREE.PerspectiveCamera).fov ?? FOV_MAX
+      const mat = mesh.material as THREE.PointsMaterial
+      mat.size = STAR_BASE_SIZE * depthScale(fov, STAR_DEPTH_MAX_SCALE)
+    })
+
+    // Compose the forwarded ref with our internal one so the parent's
+    // raycaster still sees the mesh while we keep direct access here.
+    const setRef = (node: THREE.Points | null) => {
+      internalRef.current = node
+      if (typeof ref === 'function') ref(node)
+      else if (ref) ref.current = node
+    }
+
     return (
-      <points ref={ref}>
+      <points ref={setRef}>
         <bufferGeometry>
           <bufferAttribute attach="attributes-position" args={[positions, 3]} />
           <bufferAttribute attach="attributes-color" args={[colors, 3]} />
@@ -200,7 +246,7 @@ const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite
           sizeAttenuation={false}
           transparent
           opacity={0.95}
-          size={3}
+          size={STAR_BASE_SIZE}
           map={sprite}
           alphaTest={0.01}
           depthWrite={false}
@@ -270,6 +316,21 @@ function ClickRaycastBridge({
 const ANOMALY_PULSE_OMEGA = (2 * Math.PI) / 1.5
 
 /**
+ * @description "Depth feel" multiplier for point sizes as the user zooms in
+ * (FOV shrinks). At FOV_MAX → 1.0 (current sizes). At FOV_MIN → `maxScale`.
+ * Linear interpolation in FOV-space — narrower FOV = bigger points,
+ * giving the impression of getting closer to the stars.
+ * @param fov Current camera field of view (degrees).
+ * @param maxScale Multiplier applied when fov reaches FOV_MIN.
+ * @returns Size multiplier in [1, maxScale].
+ */
+function depthScale(fov: number, maxScale: number): number {
+  const t = (FOV_MAX - fov) / (FOV_MAX - FOV_MIN) // 0 at max-FOV, 1 at min-FOV
+  const clamped = Math.max(0, Math.min(1, t))
+  return 1 + clamped * (maxScale - 1)
+}
+
+/**
  * @description Three-layer red halo overlay drawn on top of anomaly stars,
  * styled as a radar ping. Two outer rings pulse at offset phases so they
  * read as expanding/contracting waves, and a hot pure-red core marks the
@@ -279,30 +340,190 @@ const ANOMALY_PULSE_OMEGA = (2 * Math.PI) / 1.5
  * @param sprite Shared circular alpha sprite.
  * @returns Three stacked `<points>` elements, or null if there are no anomalies.
  */
-function AnomalyMarkers({ stars, sprite }: { stars: CatalogStar[]; sprite: THREE.Texture }) {
+/**
+ * @description Two-tier rendering mode for anomaly markers, driven by FOV:
+ *
+ * - **FOV ≥ ANOMALY_HARD_CUTOFF_FOV (55°)** — hard cutoff. Outer + mid
+ *   rings rendered with opacity 0; core is a 1px static dot. The
+ *   per-frame `useFrame` body early-returns without doing any trig,
+ *   lerp, or material mutation (after snapping materials to the
+ *   overview state ONCE on the transition). This is the
+ *   performance fix for the wide-FOV red blob: the issue at wide
+ *   FOV is the animated rings overlapping and smearing, not the
+ *   dot count itself.
+ * - **ANOMALY_TIER_HIGH_FOV (50°) ≤ FOV < 55°** — useFrame is still
+ *   gated off (no animation work). Materials hold their last-set
+ *   values, which the 40°–50° fade math already drove to the
+ *   overview state by the time we crossed 50°. Effectively
+ *   identical to ≥55° in render output; the gap exists because the
+ *   user spec explicitly named both thresholds and we honor both
+ *   literally — useFrame off at ≥50, hard cutoff at ≥55.
+ * - **ANOMALY_TIER_LOW_FOV (40°) ≤ FOV < 50°** — animation runs;
+ *   linear cross-fade between overview and detail: pulse opacity
+ *   ramps 0→full, core color slides overview→detail, ring sizes
+ *   interpolate from 1px → full design size.
+ * - **FOV ≤ 40°** — "detail" mode. Full three-layer pulse as designed.
+ */
+const ANOMALY_TIER_HIGH_FOV = 50  // ≥ this → useFrame body short-circuits
+const ANOMALY_TIER_LOW_FOV = 40   // ≤ this → full detail animation
+const ANOMALY_HARD_CUTOFF_FOV = 55 // ≥ this → strict static overview (no animation)
+const ANOMALY_OVERVIEW_CORE_PX = 1
+const ANOMALY_CORE_BASE_SIZE = 8
+
+/**
+ * @description Color theme for one mission's anomaly markers. Lets the
+ * same pulse animation drive two visually-distinct layers (Kepler in
+ * red/orange, TESS in cyan) without duplicating the marker code.
+ * `overview` is the static-dot color shown at wide FOV; `core`,
+ * `mid`, `outer` are the three ring colors at full detail FOV. The
+ * core's color is lerped between `overview` and `core` across the
+ * transition band.
+ */
+interface AnomalyTheme {
+  overview: THREE.Color    // static-dot color (wide FOV)
+  core: THREE.Color        // core color at full detail FOV
+  midHex: string           // mid ring color (static; set in JSX)
+  outerHex: string         // outer ring color (static; set in JSX)
+}
+
+const KEPLER_THEME: AnomalyTheme = {
+  overview: new THREE.Color('#f4a261'),  // orange
+  core: new THREE.Color('#ff0000'),      // red
+  midHex: '#ff4d6d',                     // brand red
+  outerHex: '#ff0000',
+}
+
+const TESS_THEME: AnomalyTheme = {
+  // Cyan/teal palette so TESS markers visually distinguish from
+  // Kepler's red/orange across the same sky.
+  overview: new THREE.Color('#7df9ff'),  // pale cyan (overview dot)
+  core: new THREE.Color('#00e5ff'),      // saturated cyan (detail core)
+  midHex: '#00bcd4',                     // teal mid ring
+  outerHex: '#00e5ff',                   // cyan outer ring
+}
+
+/**
+ * @description Returns the "detail mode amount" — 0.0 at FOV ≥
+ * ANOMALY_TIER_HIGH_FOV (full overview), 1.0 at FOV ≤
+ * ANOMALY_TIER_LOW_FOV (full detail), linearly interpolated in
+ * between. The pulse opacity, color shift, and ring sizes all key off
+ * this single number so the transition stays in sync across layers.
+ * @param fov Current camera field of view (degrees).
+ * @returns Detail amount in [0, 1].
+ */
+function detailAmount(fov: number): number {
+  if (fov >= ANOMALY_TIER_HIGH_FOV) return 0
+  if (fov <= ANOMALY_TIER_LOW_FOV) return 1
+  return (ANOMALY_TIER_HIGH_FOV - fov) / (ANOMALY_TIER_HIGH_FOV - ANOMALY_TIER_LOW_FOV)
+}
+
+/**
+ * @description Renders the three-layer pulse markers for one subset of
+ * anomalies sharing a color theme. Extracted from the per-mission
+ * wrapper below so the pulse + tier-fade logic isn't duplicated.
+ * @param anomalies Pre-filtered list of stars (already known to have
+ * `hasAnomaly: true` and matching the intended source/theme).
+ * @param theme Color palette for this mission's markers.
+ * @param sprite Shared circular alpha sprite.
+ * @returns Three stacked `<points>` elements, or null if empty.
+ */
+function ThemedAnomalyMarkers({
+  anomalies,
+  theme,
+  sprite,
+  dimFactor = 1,
+}: {
+  anomalies: CatalogStar[]
+  theme: AnomalyTheme
+  sprite: THREE.Texture
+  /**
+   * @description Multiplier applied to all per-frame opacity values
+   * (outer/mid/core rings AND the static overview core). `1` = full
+   * brightness; `0.5` = visited dim. The static-snap branch also
+   * scales by this so the wide-FOV core dims as expected. Default 1
+   * keeps backward-compatible behavior for callers that don't pass
+   * the prop.
+   */
+  dimFactor?: number
+}) {
   const outerRef = useRef<THREE.Points>(null)
   const midRef = useRef<THREE.Points>(null)
   const coreRef = useRef<THREE.Points>(null)
-  const anomalies = useMemo(() => stars.filter(s => s.hasAnomaly), [stars])
+  const { camera } = useThree()
+  // Scratch Color so we don't allocate one per frame.
+  const coreColorScratch = useMemo(() => new THREE.Color(), [])
+  // Tracks whether we're currently in the "static overview" snapshot
+  // state so we only mutate materials ONCE on the transition into it,
+  // not every frame. Without this guard the useFrame body still runs
+  // per-frame at wide FOV (you can't conditionally call a hook); the
+  // ref lets the body do nothing once the static state is established.
+  const isStaticRef = useRef(false)
+  // When the caller changes `dimFactor` (visited → unvisited toggle in
+  // dev, or set-rehydration), clear the latch so the next wide-FOV
+  // frame re-snaps the static state with the new dim value baked in.
+  useEffect(() => {
+    isStaticRef.current = false
+  }, [dimFactor])
 
   useFrame(({ clock }) => {
+    const fov = (camera as THREE.PerspectiveCamera).fov ?? FOV_MAX
+    // Wide FOV: skip ALL animation work. On the transition into this
+    // state, snap materials to the static overview values once; on
+    // subsequent frames, do nothing. This is the perf fix for the
+    // wide-FOV blob — the animated mutation of `size`/`opacity`/`color`
+    // every frame across thousands of overlapping markers is what
+    // produces the smear, not the marker count itself.
+    if (fov >= ANOMALY_TIER_HIGH_FOV) {
+      if (!isStaticRef.current) {
+        if (outerRef.current) {
+          const mat = outerRef.current.material as THREE.PointsMaterial
+          mat.size = 0
+          mat.opacity = 0
+        }
+        if (midRef.current) {
+          const mat = midRef.current.material as THREE.PointsMaterial
+          mat.size = 0
+          mat.opacity = 0
+        }
+        if (coreRef.current) {
+          const mat = coreRef.current.material as THREE.PointsMaterial
+          mat.size = ANOMALY_OVERVIEW_CORE_PX
+          mat.opacity = 0.7 * dimFactor
+          mat.color.copy(theme.overview)
+        }
+        isStaticRef.current = true
+      }
+      return
+    }
+    // Re-entering the animated band — clear the latch so the next
+    // wide-FOV transition snaps fresh.
+    isStaticRef.current = false
+
     const t = clock.elapsedTime * ANOMALY_PULSE_OMEGA
-    // Outer ring: largest, slowest visible swing, low opacity (~#ff000044)
+    const detail = detailAmount(fov)
+    const overview = 1 - detail
     if (outerRef.current) {
       const mat = outerRef.current.material as THREE.PointsMaterial
-      mat.size = 36 + 14 * Math.sin(t)
-      mat.opacity = 0.18 + 0.12 * Math.sin(t)
+      const pulseSize = 36 + 14 * Math.sin(t)
+      const pulseOpacity = 0.18 + 0.12 * Math.sin(t)
+      mat.size = pulseSize * detail
+      mat.opacity = pulseOpacity * detail * dimFactor
     }
-    // Mid ring: offset phase so it reads as a second ping chasing the first
     if (midRef.current) {
       const mat = midRef.current.material as THREE.PointsMaterial
-      mat.size = 22 + 9 * Math.sin(t + Math.PI * 0.6)
-      mat.opacity = 0.45 + 0.25 * Math.sin(t + Math.PI * 0.6)
+      const pulseSize = 22 + 9 * Math.sin(t + Math.PI * 0.6)
+      const pulseOpacity = 0.45 + 0.25 * Math.sin(t + Math.PI * 0.6)
+      mat.size = pulseSize * detail
+      mat.opacity = pulseOpacity * detail * dimFactor
     }
-    // Core: faster brightness wobble, stays small and hot
     if (coreRef.current) {
       const mat = coreRef.current.material as THREE.PointsMaterial
-      mat.opacity = 0.85 + 0.15 * Math.sin(t * 1.5)
+      mat.size = ANOMALY_OVERVIEW_CORE_PX * overview + ANOMALY_CORE_BASE_SIZE * detail
+      coreColorScratch.lerpColors(theme.overview, theme.core, detail)
+      mat.color.copy(coreColorScratch)
+      const overviewOpacity = 0.7
+      const detailOpacity = 0.85 + 0.15 * Math.sin(t * 1.5)
+      mat.opacity = (overviewOpacity * overview + detailOpacity * detail) * dimFactor
     }
   })
 
@@ -319,57 +540,196 @@ function AnomalyMarkers({ stars, sprite }: { stars: CatalogStar[]; sprite: THREE
 
   if (anomalies.length === 0) return null
 
+  // Initial material props match the static-overview state so the
+  // first paint (before the first useFrame tick) is correct even
+  // when the camera starts at wide FOV. The useFrame body takes
+  // over from there, mutating sizes/opacities only when FOV < 50.
   return (
     <>
-      {/* Outer faint ring — #ff0000 at ~27% opacity (≈ #ff000044) */}
       <points ref={outerRef}>
         <bufferGeometry>
           <bufferAttribute attach="attributes-position" args={[positions, 3]} />
         </bufferGeometry>
         <pointsMaterial
-          color="#ff0000"
-          size={36}
+          color={theme.outerHex}
+          size={0}
           sizeAttenuation={false}
           transparent
-          opacity={0.27}
+          opacity={0}
           map={sprite}
           alphaTest={0.01}
           depthWrite={false}
         />
       </points>
-      {/* Mid ring — brand red */}
       <points ref={midRef}>
         <bufferGeometry>
           <bufferAttribute attach="attributes-position" args={[positions, 3]} />
         </bufferGeometry>
         <pointsMaterial
-          color="#ff4d6d"
-          size={22}
+          color={theme.midHex}
+          size={0}
           sizeAttenuation={false}
           transparent
-          opacity={0.6}
+          opacity={0}
           map={sprite}
           alphaTest={0.01}
           depthWrite={false}
         />
       </points>
-      {/* Hot pure-red core dot */}
       <points ref={coreRef}>
         <bufferGeometry>
           <bufferAttribute attach="attributes-position" args={[positions, 3]} />
         </bufferGeometry>
         <pointsMaterial
-          color="#ff0000"
-          size={8}
+          color={theme.overview.getStyle()}
+          size={ANOMALY_OVERVIEW_CORE_PX}
           sizeAttenuation={false}
           transparent
-          opacity={0.95}
+          opacity={0.7}
           map={sprite}
           alphaTest={0.01}
           depthWrite={false}
         />
       </points>
     </>
+  )
+}
+
+/**
+ * @description Multiplier applied to opacity of markers for anomalies
+ * the user has already opened a light curve for. Lower than 1 so
+ * unvisited anomalies pop against a sea of visited ones — the whole
+ * point of the visited tracking is to direct attention to what hasn't
+ * been seen yet.
+ */
+const VISITED_DIM_FACTOR = 0.5
+
+/**
+ * @description Wrapper that splits the anomaly catalog by mission source
+ * AND by visited state, then renders one `ThemedAnomalyMarkers` layer
+ * per (mission, visited) bucket — four meshes total per mission color
+ * group (unvisited + visited × outer/mid/core). Visited anomalies use
+ * `dimFactor = VISITED_DIM_FACTOR` so unvisited ones stay visually
+ * dominant.
+ *
+ * A separate `FlaggedRingMarkers` layer renders a white ring around
+ * every flagged star regardless of mission or visited state — flagged
+ * is purely additive overlay, doesn't replace the underlying marker.
+ *
+ * Kepler = red/orange theme; TESS = cyan theme. Stars with no explicit
+ * source tag (legacy seeds, anomalies that pre-date mission tagging)
+ * fall into the Kepler bucket — most of them ARE historically Kepler
+ * targets (Tabby's etc), so this matches user expectation. Mission
+ * overlap: when a star is in both KOI and TOI catalogs, the page-level
+ * merge tags it as `'TESS'` (TOI merge runs last).
+ * @param stars Full catalog; we filter to `hasAnomaly: true` here.
+ * @param sprite Shared circular alpha sprite.
+ * @returns Per-mission themed layers plus the flagged ring overlay.
+ */
+function AnomalyMarkers({ stars, sprite }: { stars: CatalogStar[]; sprite: THREE.Texture }) {
+  // Subscribe to the persisted sets so the buckets recompute when the
+  // user toggles a flag or opens a new star's curve. Both are Set
+  // instances; Zustand sets a new reference on each setter call so
+  // the dependency check fires correctly.
+  const visitedIds = useStore(s => s.visitedIds)
+  const flaggedIds = useStore(s => s.flaggedIds)
+
+  const partitioned = useMemo(() => {
+    const kepUnvisited: CatalogStar[] = []
+    const kepVisited: CatalogStar[] = []
+    const tesUnvisited: CatalogStar[] = []
+    const tesVisited: CatalogStar[] = []
+    const flaggedAll: CatalogStar[] = []
+    for (const s of stars) {
+      if (!s.hasAnomaly) continue
+      const isTess = s.source === 'TESS'
+      const isVisited = visitedIds.has(s.id)
+      if (isTess) (isVisited ? tesVisited : tesUnvisited).push(s)
+      else (isVisited ? kepVisited : kepUnvisited).push(s)
+      if (flaggedIds.has(s.id)) flaggedAll.push(s)
+    }
+    return { kepUnvisited, kepVisited, tesUnvisited, tesVisited, flaggedAll }
+  }, [stars, visitedIds, flaggedIds])
+
+  return (
+    <>
+      <ThemedAnomalyMarkers anomalies={partitioned.kepUnvisited} theme={KEPLER_THEME} sprite={sprite} />
+      <ThemedAnomalyMarkers anomalies={partitioned.kepVisited} theme={KEPLER_THEME} sprite={sprite} dimFactor={VISITED_DIM_FACTOR} />
+      <ThemedAnomalyMarkers anomalies={partitioned.tesUnvisited} theme={TESS_THEME} sprite={sprite} />
+      <ThemedAnomalyMarkers anomalies={partitioned.tesVisited} theme={TESS_THEME} sprite={sprite} dimFactor={VISITED_DIM_FACTOR} />
+      <FlaggedRingMarkers anomalies={partitioned.flaggedAll} sprite={sprite} />
+    </>
+  )
+}
+
+/**
+ * @description Additive white-ring overlay drawn around every flagged
+ * anomaly star regardless of mission or visited status. Renders as a
+ * single `<points>` layer with a slightly larger sprite size than the
+ * mission cores so the ring sits around them. Hidden at wide FOV
+ * (FOV ≥ ANOMALY_TIER_HIGH_FOV, same threshold as the rest of the
+ * marker overlay) so the wide-FOV view doesn't gain visual noise just
+ * because the user flagged things across the sky.
+ * @param anomalies Flagged star subset; assumed to all have `hasAnomaly`.
+ * @param sprite Shared circular alpha sprite.
+ * @returns A single `<points>` layer, or null when empty.
+ */
+function FlaggedRingMarkers({
+  anomalies,
+  sprite,
+}: {
+  anomalies: CatalogStar[]
+  sprite: THREE.Texture
+}) {
+  const ringRef = useRef<THREE.Points>(null)
+  const { camera } = useThree()
+
+  useFrame(() => {
+    if (!ringRef.current) return
+    const fov = (camera as THREE.PerspectiveCamera).fov ?? FOV_MAX
+    const mat = ringRef.current.material as THREE.PointsMaterial
+    if (fov >= ANOMALY_TIER_HIGH_FOV) {
+      mat.opacity = 0
+      mat.size = 0
+      return
+    }
+    const detail = detailAmount(fov)
+    // Hold the ring at a stable size (no pulse — the ring is a
+    // status badge, not an animation), but follow the same FOV fade
+    // as the other markers so it doesn't pop in/out abruptly.
+    mat.size = 14 * detail
+    mat.opacity = 0.85 * detail
+  })
+
+  const positions = useMemo(() => {
+    const pos = new Float32Array(anomalies.length * 3)
+    anomalies.forEach((star, i) => {
+      const [x, y, z] = raDecToXYZ(star.ra, star.dec, STAR_SPHERE_RADIUS - 1)
+      pos[i * 3] = x
+      pos[i * 3 + 1] = y
+      pos[i * 3 + 2] = z
+    })
+    return pos
+  }, [anomalies])
+
+  if (anomalies.length === 0) return null
+
+  return (
+    <points ref={ringRef}>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" args={[positions, 3]} />
+      </bufferGeometry>
+      <pointsMaterial
+        color="#ffffff"
+        size={0}
+        sizeAttenuation={false}
+        transparent
+        opacity={0}
+        map={sprite}
+        alphaTest={0.01}
+        depthWrite={false}
+      />
+    </points>
   )
 }
 
