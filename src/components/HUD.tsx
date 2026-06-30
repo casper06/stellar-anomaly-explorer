@@ -1,7 +1,16 @@
 'use client'
-import { useEffect, useState } from 'react'
-import { useStore } from '@/lib/store'
+import { useEffect, useMemo, useState } from 'react'
+import { useStore, type Star } from '@/lib/store'
 import { KNOWN_ANOMALIES } from '@/lib/starCatalog'
+import { ALL_QUADRANT_IDS, quadrantCenter } from '@/lib/quadrants'
+
+/**
+ * @description Threshold (degrees, camera FOV) below which the quadrant
+ * HUD panel becomes visible. Matches the user spec — quadrants only
+ * make sense once the user has zoomed in enough that one quadrant
+ * actually fills a meaningful portion of the screen.
+ */
+const QUADRANT_PANEL_FOV_THRESHOLD = 45
 
 const ONBOARDING_KEY = 'sae:onboarded:v1'
 
@@ -129,31 +138,144 @@ function Onboarding() {
 }
 
 export default function HUD() {
-  const { mode, selectedStar, cameraTarget, anomalies, requestFlyTo } = useStore()
+  const {
+    mode,
+    selectedStar,
+    cameraTarget,
+    anomalies,
+    koiCount,
+    koiError,
+    toiCount,
+    toiError,
+    anomalyStars,
+    zoom,
+    nextAnomalyCursor,
+    setNextAnomalyCursor,
+    requestFlyTo,
+    visitedIds,
+    flaggedIds,
+    setSelectedStar,
+    setMode,
+  } = useStore()
 
-  function goToNearestAnomaly() {
-    // Angular nearest on the celestial sphere: convert each RA/Dec to a unit
-    // direction vector, then pick the anomaly whose direction has the highest
-    // dot product with the camera's current pointing vector. Euclidean RA/Dec
-    // distance is wrong near the poles and across the RA=0/360 seam.
-    const toUnit = (ra: number, dec: number) => {
-      const r = (ra * Math.PI) / 180
-      const d = (dec * Math.PI) / 180
-      return {
-        x: Math.cos(d) * Math.cos(r),
-        y: Math.sin(d),
-        z: Math.cos(d) * Math.sin(r),
-      }
+  // Transient toast for "NO ANOMALIES IN VIEW" feedback. Local state with
+  // a setTimeout so it self-dismisses after ~1.5s without needing a
+  // separate animation library.
+  const [toast, setToast] = useState<string | null>(null)
+  useEffect(() => {
+    if (!toast) return
+    const id = setTimeout(() => setToast(null), 1500)
+    return () => clearTimeout(id)
+  }, [toast])
+
+  // Use the full KOI catalog when it's loaded; fall back to the 11
+  // hardcoded seeds while it's still pending or if the fetch failed.
+  // This way nav works on first paint AND scales to thousands once
+  // the merge lands.
+  const navTargets = anomalyStars.length > 0 ? anomalyStars : KNOWN_ANOMALIES
+
+  /**
+   * @description Computes the unit-vector for a celestial position.
+   * Pulled out so both nav handlers and the in-view filter share one
+   * implementation. Standard RA/Dec → (x, y, z) on the unit sphere.
+   */
+  function toUnit(ra: number, dec: number) {
+    const r = (ra * Math.PI) / 180
+    const d = (dec * Math.PI) / 180
+    return {
+      x: Math.cos(d) * Math.cos(r),
+      y: Math.sin(d),
+      z: Math.cos(d) * Math.sin(r),
     }
+  }
+
+  /**
+   * @description Returns indices into `anomalyStars` for entries whose
+   * direction is inside the camera's current view cone. The cone is
+   * approximate — we use half-FOV × 1.3 to roughly cover the horizontal
+   * extent of the canvas (vertical FOV times the typical 16:9 aspect
+   * widens the horizontal field by ~30%). Good enough for "is this
+   * star on screen" filtering without round-tripping through Three.js
+   * projection math. Returns indices in score-desc order since
+   * `anomalyStars` is already sorted that way.
+   */
+  function visibleAnomalyIndices(): number[] {
+    if (anomalyStars.length === 0) return []
     const cam = toUnit(cameraTarget.ra, cameraTarget.dec)
-    let best = KNOWN_ANOMALIES[0]
-    let bestDot = -Infinity
-    for (const s of KNOWN_ANOMALIES) {
+    // `zoom` holds the camera FOV in degrees (set by CameraSync each frame).
+    const halfFovRad = ((zoom / 2) * Math.PI) / 180
+    // Generous cone: 1.3× covers horizontal extent for typical aspect ratios.
+    const cosThreshold = Math.cos(halfFovRad * 1.3)
+    const out: number[] = []
+    for (let i = 0; i < anomalyStars.length; i++) {
+      const s = anomalyStars[i]
       const v = toUnit(s.ra, s.dec)
       const dot = v.x * cam.x + v.y * cam.y + v.z * cam.z
-      if (dot > bestDot) { bestDot = dot; best = s }
+      if (dot >= cosThreshold) out.push(i)
     }
-    if (best) requestFlyTo(best.ra, best.dec)
+    return out
+  }
+
+  function goToNearestAnomaly() {
+    // Angular nearest on the celestial sphere: pick the anomaly whose
+    // direction has the highest dot product with the camera's current
+    // pointing vector. Scans the full catalog (NOT view-filtered) —
+    // this button is for "take me to the nearest anomaly even if I
+    // can't see one from here".
+    if (navTargets.length === 0) return
+    const cam = toUnit(cameraTarget.ra, cameraTarget.dec)
+    let bestIdx = 0
+    let bestDot = -Infinity
+    for (let i = 0; i < navTargets.length; i++) {
+      const s = navTargets[i]
+      const v = toUnit(s.ra, s.dec)
+      const dot = v.x * cam.x + v.y * cam.y + v.z * cam.z
+      if (dot > bestDot) { bestDot = dot; bestIdx = i }
+    }
+    const best = navTargets[bestIdx]
+    requestFlyTo(best.ra, best.dec)
+    // Sync cursor to this position so a subsequent NEXT click advances
+    // from the visible target rather than jumping somewhere arbitrary.
+    if (navTargets === anomalyStars) setNextAnomalyCursor(bestIdx)
+  }
+
+  /**
+   * @description Cycles through anomalies visible in the current viewport
+   * by score desc. The previous version cycled globally through all
+   * ~6,000 KOIs which made the button useless once the Kepler field
+   * was off-screen — it'd just keep flying back there. View-filtered
+   * cycling lets the user pan to any region of sky and tour the
+   * anomalies in THAT region.
+   *
+   * Logic:
+   *   1. Find anomalies inside the current view cone.
+   *   2. If empty → flash "NO ANOMALIES IN VIEW" toast and stop.
+   *   3. Otherwise find the first visible anomaly with `globalRank >
+   *      nextAnomalyCursor`. If none, wrap to the first visible.
+   *   4. Fly there, update cursor.
+   *
+   * The cursor stores the global rank (index into `anomalyStars`),
+   * NOT the in-view rank, because the visible set changes every time
+   * the user pans/zooms. Using global rank lets the cycle resume
+   * sensibly when the user pans somewhere new — we pick up where we
+   * left off in score order rather than restarting from the highest
+   * score visible (which would lock the user on the same top anomaly
+   * after every pan).
+   */
+  function goToNextAnomaly() {
+    if (anomalyStars.length === 0) return
+    const visible = visibleAnomalyIndices()
+    if (visible.length === 0) {
+      setToast('NO ANOMALIES IN VIEW')
+      return
+    }
+    // Find first visible index strictly greater than the cursor; wrap
+    // to the first visible if we ran past the end of the visible list.
+    let pick = visible.find(i => i > nextAnomalyCursor)
+    if (pick === undefined) pick = visible[0]
+    const target = anomalyStars[pick]
+    setNextAnomalyCursor(pick)
+    requestFlyTo(target.ra, target.dec)
   }
 
   const statusColor =
@@ -185,29 +307,35 @@ export default function HUD() {
           top: 0,
           left: 0,
           right: 0,
-          padding: '16px 24px',
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
+          padding: '16px 24px 10px',
           background: 'linear-gradient(180deg, rgba(0,0,0,0.8) 0%, transparent 100%)',
         }}
       >
-        <div>
-          <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: 3, color: 'white' }}>
-            STELLAR ANOMALY EXPLORER
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: 3, color: 'white' }}>
+              STELLAR ANOMALY EXPLORER
+            </div>
+            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginTop: 2 }}>
+              KEPLER · TESS · GAIA · HIPPARCOS
+            </div>
           </div>
-          <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginTop: 2 }}>
-            KEPLER · TESS · GAIA · HIPPARCOS
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 1 }}>
+              RA {cameraTarget.ra.toFixed(4)}° · DEC {cameraTarget.dec.toFixed(4)}°
+            </div>
+            <div style={{ fontSize: 9, color: statusColor, letterSpacing: 2, marginTop: 2 }}>
+              {statusLabel}
+            </div>
           </div>
         </div>
-        <div style={{ textAlign: 'right' }}>
-          <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 1 }}>
-            RA {cameraTarget.ra.toFixed(4)}° · DEC {cameraTarget.dec.toFixed(4)}°
-          </div>
-          <div style={{ fontSize: 9, color: statusColor, letterSpacing: 2, marginTop: 2 }}>
-            {statusLabel}
-          </div>
-        </div>
+        {/* Global progress bar — fraction of anomaly catalog the user
+            has opened a light curve for. Hidden until the catalog
+            loads (anomalyStars empty = pending) since "0 / 0" is
+            meaningless. */}
+        {anomalyStars.length > 0 && (
+          <ProgressBar visited={countVisitedAnomalies(anomalyStars, visitedIds)} total={anomalyStars.length} />
+        )}
       </div>
 
       {/* Crosshair */}
@@ -267,23 +395,30 @@ export default function HUD() {
           pointerEvents: 'auto',
         }}
       >
-        {anomalies.length > 0 && (
-          <div
-            style={{
-              background: 'rgba(0,0,0,0.7)',
-              border: '1px solid rgba(255,77,109,0.4)',
-              borderRadius: 8,
-              padding: '10px 16px',
-            }}
-          >
-            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 2 }}>
-              ANOMALIES DETECTED
-            </div>
-            <div style={{ fontSize: 22, fontWeight: 700, color: '#ff4d6d', marginTop: 2 }}>
-              {anomalies.length}
-            </div>
-          </div>
-        )}
+        {/* Global mission counters (catalog scale, not per-selected-star).
+            One row per mission, stacked in a single card so both counts
+            are visible together. Each row shows a "CATALOG UNAVAILABLE"
+            badge instead of a number when its fetch failed. The
+            per-star detected-dip count (`anomalies.length`) still
+            drives the status color/label in the header — different
+            semantic. */}
+        <div
+          style={{
+            background: 'rgba(0,0,0,0.7)',
+            border:
+              koiError && toiError
+                ? '1px solid rgba(244,162,97,0.4)'
+                : '1px solid rgba(255,77,109,0.4)',
+            borderRadius: 8,
+            padding: '10px 16px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+          }}
+        >
+          <MissionCount label="KEPLER" count={koiCount} error={koiError} accent="#ff4d6d" />
+          <MissionCount label="TESS" count={toiCount} error={toiError} accent="#00e5ff" />
+        </div>
 
         <button
           onClick={goToNearestAnomaly}
@@ -302,6 +437,96 @@ export default function HUD() {
         >
           GO TO NEAREST ANOMALY
         </button>
+
+        {/* NEXT ANOMALY — cycles through anomalies visible in the current
+            viewport, by score desc. Disabled while the catalog hasn't
+            loaded yet. Shows "N IN VIEW" — count of anomalies inside
+            the camera's view cone — instead of the global total. */}
+        <button
+          onClick={goToNextAnomaly}
+          disabled={anomalyStars.length === 0}
+          style={{
+            background: 'rgba(0,0,0,0.7)',
+            border: `1px solid ${anomalyStars.length === 0 ? 'rgba(76,201,240,0.15)' : 'rgba(76,201,240,0.4)'}`,
+            borderRadius: 8,
+            padding: '10px 16px',
+            color: anomalyStars.length === 0 ? 'rgba(76,201,240,0.3)' : '#4cc9f0',
+            fontSize: 9,
+            letterSpacing: 2,
+            cursor: anomalyStars.length === 0 ? 'default' : 'pointer',
+            textAlign: 'left',
+            fontFamily: 'inherit',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: 12,
+          }}
+        >
+          <span>NEXT ANOMALY ▸</span>
+          {anomalyStars.length > 0 && (
+            <span style={{ opacity: 0.55, fontSize: 8 }}>
+              {visibleAnomalyIndices().length.toLocaleString()} IN VIEW
+            </span>
+          )}
+        </button>
+
+        {/* Transient toast: shows when NEXT is pressed with no visible
+            anomalies. Self-dismisses after ~1.5s (handled by the
+            useEffect above). Kept small/subtle — same monospace style
+            as the rest of the HUD, not modal. */}
+        {toast && (
+          <div
+            style={{
+              fontSize: 9,
+              color: '#f4a261',
+              letterSpacing: 2,
+              padding: '6px 10px',
+              background: 'rgba(0,0,0,0.7)',
+              border: '1px solid rgba(244,162,97,0.4)',
+              borderRadius: 6,
+            }}
+          >
+            {toast}
+          </div>
+        )}
+      </div>
+
+      {/* Bottom-right column above the minimap: flagged list (top)
+          then quadrant panel (bottom). One absolutely-positioned
+          column container so the two child panels stack via flex,
+          never overlap, and the FLAGGED list always sits above the
+          QUADRANTS panel regardless of which is expanded. The
+          column anchors to bottom-right of the viewport at an
+          offset that clears the minimap (~120px). */}
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 130,
+          right: 24,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'flex-end',
+          gap: 8,
+          maxHeight: 'calc(100vh - 200px)',
+          pointerEvents: 'none', // children opt in individually
+        }}
+      >
+        <FlaggedPanel
+          flaggedIds={flaggedIds}
+          anomalyStars={anomalyStars}
+          onFlyTo={(star) => {
+            requestFlyTo(star.ra, star.dec)
+            setSelectedStar(star)
+            setMode('analyze')
+          }}
+        />
+        <QuadrantPanel
+          fov={zoom}
+          anomalyStars={anomalyStars}
+          visitedIds={visitedIds}
+          flaggedIds={flaggedIds}
+          onPick={(ra, dec) => requestFlyTo(ra, dec)}
+        />
       </div>
 
       {/* Bottom-right: minimap (click to fly the camera there) */}
@@ -498,6 +723,352 @@ function Minimap({
           }}
         />
       </div>
+    </div>
+  )
+}
+
+/**
+ * @description One mission row inside the HUD's anomaly counter card.
+ * Shows the mission label + the unique-target count (or "CATALOG
+ * UNAVAILABLE" when its fetch failed, or "…" while still loading).
+ * The accent color matches the mission's marker color in the 3D sky
+ * (red for Kepler, cyan for TESS).
+ * @param label All-caps mission tag, e.g. "KEPLER" or "TESS".
+ * @param count Unique-target count; 0 means pending or unavailable.
+ * @param error Non-null = fetch failed; the row renders the error
+ * badge instead of the count.
+ * @param accent Hex color used for the count number's text — same as
+ * the mission's marker color in StarField for visual coherence.
+ */
+function MissionCount({
+  label,
+  count,
+  error,
+  accent,
+}: {
+  label: string
+  count: number
+  error: string | null
+  accent: string
+}) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+      <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, minWidth: 56 }}>
+        {label}
+      </div>
+      {error ? (
+        <div style={{ fontSize: 10, color: '#f4a261', letterSpacing: 1 }}>
+          CATALOG UNAVAILABLE
+        </div>
+      ) : (
+        <div style={{ fontSize: 18, fontWeight: 700, color: accent }}>
+          {count > 0 ? count.toLocaleString() : '…'}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * @description Counts how many entries in the anomaly catalog the user
+ * has opened a light curve for. Intersection of `anomalyStars` and
+ * `visitedIds`. Used by the header progress bar — distinct from
+ * `visitedIds.size` because the user may have visited stars that
+ * aren't in the current anomaly subset (e.g. a Hipparcos star they
+ * inspected before the KOI/TOI merge).
+ * @param anomalyStars Current anomaly subset (post merge).
+ * @param visitedIds Persisted visited set.
+ * @returns Count of anomalies the user has visited.
+ */
+function countVisitedAnomalies(anomalyStars: Star[], visitedIds: Set<string>): number {
+  let n = 0
+  for (const s of anomalyStars) if (visitedIds.has(s.id)) n++
+  return n
+}
+
+/**
+ * @description Thin progress bar that lives below the header title row,
+ * showing how much of the anomaly catalog the user has explored. Bar
+ * is full width with a cyan fill segment representing the visited
+ * fraction. The numeric label sits to the right of the bar so a
+ * glance reads both the relative and absolute progress.
+ * @param visited Number of anomalies the user has opened.
+ * @param total Total anomaly count.
+ * @returns Bar + label row.
+ */
+function ProgressBar({ visited, total }: { visited: number; total: number }) {
+  const pct = total > 0 ? (visited / total) * 100 : 0
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+      }}
+    >
+      <div
+        style={{
+          flex: 1,
+          height: 3,
+          background: 'rgba(255,255,255,0.08)',
+          borderRadius: 2,
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            width: `${Math.min(100, pct)}%`,
+            height: '100%',
+            background: '#4cc9f0',
+            transition: 'width 0.3s ease',
+          }}
+        />
+      </div>
+      <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.55)', letterSpacing: 1, whiteSpace: 'nowrap' }}>
+        EXPLORED: {visited.toLocaleString()} / {total.toLocaleString()} ({pct.toFixed(1)}%)
+      </div>
+    </div>
+  )
+}
+
+/**
+ * @description Bottom-right overlay listing every Kepler-field quadrant
+ * intersecting the current view, with per-quadrant anomaly /
+ * visited / flagged counts. Hidden when FOV is wide (the grid only
+ * makes sense once a quadrant fills a meaningful portion of the
+ * screen) and when no anomalies have a quadrant tag yet (catalog
+ * still loading). Clicking a row flies the camera to that
+ * quadrant's center.
+ *
+ * Visible-quadrant detection: we collect the set of quadrant ids
+ * across all anomalies whose unit-vector falls inside the camera
+ * cone (`half-FOV × 1.3`, same approximation as `visibleAnomaly
+ * Indices` in the parent). Cheap O(N) per render; the per-quadrant
+ * counts (`anomalies`, `visited`, `flagged`) are also computed in
+ * the same pass.
+ * @param fov Current camera FOV in degrees.
+ * @param anomalyStars Anomaly subset from the store.
+ * @param visitedIds Persisted visited set.
+ * @param flaggedIds Persisted flagged set.
+ * @param onPick Click-to-fly callback; receives the RA/Dec at the
+ * picked quadrant's center.
+ */
+function QuadrantPanel({
+  fov,
+  anomalyStars,
+  visitedIds,
+  flaggedIds,
+  onPick,
+}: {
+  fov: number
+  anomalyStars: Star[]
+  visitedIds: Set<string>
+  flaggedIds: Set<string>
+  onPick: (ra: number, dec: number) => void
+}) {
+  // Recompute per-quadrant counts whenever any input changes. Cheap
+  // even at ~10k anomalies because it's one linear pass.
+  const visibleQuadrants = useMemo(() => {
+    if (fov >= QUADRANT_PANEL_FOV_THRESHOLD) return []
+    const stats = new Map<string, { anomalies: number; visited: number; flagged: number }>()
+    for (const s of anomalyStars) {
+      if (!s.quadrant) continue
+      let bucket = stats.get(s.quadrant)
+      if (!bucket) {
+        bucket = { anomalies: 0, visited: 0, flagged: 0 }
+        stats.set(s.quadrant, bucket)
+      }
+      bucket.anomalies++
+      if (visitedIds.has(s.id)) bucket.visited++
+      if (flaggedIds.has(s.id)) bucket.flagged++
+    }
+    // Return in canonical order (A1..F6) — feels more like a grid
+    // reading than score-sorted, which would shuffle every visit.
+    return ALL_QUADRANT_IDS
+      .filter(id => stats.has(id))
+      .map(id => ({ id, ...stats.get(id)! }))
+  }, [fov, anomalyStars, visitedIds, flaggedIds])
+
+  if (visibleQuadrants.length === 0) return null
+
+  // Sized to fit; parent column places us below the FlaggedPanel
+  // and above the minimap. No absolute positioning of our own —
+  // the parent owns the stack.
+  return (
+    <div
+      style={{
+        width: 220,
+        maxHeight: '32vh',
+        overflowY: 'auto',
+        background: 'rgba(0,0,0,0.7)',
+        border: '1px solid rgba(76,201,240,0.25)',
+        borderRadius: 6,
+        padding: 8,
+        pointerEvents: 'auto',
+      }}
+    >
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginBottom: 6, paddingLeft: 4 }}>
+        QUADRANTS IN VIEW
+      </div>
+      {visibleQuadrants.map(q => (
+        <button
+          key={q.id}
+          onClick={() => {
+            const c = quadrantCenter(q.id)
+            if (c) onPick(c.ra, c.dec)
+          }}
+          style={{
+            display: 'flex',
+            alignItems: 'baseline',
+            gap: 6,
+            width: '100%',
+            background: 'none',
+            border: 'none',
+            color: 'white',
+            fontSize: 9,
+            letterSpacing: 1,
+            padding: '4px 6px',
+            cursor: 'pointer',
+            fontFamily: 'inherit',
+            textAlign: 'left',
+            borderRadius: 4,
+          }}
+          onMouseEnter={e => { e.currentTarget.style.background = 'rgba(76,201,240,0.1)' }}
+          onMouseLeave={e => { e.currentTarget.style.background = 'none' }}
+        >
+          <span style={{ fontWeight: 700, color: '#4cc9f0', minWidth: 22 }}>{q.id}</span>
+          <span style={{ color: 'rgba(255,255,255,0.7)' }}>· {q.anomalies}</span>
+          <span style={{ color: 'rgba(255,255,255,0.45)' }}>· {q.visited} visited</span>
+          {q.flagged > 0 && <span style={{ color: 'white' }}>· {q.flagged} ★</span>}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/**
+ * @description Collapsible bottom-right panel listing every flagged
+ * star. Collapsed default = a single ★ FLAGGED (N) button; expanded
+ * = a scrollable list with name, score, and quadrant. Click a row to
+ * fly the camera to that star AND open the AnomalyPanel for it
+ * (using the dispatch passed in by the parent).
+ *
+ * The list is sourced from `anomalyStars` filtered by
+ * `flaggedIds.has(id)` so the entries carry full star metadata
+ * (score, quadrant). Stars in the persisted flagged set that aren't
+ * in the current anomaly catalog (e.g. flagged before a catalog
+ * fetch failure) are silently omitted — we don't have the data to
+ * render their row.
+ * @param flaggedIds Persisted flagged set.
+ * @param anomalyStars Anomaly subset from the store.
+ * @param onFlyTo Click handler; receives the full star so the
+ * parent can both fly the camera and select it.
+ */
+function FlaggedPanel({
+  flaggedIds,
+  anomalyStars,
+  onFlyTo,
+}: {
+  flaggedIds: Set<string>
+  anomalyStars: Star[]
+  onFlyTo: (star: Star) => void
+}) {
+  const [open, setOpen] = useState(false)
+
+  const flaggedStars = useMemo(() => {
+    const out: Star[] = []
+    for (const s of anomalyStars) {
+      if (flaggedIds.has(s.id)) out.push(s)
+    }
+    out.sort((a, b) => b.anomalyScore - a.anomalyScore)
+    return out
+  }, [flaggedIds, anomalyStars])
+
+  // Rendered first inside the parent column container so it sits
+  // ABOVE the QuadrantPanel. No absolute positioning — the parent
+  // handles bottom/right anchoring and the gap between siblings.
+  return (
+    <div
+      style={{
+        pointerEvents: 'auto',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'flex-end',
+        gap: 6,
+      }}
+    >
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{
+          background: 'rgba(0,0,0,0.7)',
+          border: '1px solid rgba(255,255,255,0.25)',
+          borderRadius: 6,
+          padding: '6px 12px',
+          color: 'white',
+          fontSize: 9,
+          letterSpacing: 2,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+        }}
+      >
+        ★ FLAGGED ({flaggedStars.length}){open ? ' ▾' : ' ▸'}
+      </button>
+      {open && (
+        <div
+          style={{
+            background: 'rgba(0,0,0,0.78)',
+            border: '1px solid rgba(255,255,255,0.18)',
+            borderRadius: 6,
+            padding: 8,
+            width: 240,
+            maxHeight: '40vh',
+            overflowY: 'auto',
+          }}
+        >
+          {flaggedStars.length === 0 ? (
+            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.45)', letterSpacing: 1, padding: 6, textAlign: 'center' }}>
+              NO FLAGGED STARS YET
+            </div>
+          ) : (
+            flaggedStars.map(s => (
+              <button
+                key={s.id}
+                onClick={() => onFlyTo(s)}
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'baseline',
+                  width: '100%',
+                  background: 'none',
+                  border: 'none',
+                  color: 'white',
+                  fontSize: 9,
+                  letterSpacing: 1,
+                  padding: '5px 6px',
+                  cursor: 'pointer',
+                  fontFamily: 'inherit',
+                  textAlign: 'left',
+                  borderRadius: 4,
+                  gap: 6,
+                }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.08)' }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'none' }}
+              >
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                  {s.name}
+                </span>
+                <span style={{ color: 'rgba(255,77,109,0.85)', fontWeight: 700 }}>
+                  {s.anomalyScore.toFixed(2)}
+                </span>
+                <span style={{ color: 'rgba(76,201,240,0.7)', minWidth: 22, textAlign: 'right' }}>
+                  {s.quadrant ?? '—'}
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      )}
     </div>
   )
 }

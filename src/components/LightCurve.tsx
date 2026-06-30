@@ -251,18 +251,40 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
   // excursions are bounded only by the absolute floor (0.5, defends
   // against truly broken negative-flux values from instrument errors).
   //
+  // **Single-point spike detector** (pass 3, both directions): the
+  // asymmetric MAD passes anything moving DOWN, but real transits are
+  // multi-sample events (Kepler 30-min cadence × few-hour transit = at
+  // least 4-8 consecutive samples). A single sample that differs
+  // sharply from BOTH neighbors while the neighbors themselves agree
+  // is an instrument artifact, not astrophysics. This catches downward
+  // single-sample spikes (hot pixel masking errors, calibration
+  // glitches) that survive the asymmetric MAD and produce visible
+  // V-shaped notches like the K00526.01 BKJD~763 case.
+  //
   // Cascade:
   //   1. Absolute hard bounds: `f > 1.05 || f < 0.5`. Defends against
   //      truly broken values that would otherwise inflate the MAD
   //      estimate below.
   //   2. Asymmetric MAD: `f > median + MAD_K * MAD` rejects upward
   //      spikes (cosmic rays). NO lower MAD bound.
+  //   3. Neighbor-based single-point spike: `|f[i] - f[i±1]| > SPIKE_K
+  //      * MAD` AND `|f[i-1] - f[i+1]| < NEIGHBOR_AGREE_K * MAD`,
+  //      symmetric (both upward AND downward). Time-gap aware — won't
+  //      compare across observation gaps > GAP_DAYS.
   //
   // K=5 catches single-point cosmic rays without touching real stellar
   // variations on the upper side (continuous variability rarely spikes
   // a single sample >5×MAD above the median).
   const cleanedFlux = useMemo(() => {
     const MAD_K = 5
+    // Spike detector thresholds. SPIKE_K=5 mirrors MAD_K so the same
+    // noise scale governs both passes. NEIGHBOR_AGREE_K=3 requires
+    // prev/next to be reasonably close (within 3×MAD of each other),
+    // which is true everywhere outside of real dip slopes — at the
+    // edge of a real dip prev and next would also differ by the dip
+    // depth (way more than 3×MAD for a meaningful dip).
+    const SPIKE_K = 5
+    const NEIGHBOR_AGREE_K = 3
     // Pass 1: absolute bounds. Skip null/non-finite entries.
     const survivors: number[] = []
     for (const f of flux) {
@@ -278,14 +300,77 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
     const mad = absDevs[Math.floor(absDevs.length / 2)]
     // Guard against pathological MAD=0 (constant flux). Fall back to a
     // tiny floor so the filter doesn't reject every sample.
-    const upperThreshold = median + MAD_K * Math.max(mad, 1e-5)
-    return flux.map(f => {
+    const madFloored = Math.max(mad, 1e-5)
+    const upperThreshold = median + MAD_K * madFloored
+
+    // Pass 2 result: absolute + asymmetric MAD.
+    const afterMad: (number | null)[] = flux.map(f => {
       if (f == null || !Number.isFinite(f)) return null
-      if (f > 1.05 || f < 0.5) return null // absolute bounds
-      if (f > upperThreshold) return null   // asymmetric MAD: reject upward spikes only
+      if (f > 1.05 || f < 0.5) return null
+      if (f > upperThreshold) return null
       return f
     })
-  }, [flux])
+
+    // Pass 3: single-point neighbor-based spike removal. Walk the
+    // array; for each interior surviving sample, compare it to its
+    // immediate previous and next surviving samples — but only when
+    // those neighbors are also within GAP_DAYS in time (don't bridge
+    // across observation gaps). If the candidate differs from BOTH
+    // neighbors by more than SPIKE_K*MAD AND the neighbors agree with
+    // each other within NEIGHBOR_AGREE_K*MAD, null the candidate.
+    const result: (number | null)[] = afterMad.slice()
+    const spikeThreshold = SPIKE_K * madFloored
+    const neighborAgreeThreshold = NEIGHBOR_AGREE_K * madFloored
+    let spikesRemoved = 0
+    for (let i = 1; i < result.length - 1; i++) {
+      const f = result[i]
+      const fp = result[i - 1]
+      const fn = result[i + 1]
+      if (f == null || fp == null || fn == null) continue
+      // Don't compare across observation gaps; those samples aren't
+      // really "neighbors" in the continuous-time sense.
+      if (times[i] - times[i - 1] > GAP_DAYS) continue
+      if (times[i + 1] - times[i] > GAP_DAYS) continue
+      const dPrev = Math.abs(f - fp)
+      const dNext = Math.abs(f - fn)
+      const dNeighbors = Math.abs(fp - fn)
+      if (
+        dPrev > spikeThreshold &&
+        dNext > spikeThreshold &&
+        dNeighbors < neighborAgreeThreshold
+      ) {
+        result[i] = null
+        spikesRemoved++
+      }
+    }
+
+    // Diagnostic logging — gated on a URL query param so it doesn't
+    // spam the console for every star. Use `?debugStar=K00526` (or any
+    // substring of the star id) to enable for one specific case.
+    if (typeof window !== 'undefined') {
+      const debugStar = new URLSearchParams(window.location.search).get('debugStar')
+      if (debugStar) {
+        console.log(
+          `[LightCurve MAD diagnostic · debugStar=${debugStar}]`,
+          {
+            samples: flux.length,
+            survivors: survivors.length,
+            median,
+            mad,
+            madFloored,
+            upperThresholdAsymmetric: upperThreshold,
+            spikeThreshold,
+            neighborAgreeThreshold,
+            droppedByAbsoluteBounds: flux.filter(f => f != null && Number.isFinite(f) && (f > 1.05 || f < 0.5)).length,
+            droppedByAsymmetricMAD: flux.filter(f => f != null && Number.isFinite(f) && f <= 1.05 && f >= 0.5 && f > upperThreshold).length,
+            droppedBySpikeDetector: spikesRemoved,
+          },
+        )
+      }
+    }
+
+    return result
+  }, [flux, times])
 
   // Percentile-based Y range using p2/p98. The previous version capped
   // the range to median ± 0.15 to defend against cosmic-ray survivors,
@@ -547,7 +632,28 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       }
       startNewSegment()
 
-      // Allocate the LTTB point budget proportionally to segment size.
+      // Allocate the LTTB point budget proportionally to segment size,
+      // then apply a per-pixel-column dedupe pass before emitting any
+      // strokes.
+      //
+      // The fill-artifact problem: at low zoom many post-LTTB points
+      // still map to the same integer pixel column. Each adjacent pair
+      // in the same column produces a vertical lineTo that visually
+      // bridges the gap between up/down strokes via antialiasing,
+      // accumulating into a solid block on high-frequency oscillators.
+      //
+      // Fix: walk the picked indices pairwise. When `floor(x[k]) ===
+      // floor(x[k+1])`, drop the one whose y is closer to the median
+      // line — keep the one whose flux deviates more. After this pass
+      // each pixel column contributes at most 2 points to the stroke
+      // (the entry point inherited from the previous column + at most
+      // one survivor inside this column), which eliminates the fill.
+      //
+      // We compare against `toY(median)` because `ys` are already in
+      // pixel space; |y - medianY| has the same ordering as |flux -
+      // median| since `toY` is monotonic — no need to thread the raw
+      // flux values back through here.
+      const medianY = toY(fluxRange.median)
       const totalPoints = segments.reduce((s, seg) => s + seg.xs.length, 0)
       if (totalPoints > 0) {
         for (const seg of segments) {
@@ -561,17 +667,43 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
           } else {
             segBudget = Math.max(2, Math.round((segLen / totalPoints) * LTTB_TARGET_POINTS))
           }
-          const picked = segBudget >= segLen
-            ? null // sentinel: draw all
-            : lttbIndices(seg.xs, seg.ys, segBudget)
-          ctx.moveTo(seg.xs[0], seg.ys[0])
-          if (picked === null) {
-            for (let k = 1; k < segLen; k++) ctx.lineTo(seg.xs[k], seg.ys[k])
+          // Normalize both code paths to an index list `picked` so the
+          // dedupe + emit loop has a single shape.
+          let picked: number[]
+          if (segBudget >= segLen) {
+            picked = new Array(segLen)
+            for (let k = 0; k < segLen; k++) picked[k] = k
           } else {
-            for (let k = 1; k < picked.length; k++) {
-              const idx = picked[k]
-              ctx.lineTo(seg.xs[idx], seg.ys[idx])
+            picked = lttbIndices(seg.xs, seg.ys, segBudget)
+          }
+
+          // Per-pixel-column dedupe. We keep the first picked point
+          // unconditionally (it's the segment's `moveTo` anchor), then
+          // walk pairs and skip a candidate when its predecessor in the
+          // accumulator shares the same column AND is further from
+          // medianY. If the candidate is further, replace the
+          // predecessor. Single pass, O(picked.length).
+          const out: number[] = [picked[0]]
+          for (let k = 1; k < picked.length; k++) {
+            const idx = picked[k]
+            const prevIdx = out[out.length - 1]
+            const colCur = Math.floor(seg.xs[idx])
+            const colPrev = Math.floor(seg.xs[prevIdx])
+            if (colCur !== colPrev) {
+              out.push(idx)
+              continue
             }
+            // Same column → keep the one further from medianY.
+            const devCur = Math.abs(seg.ys[idx] - medianY)
+            const devPrev = Math.abs(seg.ys[prevIdx] - medianY)
+            if (devCur > devPrev) out[out.length - 1] = idx
+            // else: keep prevIdx (drop current)
+          }
+
+          ctx.moveTo(seg.xs[out[0]], seg.ys[out[0]])
+          for (let k = 1; k < out.length; k++) {
+            const idx = out[k]
+            ctx.lineTo(seg.xs[idx], seg.ys[idx])
           }
         }
       }
@@ -582,49 +714,64 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       // Dip markers (only after curve has passed them). Skip dips outside
       // the visible time window so the chart doesn't draw off-screen labels.
       //
-      // Label collision: when many dips cluster within a short time span
-      // (e.g. periodic dips in KIC 11610797), their text labels overlap
-      // into an unreadable pile. We always draw the dot, but suppress the
-      // text label if another HIGHER-scoring dip already has a label
-      // within LABEL_COLLISION_CSS_PX of this dip's x position. Sort by
-      // descending score so winners get processed first.
+      // Label collision (vertical stacking):
+      // When many dips cluster within a short time span (e.g. periodic
+      // transits on KIC 11610797), their text labels overlap into an
+      // unreadable pile. Successive attempts:
+      //   1. Suppress all but the highest-scoring in a 60-px x-window
+      //      — hid too much; users couldn't tell which transit a label
+      //      belonged to.
+      //   2. Cascade y against immediately-previous label — still
+      //      produced overlapping walls on dip-dense stars (KIC
+      //      11610797) since later cascaded labels collided with
+      //      labels two-or-more positions back, not just the prior.
+      //   3. Bounding-box retry+suppress (4 attempts) — over-corrected
+      //      and dropped almost all labels at wide zoom-out because
+      //      every retry slot was also taken in dense regions.
       //
-      // The threshold is specified in CSS pixels (what the user sees),
-      // not canvas pixels — `toX` returns canvas pixels, which differ
-      // from CSS pixels by `canvas.width / rect.width` (varies with the
-      // 460-px inline chart vs the 1600-px fullscreen chart). Converting
-      // keeps perceived label spacing consistent across both contexts.
+      // **Current behavior — bucket selection.** Partition the canvas
+      // x-axis into fixed `LABEL_BUCKET_CSS_PX = 80` wide buckets.
+      // For each bucket, pick the single highest-scoring visible dip
+      // and render only that label. Dots still render for every
+      // visible dip (so all transits remain hover/click targets).
+      // Guarantees max one label per 80 CSS px of horizontal space →
+      // evenly-spaced, never-overlapping labels at any zoom level.
+      //
+      // The bucket size is in CSS px, converted to canvas px per
+      // render so spacing stays consistent across the 460-px inline
+      // chart and the 1600-px fullscreen chart.
       if (progress > 0.5) {
-        const LABEL_COLLISION_CSS_PX = 60
+        const LABEL_BUCKET_CSS_PX = 80
         const rect = canvas.getBoundingClientRect()
         const cssPxToCanvasPx = rect.width > 0 ? canvas.width / rect.width : 1
-        const collisionThresholdCanvas = LABEL_COLLISION_CSS_PX * cssPxToCanvasPx
-        const visible: { dip: Anomaly; x: number; y: number }[] = []
+        const bucketWidth = LABEL_BUCKET_CSS_PX * cssPxToCanvasPx
+
+        // Build the visible-dip render list and pick label winners by
+        // bucket in a single pass.
+        type DipRender = { dip: Anomaly; x: number; y: number }
+        const renderList: DipRender[] = []
+        // bucket index → winning dip's renderList index
+        const bucketWinner = new Map<number, number>()
         for (const dip of dips) {
           if (dip.peakTime < minT || dip.peakTime > maxT) continue
           const x = toX(dip.peakTime)
           const dipFluxIdx = times.findIndex(t => t >= dip.peakTime)
           const dipFlux = dipFluxIdx >= 0 ? flux[dipFluxIdx] : 0.98
           const y = toY(dipFlux)
-          visible.push({ dip, x, y })
-        }
-        // Sort copy by score desc so the highest-scoring dip in any cluster
-        // wins the label; we keep `visible` for the dot pass so original
-        // chronological order is irrelevant.
-        const ranked = [...visible].sort((a, b) => b.dip.score - a.dip.score)
-        const labeledXs: number[] = []
-        const dipsWithLabel = new Set<Anomaly>()
-        for (const { dip, x } of ranked) {
-          let blocked = false
-          for (const lx of labeledXs) {
-            if (Math.abs(lx - x) < collisionThresholdCanvas) { blocked = true; break }
-          }
-          if (!blocked) {
-            labeledXs.push(x)
-            dipsWithLabel.add(dip)
+          const idx = renderList.length
+          renderList.push({ dip, x, y })
+          const bucket = Math.floor(x / bucketWidth)
+          const existingIdx = bucketWinner.get(bucket)
+          if (existingIdx === undefined || dip.score > renderList[existingIdx].dip.score) {
+            bucketWinner.set(bucket, idx)
           }
         }
-        for (const { dip, x, y } of visible) {
+
+        // Single draw pass — dot for every visible dip; label only
+        // for the bucket winners.
+        const labelWinners = new Set(bucketWinner.values())
+        for (let i = 0; i < renderList.length; i++) {
+          const { dip, x, y } = renderList[i]
           const color = LABEL_COLOR[dip.label]
           ctx.beginPath()
           ctx.arc(x, y, 4, 0, Math.PI * 2)
@@ -633,12 +780,11 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
           ctx.shadowBlur = 8
           ctx.fill()
           ctx.shadowBlur = 0
-          if (dipsWithLabel.has(dip)) {
-            ctx.fillStyle = color
-            ctx.font = '8px JetBrains Mono, monospace'
-            ctx.textAlign = 'center'
-            ctx.fillText(dip.label, x, y - 10)
-          }
+          if (!labelWinners.has(i)) continue
+          ctx.fillStyle = color
+          ctx.font = '8px JetBrains Mono, monospace'
+          ctx.textAlign = 'center'
+          ctx.fillText(dip.label, x, y - 10)
         }
       }
     },

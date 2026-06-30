@@ -1,4 +1,15 @@
 import { create } from 'zustand'
+import { FLAGGED_KEY, VISITED_KEY, loadIdSet, saveIdSet } from './persistence'
+import type { CurveProfile } from './curveClassifier'
+
+/**
+ * @description Catalog of origin for a star. Used by the renderer to pick
+ * a per-mission visual treatment (Kepler anomalies → red pulse, TESS
+ * anomalies → cyan pulse). Optional because most catalog entries
+ * (Hipparcos, synthetic fillers) don't come from a survey mission;
+ * undefined means "no mission tag".
+ */
+export type StarSource = 'Kepler' | 'TESS' | 'Hipparcos'
 
 /**
  * @description A star as represented in the application's UI layer. Mirrors the catalog
@@ -14,6 +25,14 @@ export interface Star {
   colorIndex: number
   hasAnomaly: boolean
   anomalyScore: number
+  source?: StarSource
+  /**
+   * @description Kepler-field quadrant id (e.g. "C4") for anomaly stars
+   * inside RA 290–305 / Dec 36–52. Assigned at merge time by
+   * `quadrantFor` in `lib/quadrants.ts`. Undefined for stars outside
+   * the grid (most TOI stars, off-field seeds, all Hipparcos fillers).
+   */
+  quadrant?: string
 }
 
 /**
@@ -55,6 +74,13 @@ export interface LightcurveData {
   dips: Anomaly[]
   source: 'real' | 'unavailable' | 'synthetic'
   provenance: LightcurveProvenance
+  /**
+   * @description Descriptive measurements of the curve produced by
+   * `classifyCurve`. Strictly measured features — does not assert a
+   * physical cause. Null when the curve is unavailable (no data to
+   * classify).
+   */
+  profile?: CurveProfile | null
 }
 
 /**
@@ -85,6 +111,61 @@ interface AppState {
   lightcurveLoading: boolean
   loading: boolean
   flyTo: FlyToCommand | null
+  /**
+   * @description Number of unique KOI (Kepler Object of Interest) stars
+   * loaded from the NASA Exoplanet Archive. Drives the HUD anomaly
+   * counter so it shows the global scientific count, not the per-star
+   * dip count in `anomalies`. 0 while the KOI fetch is pending or if
+   * it failed.
+   */
+  koiCount: number
+  /**
+   * @description Non-null when the KOI catalog fetch failed. The HUD can
+   * surface this as a small "KOI catalog unavailable" tag so the user
+   * understands why the anomaly count is 0.
+   */
+  koiError: string | null
+  /**
+   * @description Number of unique TOI (TESS Object of Interest) stars
+   * loaded from the NASA Exoplanet Archive. Mirrors `koiCount` for the
+   * TESS mission. 0 while the TOI fetch is pending or if it failed.
+   */
+  toiCount: number
+  /**
+   * @description Non-null when the TOI catalog fetch failed. Surfaced
+   * in the HUD's TESS counter row the same way `koiError` is for KOI.
+   */
+  toiError: string | null
+  /**
+   * @description Subset of the merged catalog that has `hasAnomaly: true`,
+   * pre-sorted by `anomalyScore` descending. Populated by `page.tsx`
+   * after the KOI merge so HUD nav buttons ('GO TO NEAREST', 'NEXT
+   * ANOMALY') can scan all KOIs cheaply without re-deriving on every
+   * click. Empty array while KOI is still loading or if it failed.
+   */
+  anomalyStars: Star[]
+  /**
+   * @description Cursor into `anomalyStars` (already sorted by score
+   * desc). The 'NEXT ANOMALY' button advances this; wraps to 0 at the
+   * end. -1 = "haven't started cycling yet"; the first NEXT click
+   * jumps to index 0 (the highest-scoring anomaly).
+   */
+  nextAnomalyCursor: number
+  /**
+   * @description Set of star ids the user has opened a light curve
+   * for. Hydrated from localStorage `sae_visited` on mount and
+   * persisted on every toggle. Drives the dimmed-pulse rendering for
+   * already-seen anomalies in the 3D sky and the visited count in
+   * the HUD progress bar.
+   */
+  visitedIds: Set<string>
+  /**
+   * @description Set of star ids the user has explicitly bookmarked
+   * via the ★ button in the AnomalyPanel. Hydrated from localStorage
+   * `sae_flagged`. Drives the white ring around flagged markers in
+   * the 3D sky and the FLAGGED list panel in the HUD.
+   */
+  flaggedIds: Set<string>
   setSelectedStar: (star: Star | null) => void
   setHoveredStar: (star: Star | null) => void
   setAnomalies: (anomalies: Anomaly[]) => void
@@ -94,7 +175,30 @@ interface AppState {
   setLightcurve: (data: LightcurveData | null) => void
   setLightcurveLoading: (loading: boolean) => void
   setLoading: (loading: boolean) => void
+  setKoiCount: (n: number) => void
+  setKoiError: (err: string | null) => void
+  setToiCount: (n: number) => void
+  setToiError: (err: string | null) => void
+  setAnomalyStars: (stars: Star[]) => void
+  setNextAnomalyCursor: (i: number) => void
   requestFlyTo: (ra: number, dec: number) => void
+  /**
+   * @description Adds a star id to `visitedIds` (no-op if already
+   * present) and persists the updated set to localStorage.
+   */
+  markVisited: (starId: string) => void
+  /**
+   * @description Toggles a star id's membership in `flaggedIds` and
+   * persists the updated set to localStorage. Used by the bookmark
+   * button in the AnomalyPanel.
+   */
+  toggleFlagged: (starId: string) => void
+  /**
+   * @description One-shot hydration from localStorage on app mount.
+   * Called from a top-level useEffect; replaces the empty initial
+   * sets with whatever the user persisted in previous sessions.
+   */
+  hydratePersistedSets: () => void
 }
 
 let flyToCounter = 0
@@ -118,6 +222,19 @@ export const useStore = create<AppState>((set) => ({
   lightcurveLoading: false,
   loading: false,
   flyTo: null,
+  koiCount: 0,
+  koiError: null,
+  toiCount: 0,
+  toiError: null,
+  anomalyStars: [],
+  nextAnomalyCursor: -1,
+  // Sets start empty; the page calls hydratePersistedSets() once on
+  // mount to replace these with the user's localStorage state. We
+  // can't read localStorage at module-load time because Zustand's
+  // create() runs on the server during SSR; reading there would
+  // throw on `window`-less environments.
+  visitedIds: new Set<string>(),
+  flaggedIds: new Set<string>(),
   setSelectedStar: (star) => set({ selectedStar: star }),
   setHoveredStar: (star) => set({ hoveredStar: star }),
   setAnomalies: (anomalies) => set({ anomalies }),
@@ -127,5 +244,30 @@ export const useStore = create<AppState>((set) => ({
   setLightcurve: (data) => set({ lightcurve: data }),
   setLightcurveLoading: (loading) => set({ lightcurveLoading: loading }),
   setLoading: (loading) => set({ loading }),
+  setKoiCount: (n) => set({ koiCount: n }),
+  setKoiError: (err) => set({ koiError: err }),
+  setToiCount: (n) => set({ toiCount: n }),
+  setToiError: (err) => set({ toiError: err }),
+  setAnomalyStars: (stars) => set({ anomalyStars: stars, nextAnomalyCursor: -1 }),
+  setNextAnomalyCursor: (i) => set({ nextAnomalyCursor: i }),
   requestFlyTo: (ra, dec) => set({ flyTo: { ra, dec, id: ++flyToCounter } }),
+  markVisited: (starId) => set(state => {
+    if (state.visitedIds.has(starId)) return state
+    // New Set so React-subscribed components see a referential change
+    const next = new Set(state.visitedIds)
+    next.add(starId)
+    saveIdSet(VISITED_KEY, next)
+    return { visitedIds: next }
+  }),
+  toggleFlagged: (starId) => set(state => {
+    const next = new Set(state.flaggedIds)
+    if (next.has(starId)) next.delete(starId)
+    else next.add(starId)
+    saveIdSet(FLAGGED_KEY, next)
+    return { flaggedIds: next }
+  }),
+  hydratePersistedSets: () => set({
+    visitedIds: loadIdSet(VISITED_KEY),
+    flaggedIds: loadIdSet(FLAGGED_KEY),
+  }),
 }))

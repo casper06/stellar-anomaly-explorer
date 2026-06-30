@@ -2,7 +2,6 @@ import { NextResponse } from 'next/server'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { KNOWN_ANOMALIES } from '@/lib/starCatalog'
 import {
   generateSyntheticLightcurve,
   KEPLER_PROVENANCE,
@@ -102,24 +101,21 @@ async function writeDiskCache(
 }
 
 /**
- * @description Returns true if the given id is a known anomaly we'll try to
- * fetch real data for. Anything else short-circuits to the synthetic/
- * unavailable path without hitting MAST.
- * @param id Catalog id like "KIC8462852".
+ * @description Converts a Kepler ID (numeric or "KIC{N}"-prefixed string)
+ * into Kepler's archive naming convention `kplrNNNNNNNNN` — lowercase
+ * prefix, 9-digit zero-padded number. MAST's `target_name` column uses
+ * this form; querying the raw KIC integer or unpadded id returns zero
+ * rows. Used for ALL light-curve fetches now (KOI stars too, not just
+ * the 11 hardcoded seeds), so any star with a valid KIC id can return
+ * real Kepler PDC data from MAST.
+ * @param id Either a numeric `kepid` or a `KIC{digits}` string.
+ * @returns Kepler archive target name, or null if `id` can't be parsed.
  */
-function isKnownAnomaly(id: string): boolean {
-  return KNOWN_ANOMALIES.some(s => s.id === id)
-}
-
-/**
- * @description Converts a catalog id like "KIC8462852" into Kepler's
- * archive naming convention `kplr008462852` (lowercase prefix, 9-digit
- * zero-padded KIC number). MAST's `target_name` column uses this form;
- * a query for the raw "KIC8462852" returns zero rows.
- * @param id Catalog id (must start with "KIC").
- * @returns Kepler archive target name, or null if `id` isn't a KIC.
- */
-function kicIdToKeplerTargetName(id: string): string | null {
+function kepidToTargetName(id: string | number): string | null {
+  if (typeof id === 'number') {
+    if (!Number.isFinite(id) || id <= 0) return null
+    return `kplr${String(Math.floor(id)).padStart(9, '0')}`
+  }
   const match = id.match(/^KIC(\d+)$/)
   if (!match) return null
   return `kplr${match[1].padStart(9, '0')}`
@@ -376,7 +372,13 @@ export async function GET(
     })
   }
 
-  const targetName = isKnownAnomaly(id) ? kicIdToKeplerTargetName(id) : null
+  // Try MAST for any KIC id, not just the 11 hardcoded seeds — the KOI
+  // catalog adds thousands of real Kepler targets and they all have
+  // archived PDC light curves. The MAST cone search will either
+  // return data or 0 rows; either way the fallback path below catches
+  // it. The previous `isKnownAnomaly` gate predated the KOI catalog
+  // and is now obsolete.
+  const targetName = kepidToTargetName(id)
   if (targetName) {
     console.error(`${tag} ${id} → Kepler target_name='${targetName}'; querying MAST TAP`)
     const real = await tryFetchRealLightcurve(targetName)
@@ -394,7 +396,7 @@ export async function GET(
     }
     console.error(`${tag} MAST fetch returned null for ${id}`)
   } else {
-    console.error(`${tag} ${id} is not a known KIC anomaly; skipping MAST`)
+    console.error(`${tag} ${id} is not a parseable KIC id; skipping MAST`)
   }
 
   if (process.env.NODE_ENV === 'development') {
