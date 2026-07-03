@@ -8,6 +8,7 @@ import { CatalogStar } from '@/lib/starCatalog'
 import { useStore } from '@/lib/store'
 import { selectStarAndFetchCurve } from '@/lib/selectStar'
 import type { CurvePattern } from '@/lib/curveClassifier'
+import { RADAR_COLOR_HEX } from '@/lib/radarPalette'
 
 const STAR_SPHERE_RADIUS = 500
 // Camera orbits the origin at a fixed radius — "zoom" is done via FOV, not by
@@ -861,23 +862,6 @@ function FlaggedRingMarkers({
 }
 
 /**
- * @description Color palette for the sky-radar overlay, keyed by
- * `CurvePattern`. IRREGULAR pops in bright magenta so it reads as
- * "interesting — worth a closer look"; PERIODIC_UNIFORM is a dim,
- * calm green so classified planetary-signal-looking stars fade into
- * the background. HIGH_VARIABILITY gets a dim yellow to flag "noisy,
- * take results with a grain of salt". SPARSE and UNCERTAIN
- * intentionally have no radar entry — the classifier is admitting
- * it can't tell, so we let those stars keep their default
- * mission-color anomaly marker with no radar tint.
- */
-const RADAR_COLOR_HEX: Partial<Record<CurvePattern, string>> = {
-  IRREGULAR: '#ff2ea6',        // bright magenta — pops as "interesting"
-  PERIODIC_UNIFORM: '#4ade80', // dim green — "boring, known"
-  HIGH_VARIABILITY: '#facc15', // dim yellow — "noisy backdrop"
-}
-
-/**
  * @description Extra overlay layer for the sky radar. Renders one dot
  * per classified star at the pattern color from `RADAR_COLOR_HEX`.
  * Drawn ABOVE the mission-themed `AnomalyMarkers` so the mission
@@ -1664,9 +1648,11 @@ function formatArcmin(arcmin: number): string {
 /**
  * @description Popover shown when a click hits multiple stars within
  * `CLICK_DISAMBIG_RADIUS_PX` in the 3D sky. Lists each candidate
- * with its name and its ΔRA/ΔDec angular offset from the clicked
- * sky position (arcminutes, ΔRA cos δ-corrected); clicking an entry
- * selects that star, clicking the backdrop dismisses. Rows stay
+ * with a sky-radar pattern swatch (the star's radar tint from
+ * `classifiedPatterns`; transparent for SPARSE / UNCERTAIN /
+ * unclassified), its name, and its ΔRA/ΔDec angular offset from the
+ * clicked sky position (arcminutes, ΔRA cos δ-corrected); clicking
+ * an entry selects that star, clicking the backdrop dismisses. Rows stay
  * sorted by projected screen distance (nearest first) — the offsets
  * replaced the old mag/px columns only as the DISPLAYED values,
  * because in dense KOI stacks those rendered identically for every
@@ -1699,6 +1685,11 @@ function ClickDisambiguationPopover({
   onPick: (star: CatalogStar) => void
   onDismiss: () => void
 }) {
+  // Sky-radar pattern lookup for the per-row swatch — same data the
+  // radar overlay tints markers with (loaded from pattern-cache.json
+  // on mount, lazily filled by organic clicks). Hook must run before
+  // the early return below.
+  const classifiedPatterns = useStore(s => s.classifiedPatterns)
   // NOTE on event isolation: the container in the outer component
   // registers NATIVE `pointerdown`/`pointerup` listeners on its
   // root div via `addEventListener`. Those don't participate in
@@ -1776,7 +1767,14 @@ function ClickDisambiguationPopover({
         >
           ΔRA · ΔDEC FROM CLICK (ARCMIN)
         </div>
-        {candidates.map(c => (
+        {candidates.map(c => {
+          // Swatch = the star's radar tint. Only IRREGULAR /
+          // HIGH_VARIABILITY / PERIODIC_UNIFORM have colors; SPARSE,
+          // UNCERTAIN, and unclassified stars render a transparent
+          // placeholder so row text stays aligned.
+          const pattern = classifiedPatterns.get(c.star.id)
+          const tint = pattern ? RADAR_COLOR_HEX[pattern] : undefined
+          return (
           <button
             key={c.star.id}
             onClick={() => onPick(c.star)}
@@ -1802,6 +1800,18 @@ function ClickDisambiguationPopover({
             onMouseLeave={e => { e.currentTarget.style.background = 'none' }}
           >
             <span
+              title={pattern}
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: '50%',
+                flexShrink: 0,
+                background: tint ?? 'transparent',
+                boxShadow: tint ? `0 0 4px ${tint}` : 'none',
+                alignSelf: 'center',
+              }}
+            />
+            <span
               style={{
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
@@ -1819,7 +1829,8 @@ function ClickDisambiguationPopover({
               {formatArcmin(c.dDecArcmin)}
             </span>
           </button>
-        ))}
+          )
+        })}
       </div>
       <style jsx>{`
         @keyframes sf-disambig-fade {
