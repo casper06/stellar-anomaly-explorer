@@ -122,6 +122,24 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 
 ### Next features 🚀
 - More Kepler/K2/TESS anomaly seeds beyond the current 11
+- **Celestial orientation / "where am I looking"**: users navigating
+  the 3D explorer have no reference for what part of the real sky a
+  given region corresponds to. Proposed: when navigating to a region,
+  show which constellation it falls in (e.g. "this is in Cygnus"), a
+  context mini-map showing that region relative to the whole sky, and
+  hemisphere visibility info (visible from the northern hemisphere at
+  X, southern at Y, or not visible at all from one of them). Likely
+  requires cross-referencing existing RA/Dec data against an IAU
+  constellation-boundaries catalog, plus visibility-by-latitude
+  logic. Future idea — not being implemented now.
+- **In-app interactive tutorial**: a button (HUD, near the search
+  bar) that launches a slide-based or similarly didactic walkthrough
+  of how to use the app itself — navigation, what the markers mean,
+  how to read the lightcurve viewer, what the REAL DATA vs
+  DEV/SYNTHETIC badges mean, and how citizen-science reporting works.
+  This is product onboarding (deeper than the current first-run
+  overlay), separate from the astronomy-content feature above. Future
+  idea — not being implemented now.
 
 ## Real-data integration
 
