@@ -274,12 +274,21 @@ const CLICK_DISAMBIG_RADIUS_PX = 6
  * @description One candidate returned by the picker when a click hits
  * multiple stars within `CLICK_DISAMBIG_RADIUS_PX`. `screenDistPx`
  * is the star's projected distance from the click point in CSS
- * pixels — the popover uses it to sort candidates by proximity and
- * to show the distance to the user.
+ * pixels — kept as the sort key (nearest first) but NOT displayed:
+ * in dense KOI stacks every candidate reads 0.0px (and the KOI
+ * default magnitude 13.5), which carries zero signal. The popover
+ * instead shows `dRaArcmin` / `dDecArcmin` — the star's angular
+ * offset from the clicked sky position in arcminutes (ΔRA is the
+ * on-sky offset, already scaled by cos δ) — which varies row to
+ * row even inside a dense stack.
  */
 export interface ClickCandidate {
   star: CatalogStar
   screenDistPx: number
+  /** On-sky RA offset from the click point, arcmin: (α★ − α_click) · cos δ. */
+  dRaArcmin: number
+  /** Dec offset from the click point, arcmin: δ★ − δ_click. */
+  dDecArcmin: number
 }
 
 /**
@@ -289,10 +298,13 @@ export interface ClickCandidate {
  * function from its native `pointerup` listener to do raycasting.
  *
  * Multi-hit disambiguation: `raycaster.intersectObject` returns every
- * star along the ray path. We reproject each hit back to screen
- * space and keep only stars within `CLICK_DISAMBIG_RADIUS_PX` of the
- * click point — that's the direct interpretation of "the user
- * clicked on this spot". Behavior:
+ * star along the ray path (within the world-space Points threshold).
+ * We project each hit star's OWN world position — taken from the
+ * geometry position buffer, never `intersection.point`, which for
+ * Points is the closest point on the ray and projects back onto the
+ * click pixel for every hit — to screen space, and keep only stars
+ * within `CLICK_DISAMBIG_RADIUS_PX` of the click point. That's the
+ * direct interpretation of "the user clicked on this spot". Behavior:
  * - **1 candidate**: select immediately (identical to the pre-
  *   disambiguation behavior; the popover would just be noise).
  * - **2+ candidates**: publish them via `onDisambiguate` so the
@@ -341,13 +353,29 @@ function ClickRaycastBridge({
       const hits = raycaster.intersectObject(mesh)
       if (hits.length === 0) return
 
-      // Reproject each hit to screen space and keep only those within
-      // CLICK_DISAMBIG_RADIUS_PX of the click. Dedupe by index so a
-      // single star that somehow shows up twice (shouldn't happen for
-      // a single Points mesh but cheap insurance) doesn't fill the
-      // popover with duplicates.
+      // Project each hit STAR to screen space and keep only those
+      // within CLICK_DISAMBIG_RADIUS_PX of the click. Crucially this
+      // uses the star's own world position from the geometry buffer,
+      // NOT `h.point`: THREE.Points raycasting sets intersection.point
+      // to the closest point ON THE RAY (Ray.closestPointToPoint), so
+      // projecting h.point lands back on the click pixel for EVERY hit
+      // and the screen filter passes everything inside the world-space
+      // threshold (~0.5° of sky) — that bug produced 20–30-candidate
+      // popovers of stars that were visibly nowhere near the cursor.
+      // Dedupe by index so a single star that somehow shows up twice
+      // (shouldn't happen for a single Points mesh but cheap insurance)
+      // doesn't fill the popover with duplicates.
       const clickScreenX = clientX - rect.left
       const clickScreenY = clientY - rect.top
+      const posAttr = mesh.geometry.getAttribute('position')
+      // Sky position under the cursor: the (normalized) pick-ray
+      // direction converted back to RA/Dec. Basis for the per-row
+      // ΔRA/ΔDec readout in the disambiguation popover.
+      const clickSky = xyzToRaDec(
+        raycaster.ray.direction.x,
+        raycaster.ray.direction.y,
+        raycaster.ray.direction.z,
+      )
       const projected = new THREE.Vector3()
       const dedupe = new Set<number>()
       const candidates: ClickCandidate[] = []
@@ -357,7 +385,10 @@ function ClickRaycastBridge({
         dedupe.add(idx)
         const star = stars[idx]
         if (!star) continue
-        projected.copy(h.point).project(camera)
+        projected
+          .fromBufferAttribute(posAttr, idx)
+          .applyMatrix4(mesh.matrixWorld)
+          .project(camera)
         // NDC → CSS pixels within the canvas element.
         const sx = (projected.x * 0.5 + 0.5) * rect.width
         const sy = (1 - (projected.y * 0.5 + 0.5)) * rect.height
@@ -365,7 +396,13 @@ function ClickRaycastBridge({
         const dy = sy - clickScreenY
         const screenDistPx = Math.sqrt(dx * dx + dy * dy)
         if (screenDistPx <= CLICK_DISAMBIG_RADIUS_PX) {
-          candidates.push({ star, screenDistPx })
+          // Wrap the RA difference to (-180°, 180°] so a click near
+          // the RA 0/360 seam doesn't report a ~21600′ offset, then
+          // scale by cos δ for the true on-sky angular offset.
+          const dRaDeg = ((star.ra - clickSky.ra + 540) % 360) - 180
+          const dRaArcmin = dRaDeg * 60 * Math.cos((star.dec * Math.PI) / 180)
+          const dDecArcmin = (star.dec - clickSky.dec) * 60
+          candidates.push({ star, screenDistPx, dRaArcmin, dDecArcmin })
         }
       }
 
@@ -1609,10 +1646,32 @@ export default function StarField({ stars }: StarFieldProps) {
 }
 
 /**
+ * @description Formats an angular offset in arcminutes for the
+ * disambiguation popover: explicit sign (so direction from the click
+ * is readable), one decimal at arcminute scale, two decimals below
+ * 0.1′ so ultra-tight stacks still show distinct values, and a prime
+ * suffix. Examples: `+2.1′`, `−0.05′`.
+ * @param arcmin Signed angular offset in arcminutes.
+ * @returns Compact signed string with a ′ suffix.
+ */
+function formatArcmin(arcmin: number): string {
+  const abs = Math.abs(arcmin)
+  const digits = abs < 0.1 ? 2 : 1
+  const sign = arcmin < 0 ? '−' : '+'
+  return `${sign}${abs.toFixed(digits)}′`
+}
+
+/**
  * @description Popover shown when a click hits multiple stars within
  * `CLICK_DISAMBIG_RADIUS_PX` in the 3D sky. Lists each candidate
- * with id, magnitude, and screen distance from the click; clicking
- * an entry selects that star, clicking the backdrop dismisses.
+ * with its name and its ΔRA/ΔDec angular offset from the clicked
+ * sky position (arcminutes, ΔRA cos δ-corrected); clicking an entry
+ * selects that star, clicking the backdrop dismisses. Rows stay
+ * sorted by projected screen distance (nearest first) — the offsets
+ * replaced the old mag/px columns only as the DISPLAYED values,
+ * because in dense KOI stacks those rendered identically for every
+ * row (mag 13.5 · 0.0px) and gave the user nothing to tell
+ * candidates apart by.
  *
  * A full-viewport transparent backdrop sits behind the card and
  * intercepts clicks so a stray click on the sky doesn't re-trigger
@@ -1702,10 +1761,20 @@ function ClickDisambiguationPopover({
             fontSize: 8,
             color: 'rgba(255,255,255,0.4)',
             letterSpacing: 2,
-            padding: '2px 6px 6px',
+            padding: '2px 6px 0',
           }}
         >
           {candidates.length} STARS AT THIS POINT
+        </div>
+        <div
+          style={{
+            fontSize: 7,
+            color: 'rgba(255,255,255,0.25)',
+            letterSpacing: 1,
+            padding: '2px 6px 6px',
+          }}
+        >
+          ΔRA · ΔDEC FROM CLICK (ARCMIN)
         </div>
         {candidates.map(c => (
           <button
@@ -1743,11 +1812,11 @@ function ClickDisambiguationPopover({
             >
               {c.star.name}
             </span>
-            <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 9 }}>
-              mag {c.star.magnitude.toFixed(1)}
+            <span style={{ color: 'rgba(76,201,240,0.75)', fontSize: 9, minWidth: 42, textAlign: 'right' }}>
+              {formatArcmin(c.dRaArcmin)}
             </span>
-            <span style={{ color: 'rgba(76,201,240,0.75)', fontSize: 9, minWidth: 30, textAlign: 'right' }}>
-              {c.screenDistPx.toFixed(1)}px
+            <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 9, minWidth: 42, textAlign: 'right' }}>
+              {formatArcmin(c.dDecArcmin)}
             </span>
           </button>
         ))}

@@ -113,7 +113,7 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 - First-run onboarding overlay (persists dismissal in localStorage)
 - FOV-based zoom (wheel changes camera FOV, telescope-style) with damping
 - Drag to rotate the view (OrbitControls, keyboard disabled)
-- Click-to-select via native raycasting; opens AnomalyPanel. Dense-field disambiguation: when a click hits 2+ stars within a 6-CSS-pixel screen radius, a popover appears at the click site listing each candidate (name, mag, screen distance) so the user can pick the intended one. Clicking off-card dismisses without selecting.
+- Click-to-select via native raycasting; opens AnomalyPanel. Dense-field disambiguation: when a click hits 2+ stars within a 6-CSS-pixel screen radius, a popover appears at the click site listing each candidate (name, ΔRA/ΔDec from the clicked sky position in arcminutes) so the user can pick the intended one. Clicking off-card dismisses without selecting.
 - Star visualization SVG (radial gradient by B-V + corona + anomaly ring)
 - Glossary tooltips (?) for MAG/RA/DEC/COLOR/DIP/SCORE/DEPTH/DURATION/BKJD
 
@@ -1207,9 +1207,21 @@ other stars were there. Fix:
 
 1. `raycaster.intersectObject(mesh)` returns EVERY hit along the
    ray (already does; we just weren't using them all).
-2. For each hit, reproject `intersection.point` back to screen space
-   via `camera.project` + NDC-to-CSS-pixels, and compute the
-   Euclidean distance from the click point in CSS pixels.
+2. For each hit, project the STAR'S OWN world position (read from
+   the geometry position buffer at `hit.index`) to screen space via
+   `camera.project` + NDC-to-CSS-pixels, and compute the Euclidean
+   distance from the click point in CSS pixels.
+   **Pitfall (was a live bug)**: do NOT project `intersection.point`
+   — for `THREE.Points`, raycasting sets it to the closest point ON
+   THE RAY (`Ray.closestPointToPoint`), not the star's position, so
+   it projects back onto the click pixel for every hit. With that,
+   the 6px screen filter passed EVERYTHING inside the world-space
+   Points threshold (~0.5° of sky at the star-sphere radius) and
+   dense-field popovers listed 20–30 "candidates" up to ~27′ from
+   the cursor, all reading 0.0px. Measured on a fixed 16-click grid
+   over the Kepler field at FOV ≈ 24°: before = 10/16 popovers,
+   5–30 candidates (mean 15.6); after = 5/16 popovers, 2–4
+   candidates, the rest direct-select.
 3. Keep only hits within `CLICK_DISAMBIG_RADIUS_PX = 6`. That's the
    direct "clicked on this spot" filter — wider world-space
    raycaster thresholds catch stars that are far off in perspective
@@ -1221,9 +1233,16 @@ other stars were there. Fix:
 5. **1 candidate**: select immediately, no UI change.
 6. **2+ candidates**: open `<ClickDisambiguationPopover>` at the
    click coordinates. Popover lists each candidate sorted by
-   ascending screen distance (name · mag · distance px). Click a
-   row → select + close. Click the backdrop → close without
-   selecting.
+   ascending screen distance, showing name · ΔRA · ΔDec, where the
+   deltas are the star's angular offset from the clicked sky
+   position in arcminutes (ΔRA cos δ-corrected, RA-seam-wrapped;
+   sub-0.1′ values get two decimals). The previous mag · px columns
+   rendered identically for every row in dense KOI stacks (mag 13.5
+   · 0.0px — the KOI default magnitude and a sub-pixel projected
+   distance) and gave zero signal to tell candidates apart;
+   `screenDistPx` is still computed as the sort key, just not
+   displayed. Click a row → select + close. Click the backdrop →
+   close without selecting.
 
 The popover's backdrop is a full-viewport transparent
 `position: fixed` layer that captures React `onClick` to dismiss.
