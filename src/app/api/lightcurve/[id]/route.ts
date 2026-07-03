@@ -35,6 +35,42 @@ const cache = new Map<string, { times: number[]; flux: number[] }>()
  */
 const DISK_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
+/**
+ * @description Schema/provenance version of disk-cache entries. BUMP THIS
+ * whenever the fetch pipeline changes in a way that can alter the cached
+ * arrays: segment-file filtering rules, per-segment normalization,
+ * stitching/sorting, FITS parsing, or the TAP query itself. Entries
+ * written under a different version are treated as cache MISSES and
+ * refetched, never served.
+ *
+ * Why: during the 2026-06/07 dev period the route was edited while
+ * 7-day-TTL entries written by older iterations kept being served —
+ * K02357.02's dip measured 1.08% deep from a stale-provenance entry vs
+ * 1.00% from a fresh fetch of the same star (same reader code, different
+ * write-time code). Quarter availability was quantitatively ruled out
+ * (leave-one-quarter-out moves depth ≤0.0001 pp); mixed-provenance cache
+ * data was the remaining cause. Versioning eliminates the class.
+ */
+const CACHE_SCHEMA_VERSION = 1
+
+/**
+ * @description Shape of a disk-cache entry. Metadata fields sit
+ * before the big arrays so `head`-ing the JSON file answers "when was
+ * this fetched, by which schema, from which segment files" without
+ * parsing megabytes — drift investigations become a file read.
+ */
+interface DiskCacheEntry {
+  schemaVersion: number
+  /** ISO timestamp of the MAST fetch that produced this entry. */
+  fetchedAt: string
+  /** Number of samples in `times`/`flux`. */
+  sampleCount: number
+  /** Archive filenames of the segments that parsed successfully. */
+  segmentFiles: string[]
+  times: number[]
+  flux: number[]
+}
+
 /** @description Directory under OS temp where parsed light curves are cached. */
 const DISK_CACHE_DIR = path.join(os.tmpdir(), 'stellar-cache')
 
@@ -68,13 +104,26 @@ async function readDiskCache(
       return null
     }
     const raw = await fs.readFile(file, 'utf8')
-    const parsed = JSON.parse(raw) as { times: number[]; flux: number[] }
+    const parsed = JSON.parse(raw) as Partial<DiskCacheEntry>
     if (!Array.isArray(parsed.times) || !Array.isArray(parsed.flux) || parsed.times.length < 10) {
       console.error(`${tag} disk cache for ${id} parsed but malformed; ignoring`)
       return null
     }
-    console.error(`${tag} disk cache HIT for ${id} (${parsed.times.length} samples, age ${Math.round(ageMs / 3600000)}h)`)
-    return parsed
+    // Provenance guard: an entry written under a different (or missing —
+    // pre-v1) schema version may have been produced by a different fetch/
+    // normalization pipeline. Serving it would mix data provenances across
+    // code changes, so treat it as a miss and refetch.
+    if (parsed.schemaVersion !== CACHE_SCHEMA_VERSION) {
+      console.error(
+        `${tag} disk cache for ${id} has schema v${parsed.schemaVersion ?? '<none>'} ≠ current v${CACHE_SCHEMA_VERSION}; ignoring (will refetch)`,
+      )
+      return null
+    }
+    console.error(
+      `${tag} disk cache HIT for ${id} (schema v${parsed.schemaVersion}, ${parsed.times.length} samples, ` +
+        `fetchedAt ${parsed.fetchedAt ?? 'unknown'}, age ${Math.round(ageMs / 3600000)}h)`,
+    )
+    return { times: parsed.times, flux: parsed.flux }
   } catch (e) {
     // ENOENT is the common case — file doesn't exist yet. Don't spam logs.
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -85,25 +134,40 @@ async function readDiskCache(
 }
 
 /**
- * @description Writes a successful MAST fetch to the disk cache. Uses
- * write-to-temp + rename so a crash mid-write can't leave a corrupted
- * file that would then be returned on next read.
+ * @description Writes a successful MAST fetch to the disk cache as a
+ * `DiskCacheEntry` stamped with the current `CACHE_SCHEMA_VERSION` —
+ * schema version + fetch timestamp + segment file list + sample count
+ * ahead of the arrays. Uses write-to-temp + rename so a
+ * crash mid-write can't leave a corrupted file that would then be
+ * returned on next read.
  * @param id Catalog id.
- * @param data Parsed light curve (times + flux).
+ * @param data Parsed light curve (times + flux) plus the archive
+ * filenames of the segments that produced it.
  * @param tag Log prefix.
  */
 async function writeDiskCache(
   id: string,
-  data: { times: number[]; flux: number[] },
+  data: { times: number[]; flux: number[]; segmentFiles?: string[] },
   tag: string,
 ): Promise<void> {
   const file = diskCachePath(id)
   const tmp = `${file}.${process.pid}.tmp`
+  const entry: DiskCacheEntry = {
+    schemaVersion: CACHE_SCHEMA_VERSION,
+    fetchedAt: new Date().toISOString(),
+    sampleCount: data.times.length,
+    segmentFiles: data.segmentFiles ?? [],
+    times: data.times,
+    flux: data.flux,
+  }
   try {
     await fs.mkdir(DISK_CACHE_DIR, { recursive: true })
-    await fs.writeFile(tmp, JSON.stringify(data), 'utf8')
+    await fs.writeFile(tmp, JSON.stringify(entry), 'utf8')
     await fs.rename(tmp, file)
-    console.error(`${tag} disk cache WROTE ${id} (${data.times.length} samples) → ${file}`)
+    console.error(
+      `${tag} disk cache WROTE ${id} (schema v${entry.schemaVersion}, ${entry.sampleCount} samples, ` +
+        `${entry.segmentFiles.length} segment files) → ${file}`,
+    )
   } catch (e) {
     console.error(`${tag} disk cache write error for ${id}:`, e)
     // Best-effort cleanup of the temp file
@@ -338,12 +402,14 @@ function isPdcLightcurveUrl(url: string, mission: 'Kepler' | 'TESS'): boolean {
  * alone is just commissioning data with no anomalies.
  * @param mission The mission whose collection to query.
  * @param targetName Archive target name (mission-specific format).
- * @returns Concatenated multi-segment light curve, or null on failure.
+ * @returns Concatenated multi-segment light curve plus the archive
+ * filenames of the segments that parsed successfully (cache provenance
+ * metadata), or null on failure.
  */
 async function tryFetchRealLightcurve(
   mission: 'Kepler' | 'TESS',
   targetName: string,
-): Promise<{ times: number[]; flux: number[] } | null> {
+): Promise<{ times: number[]; flux: number[]; segmentFiles: string[] } | null> {
   const tag = '[lightcurve]'
   try {
     const tapUrl = mastTapQueryUrl(mission, targetName)
@@ -394,12 +460,17 @@ async function tryFetchRealLightcurve(
     )
     if (lcUrls.length === 0) return null
 
-    // Download + parse all segments in parallel
+    // Download + parse all segments in parallel. Keep each segment paired
+    // with its archive filename — the successful list is written into the
+    // disk-cache entry as provenance metadata.
     const segments = await Promise.all(lcUrls.map(fetchAndParseSegment))
-    const ok = segments.filter((q): q is { times: number[]; flux: number[] } => q !== null)
-    if (ok.length < segments.length) {
-      const failed: string[] = []
-      segments.forEach((q, i) => { if (q === null) failed.push(lcFilenames[i]) })
+    const ok: Array<{ times: number[]; flux: number[]; file: string }> = []
+    const failed: string[] = []
+    segments.forEach((q, i) => {
+      if (q === null) failed.push(lcFilenames[i])
+      else ok.push({ ...q, file: lcFilenames[i] })
+    })
+    if (failed.length > 0) {
       console.error(
         `${tag} ${ok.length}/${segments.length} segments parsed successfully; failed: ${failed.join(', ')}`,
       )
@@ -413,9 +484,11 @@ async function tryFetchRealLightcurve(
     ok.sort((a, b) => a.times[0] - b.times[0])
     const times: number[] = []
     const flux: number[] = []
+    const segmentFiles: string[] = []
     for (const q of ok) {
       times.push(...q.times)
       flux.push(...q.flux)
+      segmentFiles.push(q.file)
     }
     // BKJD for Kepler, TJD for TESS — both are just labels for the raw
     // time offset reported by the FITS TIME column.
@@ -424,7 +497,7 @@ async function tryFetchRealLightcurve(
       `${tag} ${mission} success: ${ok.length} segments concatenated → ${times.length} samples, ` +
         `time range ${tUnit} ${times[0].toFixed(1)} → ${times[times.length - 1].toFixed(1)}`,
     )
-    return { times, flux }
+    return { times, flux, segmentFiles }
   } catch (e) {
     console.error(`${tag} caught error in tryFetchRealLightcurve:`, e)
     return null

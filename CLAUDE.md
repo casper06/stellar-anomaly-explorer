@@ -315,6 +315,25 @@ caching is safe):
   key means a Kepler hit and a TESS hit at the same star can cache
   independently — rare but the right semantics.
 
+**L2 entries are schema-versioned** (`CACHE_SCHEMA_VERSION` in the
+route; currently 1). Each entry stores `schemaVersion`, `fetchedAt`
+(ISO timestamp), `sampleCount`, and `segmentFiles` (the archive
+filenames that parsed successfully) BEFORE the times/flux arrays, so
+`head`-ing the JSON answers "when / which schema / which segments"
+without parsing megabytes. On read, an entry whose `schemaVersion`
+doesn't match the current constant (including pre-versioning entries
+with none) is logged and treated as a MISS — refetched, never
+served. **Bump the constant whenever the fetch pipeline changes in a
+way that can alter the arrays** (segment filtering, per-segment
+normalization, stitching, FITS parsing, TAP query). Why this exists:
+during the 2026-06/07 dev period, 7-day-TTL entries written by older
+route iterations kept being served after the code changed —
+K02357.02's dip measured 1.08% deep from a stale-provenance entry vs
+1.00% from a fresh fetch (leave-one-quarter-out testing ruled out
+MAST segment availability: it moves depth ≤0.0001 pp). Versioning
+eliminates mixed-provenance data as a class. L1 needs no version —
+it dies with the process that wrote it.
+
 **Per-segment diagnostic logging**: when a segment fails to download
 or parse, the log line names it by filename plus the failure reason.
 Aggregate success log also lists the *failed* filenames when any
@@ -1004,9 +1023,14 @@ a conclusion.
 3. `SPARSE` if dip count < `MIN_DIPS_FOR_PATTERN = 3`.
 4. `IRREGULAR` otherwise.
 
-`bestFitPeriodDays` is only surfaced when `periodicity ≥ 0.5` —
-reporting a period under that threshold would be more misleading
-than useful.
+`bestFitPeriodDays` is only surfaced when the pattern label is
+`PERIODIC_UNIFORM` — outside that branch the candidate period is
+meaningless and displaying it contradicts the label. (The earlier
+gate was `periodicity ≥ 0.5` + not-UNCERTAIN, which leaked the
+contradiction on Tabby's Star: periodicity 0.601 with
+depthConsistency 0 → IRREGULAR, yet a bogus 0.307 d period rendered
+next to the IRREGULAR badge. Fixed 2026-07-03; pinned by the
+KIC8462852 fixture in the data regression test.)
 
 **Flow:** `selectStar` in `StarField.tsx` calls `classifyCurve`
 after `detectDips`, stuffs the result into `lightcurve.profile`,
@@ -1046,14 +1070,15 @@ baseline; hand-verified via transit-count agreement), K01725.01
 implausible-period guard; its real 0.15% transits are below the 1%
 dip threshold).
 
-Two KNOWN classifier quirks are deliberately frozen by the
-expectations (changing them should trip the test so it's a
-conscious decision): (1) Tabby's IRREGULAR profile still surfaces a
-meaningless 0.307 d best-fit period because the implausible-period
-guard only runs on the would-be-PERIODIC branch; (2) K00931.01, a
-textbook periodic transiter, computes periodicity ≈ 0.4996 — a hair
-under the 0.5 cutoff — and therefore labels IRREGULAR with no
-period.
+One KNOWN classifier quirk is deliberately frozen by the
+expectations (changing it should trip the test so it's a conscious
+decision): K00931.01, a textbook periodic transiter, computes
+periodicity ≈ 0.4996 — a hair under the 0.5 cutoff — and
+therefore labels IRREGULAR with no period. (A second quirk —
+Tabby's IRREGULAR profile surfacing a meaningless 0.307 d best-fit
+period — was FIXED on 2026-07-03: the classifier now returns a
+period only for PERIODIC_UNIFORM, and the KIC8462852 fixture
+asserts `bestFitPeriodDays: null` so it can't regress.)
 
 ### Interactive LightCurve mode
 `<LightCurve interactive />` (used in the fullscreen overlay) adds:

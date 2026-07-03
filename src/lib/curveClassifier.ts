@@ -211,13 +211,15 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
     coverageDays,
   })
 
-  // Suppress the "best-fit period" whenever the pattern was downgraded
-  // to UNCERTAIN — reporting a physically implausible period alongside
-  // the doubt flag would defeat the point of the flag.
-  const reportedPeriod =
-    pattern === 'UNCERTAIN' || periodicity < PERIODIC_THRESHOLD
-      ? null
-      : bestFitPeriodDays
+  // Surface the "best-fit period" ONLY when the pattern label is
+  // PERIODIC_UNIFORM. Outside that branch the candidate period is
+  // meaningless — and displaying it CONTRADICTS the label. The previous
+  // gate (`pattern !== 'UNCERTAIN' && periodicity >= threshold`) leaked
+  // exactly that case: Tabby's Star measures periodicity 0.601 with
+  // depthConsistency 0, labels IRREGULAR, and still surfaced a
+  // physically implausible 0.307 d period next to the IRREGULAR badge.
+  // Pinned by the KIC8462852 fixture in the data regression test.
+  const reportedPeriod = pattern === 'PERIODIC_UNIFORM' ? bestFitPeriodDays : null
 
   return {
     pattern,
@@ -225,9 +227,6 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
     depthConsistency,
     dipShape,
     baselineRMS,
-    // Only surface the period when periodicity is confident enough
-    // to mean anything — a "best-fit period" with 12% periodicity
-    // would be more misleading than useful.
     bestFitPeriodDays: reportedPeriod,
     dipCount,
   }

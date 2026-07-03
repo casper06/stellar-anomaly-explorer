@@ -66,9 +66,11 @@ const PERIOD_TOL = 0.05 // days
  * - KIC8462852 (Tabby's Star): 9 dips led by the famous D1519 −20.7%
  *   event (D792 −14.2% is second) — matches the live panel observed in
  *   the 2026-07-02 verification session. IRREGULAR (depthConsistency 0).
- *   Quirk: periodicity computes 0.601, so a physically meaningless
- *   0.307 d "best-fit period" IS surfaced (the implausible-period guard
- *   only runs on the would-be-PERIODIC branch). Frozen as-is.
+ *   `bestFitPeriodDays` MUST be null: periodicity computes 0.601, and
+ *   the classifier used to surface a physically meaningless 0.307 d
+ *   "best-fit period" alongside the IRREGULAR label. The period is now
+ *   surfaced ONLY when the pattern is PERIODIC_UNIFORM; this fixture
+ *   pins that (fixed 2026-07-03, don't regress).
  * - KIC7449554 (K02357.02): matches the live-session values (1 dip,
  *   NOTABLE, t=1273.1 BKJD, SPARSE), not re-derived. Depth on this
  *   fixture measures 1.00% (the session panel displayed −1.08% from an
@@ -99,7 +101,7 @@ const EXPECTED: Expectation[] = [
     topDipLabel: 'WOW',
     topDipPeakTime: 1519.52,
     topDipDepth: 0.2069,
-    bestFitPeriodDays: 0.3065,
+    bestFitPeriodDays: null,
   },
   {
     id: 'KIC7449554',
