@@ -125,7 +125,13 @@ async function classifyOne(
       flux: number[]
       source: 'real' | 'unavailable' | 'synthetic'
     }
-    if (data.source === 'unavailable' || !data.times || data.times.length === 0) return 'no-data'
+    // Only REAL data may produce a shared pattern-cache entry. In dev the
+    // lightcurve route substitutes a synthetic curve when the MAST fetch
+    // fails for a catalog star — classifying that would write a fake
+    // pattern into the cache the sky radar renders as truth. Treat
+    // anything non-real (synthetic included) as no-data; the next run
+    // retries those stars against MAST.
+    if (data.source !== 'real' || !data.times || data.times.length === 0) return 'no-data'
     const dips = detectDips(data.flux, data.times)
     const profile = classifyCurve(data.times, data.flux, dips)
     await setEntry(spec.id, profile.pattern)
