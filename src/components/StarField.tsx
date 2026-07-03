@@ -6,8 +6,8 @@ import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 import * as THREE from 'three'
 import { CatalogStar } from '@/lib/starCatalog'
 import { useStore } from '@/lib/store'
-import { fetchLightcurve, detectDips } from '@/lib/anomalyDetector'
-import { classifyCurve } from '@/lib/curveClassifier'
+import { selectStarAndFetchCurve } from '@/lib/selectStar'
+import type { CurvePattern } from '@/lib/curveClassifier'
 
 const STAR_SPHERE_RADIUS = 500
 // Camera orbits the origin at a fixed radius — "zoom" is done via FOV, not by
@@ -97,59 +97,62 @@ function makeCircleTexture(): THREE.Texture {
 }
 
 /**
- * @description Selects a star: switches the UI to analyze mode, fetches its light curve,
- * detects dips, and pushes everything into the store so the side panel can
- * render. Setters are passed in (instead of pulled from `useStore()`) so this
- * helper stays callable from both React handlers and `useFrame` loops.
- * @param star The star the user (or auto-select) just picked.
- * @param setSelectedStar Store action — selected star.
- * @param setMode Store action — UI mode.
- * @param setLightcurve Store action — light curve + dips.
- * @param setAnomalies Store action — list of notable+ dips for the HUD counter.
+ * @description Builds a 128×128 reticle sprite for the "you are here"
+ * selection marker: a thin white ring with four short crosshair ticks
+ * cutting inward through it. Sprite is drawn on transparent alpha so
+ * only the ring + ticks show — the star itself remains visible in the
+ * middle. Wider stroke than the flagged ring so the two read as
+ * distinct at a glance (flagged is a status badge; selection is
+ * navigational). Additive blending in the material makes it pop
+ * against dense backgrounds without changing its underlying whites.
+ * @returns A CanvasTexture ready to assign to PointsMaterial.map.
  */
-async function selectStar(
-  star: CatalogStar,
-  setSelectedStar: (s: CatalogStar) => void,
-  setMode: (m: 'explore' | 'analyze' | 'report') => void,
-  setLightcurve: (d: ReturnType<typeof useStore.getState>['lightcurve']) => void,
-  setAnomalies: (a: ReturnType<typeof useStore.getState>['anomalies']) => void,
-) {
-  setSelectedStar(star)
-  setMode('analyze')
-  // Mark visited as soon as the user opens the curve — the persisted
-  // record is "I tried to look at this star", not "I successfully
-  // fetched data". A failed MAST fetch still counts as visited so the
-  // user isn't pestered to revisit dead targets.
-  useStore.getState().markVisited(star.id)
-  // Clear stale data from the previously selected star and flip the loading
-  // flag so the panel can render its progress indicator instead.
-  const { setLightcurveLoading } = useStore.getState()
-  setLightcurve(null)
-  setLightcurveLoading(true)
-  try {
-    const { times, flux, source, provenance } = await fetchLightcurve(star.id)
-    const dips = detectDips(flux, times)
-    const anomalyDips = dips.map(d => ({
-      starId: star.id,
-      score: d.score,
-      depth: d.depth,
-      duration: d.duration,
-      asymmetry: d.asymmetry,
-      peakTime: d.peakTime,
-      label: d.label,
-    }))
-    // Profile the curve only when we actually have data; the
-    // 'unavailable' path returns empty arrays and `classifyCurve`
-    // would just report SPARSE / zeros — clearer to surface null.
-    const profile =
-      source === 'unavailable' || times.length === 0
-        ? null
-        : classifyCurve(times, flux, dips)
-    setLightcurve({ times, flux, dips: anomalyDips, source, provenance, profile })
-    setAnomalies(anomalyDips.filter(d => d.label !== 'NORMAL'))
-  } finally {
-    setLightcurveLoading(false)
+function makeReticleTexture(): THREE.Texture {
+  const size = 128
+  const canvas = document.createElement('canvas')
+  canvas.width = size
+  canvas.height = size
+  const ctx = canvas.getContext('2d')!
+  const cx = size / 2
+  const cy = size / 2
+  const radius = 48
+  ctx.clearRect(0, 0, size, size)
+  ctx.lineCap = 'round'
+  // Main ring — solid, moderately thick so it reads as a UI element
+  // rather than a natural glow.
+  ctx.strokeStyle = 'rgba(255,255,255,0.95)'
+  ctx.lineWidth = 3
+  ctx.beginPath()
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2)
+  ctx.stroke()
+  // Four crosshair ticks — poking inward from the ring toward center,
+  // stopping short so the star's own visual isn't obscured. Reads as
+  // "target this point" in every game/UI reticle vocabulary.
+  const tickInner = radius - 12
+  const tickOuter = radius + 8
+  ctx.lineWidth = 2.5
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)'
+  for (const angle of [0, Math.PI / 2, Math.PI, 3 * Math.PI / 2]) {
+    const dx = Math.cos(angle)
+    const dy = Math.sin(angle)
+    ctx.beginPath()
+    ctx.moveTo(cx + dx * tickInner, cy + dy * tickInner)
+    ctx.lineTo(cx + dx * tickOuter, cy + dy * tickOuter)
+    ctx.stroke()
   }
+  // Subtle inner halo so the reticle has a soft aura at wide FOV
+  // where the ring itself is only a few pixels across.
+  const halo = ctx.createRadialGradient(cx, cy, radius - 4, cx, cy, radius + 6)
+  halo.addColorStop(0, 'rgba(76,201,240,0)')
+  halo.addColorStop(0.5, 'rgba(76,201,240,0.15)')
+  halo.addColorStop(1, 'rgba(76,201,240,0)')
+  ctx.fillStyle = halo
+  ctx.beginPath()
+  ctx.arc(cx, cy, radius + 6, 0, Math.PI * 2)
+  ctx.fill()
+  const tex = new THREE.CanvasTexture(canvas)
+  tex.needsUpdate = true
+  return tex
 }
 
 // ─── Star points ────────────────────────────────────────────────────────────
@@ -257,25 +260,66 @@ const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite
 )
 
 /**
+ * @description Screen-space radius (CSS pixels) around the click point
+ * used to collect multi-hit candidates in dense fields. Stars whose
+ * projected screen position falls within this many pixels of the
+ * click are all treated as "at" the click and shown in the
+ * disambiguation popover. Small enough that widely-separated stars
+ * don't trigger the popover; large enough to include truly
+ * overlapping points in dense KOI clusters.
+ */
+const CLICK_DISAMBIG_RADIUS_PX = 6
+
+/**
+ * @description One candidate returned by the picker when a click hits
+ * multiple stars within `CLICK_DISAMBIG_RADIUS_PX`. `screenDistPx`
+ * is the star's projected distance from the click point in CSS
+ * pixels — the popover uses it to sort candidates by proximity and
+ * to show the distance to the user.
+ */
+export interface ClickCandidate {
+  star: CatalogStar
+  screenDistPx: number
+}
+
+/**
  * @description Bridge component that lives inside the Canvas so it has access to camera,
  * raycaster, and gl, then publishes a `pick(clientX, clientY)` function back
  * to the outer DOM tree via the `onPick` callback. The container uses that
- * function from its native `pointerup` listener to do raycasting and select
- * the star nearest the click.
+ * function from its native `pointerup` listener to do raycasting.
+ *
+ * Multi-hit disambiguation: `raycaster.intersectObject` returns every
+ * star along the ray path. We reproject each hit back to screen
+ * space and keep only stars within `CLICK_DISAMBIG_RADIUS_PX` of the
+ * click point — that's the direct interpretation of "the user
+ * clicked on this spot". Behavior:
+ * - **1 candidate**: select immediately (identical to the pre-
+ *   disambiguation behavior; the popover would just be noise).
+ * - **2+ candidates**: publish them via `onDisambiguate` so the
+ *   outer component can render a popover. No `selectStar` runs
+ *   until the user picks one.
+ * - **0 candidates** (nothing within the screen radius but the ray
+ *   still intersected something further out): fall back to the
+ *   closest-to-ray hit so a slightly-off click still selects
+ *   something reasonable.
  *
  * Renders nothing.
  * @param pointsRef Ref to the `THREE.Points` mesh of the catalog.
  * @param stars Catalog backing the points, indexed by `intersect.index`.
  * @param onPick Receives the picker function once the scene is mounted.
+ * @param onDisambiguate Called when a click lands on 2+ stars; the
+ * outer component shows a popover at the click coordinates.
  */
 function ClickRaycastBridge({
   pointsRef,
   stars,
   onPick,
+  onDisambiguate,
 }: {
   pointsRef: React.RefObject<THREE.Points | null>
   stars: CatalogStar[]
   onPick: (picker: (clientX: number, clientY: number) => void) => void
+  onDisambiguate: (clientX: number, clientY: number, candidates: ClickCandidate[]) => void
 }) {
   const { camera, raycaster, gl } = useThree()
 
@@ -288,24 +332,70 @@ function ClickRaycastBridge({
         ((clientX - rect.left) / rect.width) * 2 - 1,
         -((clientY - rect.top) / rect.height) * 2 + 1,
       )
-      // Bigger threshold = easier to hit a star
+      // World-space threshold — kept a bit wider than the visual dot
+      // so a slightly-off click still gets its intended target. The
+      // strict "am I actually at this spot?" filter is the screen-
+      // space reprojection below.
       raycaster.params.Points = { threshold: 4 }
       raycaster.setFromCamera(ndc, camera)
       const hits = raycaster.intersectObject(mesh)
       if (hits.length === 0) return
-      // Prefer the hit closest to the click in screen space (smallest distanceToRay)
-      let best = hits[0]
+
+      // Reproject each hit to screen space and keep only those within
+      // CLICK_DISAMBIG_RADIUS_PX of the click. Dedupe by index so a
+      // single star that somehow shows up twice (shouldn't happen for
+      // a single Points mesh but cheap insurance) doesn't fill the
+      // popover with duplicates.
+      const clickScreenX = clientX - rect.left
+      const clickScreenY = clientY - rect.top
+      const projected = new THREE.Vector3()
+      const dedupe = new Set<number>()
+      const candidates: ClickCandidate[] = []
       for (const h of hits) {
-        if ((h.distanceToRay ?? Infinity) < (best.distanceToRay ?? Infinity)) best = h
+        const idx = h.index
+        if (idx == null || dedupe.has(idx)) continue
+        dedupe.add(idx)
+        const star = stars[idx]
+        if (!star) continue
+        projected.copy(h.point).project(camera)
+        // NDC → CSS pixels within the canvas element.
+        const sx = (projected.x * 0.5 + 0.5) * rect.width
+        const sy = (1 - (projected.y * 0.5 + 0.5)) * rect.height
+        const dx = sx - clickScreenX
+        const dy = sy - clickScreenY
+        const screenDistPx = Math.sqrt(dx * dx + dy * dy)
+        if (screenDistPx <= CLICK_DISAMBIG_RADIUS_PX) {
+          candidates.push({ star, screenDistPx })
+        }
       }
-      const idx = best.index ?? 0
-      const star = stars[idx]
-      if (star) {
-        const { setSelectedStar, setMode, setLightcurve, setAnomalies } = useStore.getState()
-        selectStar(star, setSelectedStar, setMode, setLightcurve, setAnomalies)
+
+      if (candidates.length === 0) {
+        // Nothing within the disambiguation radius. Fall back to the
+        // single closest-to-ray hit so a click that's off by a few
+        // pixels still selects something — matches the old behavior
+        // for edge-case clicks.
+        let best = hits[0]
+        for (const h of hits) {
+          if ((h.distanceToRay ?? Infinity) < (best.distanceToRay ?? Infinity)) best = h
+        }
+        const star = stars[best.index ?? 0]
+        if (star) {
+          void selectStarAndFetchCurve(star)
+        }
+        return
       }
+
+      if (candidates.length === 1) {
+        void selectStarAndFetchCurve(candidates[0].star)
+        return
+      }
+
+      // 2+ candidates → open the popover. Sort by screen distance so
+      // the top row is the star nearest the click.
+      candidates.sort((a, b) => a.screenDistPx - b.screenDistPx)
+      onDisambiguate(clientX, clientY, candidates)
     })
-  }, [pointsRef, stars, camera, raycaster, gl, onPick])
+  }, [pointsRef, stars, camera, raycaster, gl, onPick, onDisambiguate])
 
   return null
 }
@@ -733,6 +823,271 @@ function FlaggedRingMarkers({
   )
 }
 
+/**
+ * @description Color palette for the sky-radar overlay, keyed by
+ * `CurvePattern`. IRREGULAR pops in bright magenta so it reads as
+ * "interesting — worth a closer look"; PERIODIC_UNIFORM is a dim,
+ * calm green so classified planetary-signal-looking stars fade into
+ * the background. HIGH_VARIABILITY gets a dim yellow to flag "noisy,
+ * take results with a grain of salt". SPARSE and UNCERTAIN
+ * intentionally have no radar entry — the classifier is admitting
+ * it can't tell, so we let those stars keep their default
+ * mission-color anomaly marker with no radar tint.
+ */
+const RADAR_COLOR_HEX: Partial<Record<CurvePattern, string>> = {
+  IRREGULAR: '#ff2ea6',        // bright magenta — pops as "interesting"
+  PERIODIC_UNIFORM: '#4ade80', // dim green — "boring, known"
+  HIGH_VARIABILITY: '#facc15', // dim yellow — "noisy backdrop"
+}
+
+/**
+ * @description Extra overlay layer for the sky radar. Renders one dot
+ * per classified star at the pattern color from `RADAR_COLOR_HEX`.
+ * Drawn ABOVE the mission-themed `AnomalyMarkers` so the mission
+ * color underneath still peeks through the pulse animation while the
+ * radar dot sits crisply on top at the star's exact position.
+ *
+ * FOV tier behavior mirrors `AnomalyMarkers`: hidden above the
+ * hard-cutoff (≥ ANOMALY_HARD_CUTOFF_FOV = 55°) so a wide-view sky
+ * doesn't grow a rash of colored dots on top of the already-static
+ * overview cores. Between 40° and 50° the layer fades linearly with
+ * `detailAmount(fov)`. Below 40° it renders at full opacity.
+ *
+ * Uses ONE `<points>` mesh per pattern so we don't need a custom
+ * shader to vary color per vertex — three cheap draws (magenta /
+ * green / yellow) is well within our budget and keeps the layer
+ * consistent with how the rest of the file draws grouped markers.
+ * @param stars Full catalog (we filter by classifiedPatterns here).
+ * @param sprite Shared circular alpha sprite.
+ * @returns One `<points>` mesh per pattern with a cached entry.
+ */
+function PatternRadarMarkers({
+  stars,
+  sprite,
+}: {
+  stars: CatalogStar[]
+  sprite: THREE.Texture
+}) {
+  const classifiedPatterns = useStore(s => s.classifiedPatterns)
+
+  // Bucket stars by pattern once per (stars, classifiedPatterns)
+  // change — expensive to recompute, cheap to iterate later.
+  const buckets = useMemo(() => {
+    const out: Record<string, CatalogStar[]> = {}
+    for (const patternKey of Object.keys(RADAR_COLOR_HEX)) out[patternKey] = []
+    for (const star of stars) {
+      const pattern = classifiedPatterns.get(star.id)
+      if (!pattern) continue
+      if (!(pattern in RADAR_COLOR_HEX)) continue
+      out[pattern].push(star)
+    }
+    return out
+  }, [stars, classifiedPatterns])
+
+  return (
+    <>
+      {Object.entries(buckets).map(([pattern, patternStars]) => (
+        <PatternRadarBucket
+          key={pattern}
+          stars={patternStars}
+          colorHex={RADAR_COLOR_HEX[pattern as CurvePattern]!}
+          sprite={sprite}
+        />
+      ))}
+    </>
+  )
+}
+
+/**
+ * @description Single `<points>` mesh for one pattern bucket. Pulled
+ * out so each bucket owns its own refs, useFrame, and positions
+ * memo — cleaner than one giant per-pattern for-loop inside a
+ * useFrame that also has to track per-bucket refs.
+ *
+ * Sits at `STAR_SPHERE_RADIUS - 3` (in front of the mission anomaly
+ * layer at −1 and the flagged ring at −1) so its dot is always the
+ * visually-top-most classified badge. `depthWrite: false` +
+ * `depthTest: false` avoids Z-fighting with the other overlays at
+ * near-equal radii.
+ * @param stars Pre-bucketed subset for this pattern.
+ * @param colorHex Radar color for this pattern.
+ * @param sprite Shared circular alpha sprite.
+ * @returns One `<points>` mesh, or null when the bucket is empty.
+ */
+function PatternRadarBucket({
+  stars,
+  colorHex,
+  sprite,
+}: {
+  stars: CatalogStar[]
+  colorHex: string
+  sprite: THREE.Texture
+}) {
+  const ref = useRef<THREE.Points>(null)
+  const { camera } = useThree()
+  const isStaticRef = useRef(false)
+
+  useFrame(() => {
+    if (!ref.current) return
+    const fov = (camera as THREE.PerspectiveCamera).fov ?? FOV_MAX
+    const mat = ref.current.material as THREE.PointsMaterial
+    // Same hard cutoff as the mission-color anomaly layer. Above
+    // this FOV the wide-view sky shows only the static overview
+    // cores; adding radar dots on top would just add clutter and
+    // undo the perf win of the AnomalyMarkers static-snap.
+    if (fov >= ANOMALY_HARD_CUTOFF_FOV) {
+      if (!isStaticRef.current) {
+        mat.size = 0
+        mat.opacity = 0
+        isStaticRef.current = true
+      }
+      return
+    }
+    isStaticRef.current = false
+    // Linear fade over the same 40°–50° band as `detailAmount`.
+    // Below 40° the dot renders at full 8px / 0.9 opacity.
+    const detail = detailAmount(fov)
+    mat.size = 8 * detail
+    mat.opacity = 0.9 * detail
+  })
+
+  const positions = useMemo(() => {
+    const pos = new Float32Array(stars.length * 3)
+    stars.forEach((star, i) => {
+      const [x, y, z] = raDecToXYZ(star.ra, star.dec, STAR_SPHERE_RADIUS - 3)
+      pos[i * 3] = x
+      pos[i * 3 + 1] = y
+      pos[i * 3 + 2] = z
+    })
+    return pos
+  }, [stars])
+
+  if (stars.length === 0) return null
+
+  return (
+    <points ref={ref}>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" args={[positions, 3]} />
+      </bufferGeometry>
+      <pointsMaterial
+        color={colorHex}
+        size={0}
+        sizeAttenuation={false}
+        transparent
+        opacity={0}
+        map={sprite}
+        alphaTest={0.01}
+        depthWrite={false}
+        depthTest={false}
+      />
+    </points>
+  )
+}
+
+/**
+ * @description Base sprite size (screen pixels) for the selection
+ * reticle at wide FOV. The `useFrame` animation modulates around
+ * this baseline; picked to be large enough to read at FOV_MAX
+ * without swamping the star itself.
+ */
+const SELECTION_BASE_SIZE = 34
+
+/**
+ * @description Angular frequency of the selection reticle's breathing
+ * pulse (radians per second). Slower than the anomaly pulse
+ * (`ANOMALY_PULSE_OMEGA`) so the two are visually distinguishable
+ * when a flagged/anomaly star is also the selection — the reticle
+ * feels calm and deliberate, the anomaly feels alert.
+ */
+const SELECTION_PULSE_OMEGA = (2 * Math.PI) / 2.2
+
+/**
+ * @description "You are here" reticle rendered at the currently-
+ * selected star's position. Distinct from every other overlay:
+ * - Flagged white ring is thinner, static, and only at anomaly stars.
+ * - Anomaly pulse is red/cyan (mission-tinted) and FOV-gated.
+ * This reticle is bright cyan, always visible regardless of FOV,
+ * carries a crosshair-inside-ring shape, and breathes in size + opacity
+ * so it reads as "the current cursor / selection anchor" rather than
+ * as a status badge.
+ *
+ * Renders nothing when `selectedStar` is null. When it is set, the
+ * position attribute is re-populated whenever the id / RA / Dec
+ * changes — the underlying `<points>` mesh persists so we don't
+ * churn a full mount cycle on every selection.
+ * @returns Reticle `<points>` layer, or null if nothing is selected.
+ */
+function SelectionMarker() {
+  const selectedStar = useStore(s => s.selectedStar)
+  const ref = useRef<THREE.Points>(null)
+  const reticle = useMemo(() => makeReticleTexture(), [])
+  const { camera } = useThree()
+
+  // Single-vertex position buffer. Re-populated by an effect below
+  // whenever the selected star changes; we allocate the buffer once
+  // and mutate it in place to avoid re-uploading the entire mesh
+  // through React on each selection.
+  const positions = useMemo(() => new Float32Array(3), [])
+
+  useEffect(() => {
+    if (!selectedStar || !ref.current) return
+    const [x, y, z] = raDecToXYZ(selectedStar.ra, selectedStar.dec, STAR_SPHERE_RADIUS - 2)
+    positions[0] = x
+    positions[1] = y
+    positions[2] = z
+    const geom = ref.current.geometry
+    const attr = geom.getAttribute('position') as THREE.BufferAttribute | undefined
+    if (attr) attr.needsUpdate = true
+  }, [selectedStar, positions])
+
+  useFrame(({ clock }) => {
+    if (!ref.current) return
+    const mat = ref.current.material as THREE.PointsMaterial
+    if (!selectedStar) {
+      // Fully hidden when nothing is selected. We don't unmount the
+      // mesh — cheap enough to keep around, and this way the
+      // position/material state stays warm for the next selection.
+      mat.opacity = 0
+      mat.size = 0
+      return
+    }
+    // Breathing pulse: size ±15% around the base, opacity 0.55–0.9.
+    // Sine on different phases so size peak and opacity peak don't
+    // land on the same frame — feels more organic than a lockstep
+    // pulse. Renders at ALL FOVs (unlike the anomaly pulse) so the
+    // user can always locate their selection.
+    const t = clock.elapsedTime * SELECTION_PULSE_OMEGA
+    const fov = (camera as THREE.PerspectiveCamera).fov ?? FOV_MAX
+    // Gentle FOV boost so the reticle doesn't shrink relative to the
+    // star point when the user zooms in (star points already scale
+    // via `depthScale`). Cap at 1.6× to avoid overwhelming the star
+    // itself at maximum zoom.
+    const fovBoost = 1 + Math.min(0.6, (FOV_MAX - fov) / FOV_MAX * 0.9)
+    mat.size = SELECTION_BASE_SIZE * fovBoost * (1 + 0.15 * Math.sin(t))
+    mat.opacity = 0.55 + 0.35 * (0.5 + 0.5 * Math.sin(t + Math.PI / 3))
+  })
+
+  return (
+    <points ref={ref}>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" args={[positions, 3]} />
+      </bufferGeometry>
+      <pointsMaterial
+        color="#4cc9f0"
+        size={0}
+        sizeAttenuation={false}
+        transparent
+        opacity={0}
+        map={reticle}
+        alphaTest={0.01}
+        depthWrite={false}
+        depthTest={false}
+        blending={THREE.AdditiveBlending}
+      />
+    </points>
+  )
+}
+
 // ─── Camera sync + auto-select on zoom (FOV-based, no keyboard) ─────────────
 
 /**
@@ -745,8 +1100,16 @@ function FlaggedRingMarkers({
  */
 function CameraSync({ stars }: { stars: CatalogStar[] }) {
   const { camera } = useThree()
-  const { setSelectedStar, setMode, setLightcurve, setAnomalies, selectedStar, setCameraTarget, setZoom } = useStore()
+  const { selectedStar, setCameraTarget, setZoom } = useStore()
+  const flyTo = useStore(s => s.flyTo)
   const autoSelectedRef = useRef<string | null>(null)
+  // Timestamp of the most recent fly-to command. Auto-select is
+  // suppressed until this many ms have passed, giving the tween time
+  // to arrive without any intermediate frame's `closest` anomaly
+  // latching onto and overwriting the user's explicit pick. The
+  // fly-to tween itself runs ~1000 ms; we hold the suppression a bit
+  // longer so a slow arrival frame doesn't slip through.
+  const flyToSuppressUntilRef = useRef<number>(0)
 
   const anomalyDirs = useMemo(
     () =>
@@ -759,6 +1122,31 @@ function CameraSync({ stars }: { stars: CatalogStar[] }) {
     [stars],
   )
 
+  // Suppression window: any fly-to command triggers a ~1.3s hold on
+  // auto-select. Without this, the auto-select useFrame below scans
+  // for the anomaly angularly closest to the camera on every frame
+  // during the 1s tween and fires `selectStarAndFetchCurve` on it —
+  // silently overwriting the user's explicit selection when the
+  // fly-to path passes within `halfFov * 0.5` of a different
+  // anomaly. Verified failure case: search picks K02357.02
+  // (KIC7449554); K07016.01 (KIC8311864) sits 2.36° away; at FOV≤28°
+  // (auto-select threshold) `halfFov*0.5 = 7°` easily catches it,
+  // and the identity guard doesn't help because the two stars have
+  // different ids.
+  useEffect(() => {
+    if (!flyTo) return
+    flyToSuppressUntilRef.current = performance.now() + 1300
+  }, [flyTo])
+
+  // Keep the identity guard in sync with any external selection so
+  // manual zoom/pan onto the SAME anomaly the user just picked
+  // doesn't re-fire auto-select once the suppression window
+  // expires. This is the pre-existing guard's original purpose — the
+  // fly-to window above is the new belt.
+  useEffect(() => {
+    if (selectedStar) autoSelectedRef.current = selectedStar.id
+  }, [selectedStar])
+
   useFrame(() => {
     const dir = new THREE.Vector3()
     camera.getWorldDirection(dir)
@@ -768,8 +1156,11 @@ function CameraSync({ stars }: { stars: CatalogStar[] }) {
     const fov = (camera as THREE.PerspectiveCamera).fov ?? FOV_MAX
     setZoom(fov)
 
-    // Auto-select when zoomed in (narrow FOV) and an anomaly is near center
-    if (fov <= AUTO_SELECT_FOV) {
+    // Auto-select when zoomed in (narrow FOV) and an anomaly is near center.
+    // Suppressed for a ~1.3s window after any fly-to command so an
+    // in-flight tween can't be silently overridden by whatever anomaly
+    // happens to sit along its path.
+    if (fov <= AUTO_SELECT_FOV && performance.now() >= flyToSuppressUntilRef.current) {
       let closest: (typeof anomalyDirs)[0] | null = null
       let closestAngle = Infinity
       for (const ap of anomalyDirs) {
@@ -780,9 +1171,9 @@ function CameraSync({ stars }: { stars: CatalogStar[] }) {
       const halfFovRad = (fov / 2) * (Math.PI / 180)
       if (closest && closestAngle < halfFovRad * 0.5 && autoSelectedRef.current !== closest.star.id) {
         autoSelectedRef.current = closest.star.id
-        selectStar(closest.star, setSelectedStar, setMode, setLightcurve, setAnomalies)
+        void selectStarAndFetchCurve(closest.star)
       }
-    } else {
+    } else if (fov > AUTO_SELECT_FOV) {
       if (!selectedStar) autoSelectedRef.current = null
     }
   })
@@ -1039,6 +1430,35 @@ export default function StarField({ stars }: StarFieldProps) {
   const [arrivalFlash, setArrivalFlash] = useState(false)
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const sprite = useMemo(() => makeCircleTexture(), [])
+  // Popover shown when a click hits multiple stars in the same
+  // screen-space region. `x`/`y` are page-coordinate pixel offsets
+  // (from the click event), used verbatim as the popover's absolute
+  // position — anchored so the top-left of the card sits at the
+  // click site. Null when no disambiguation is pending.
+  const [disambig, setDisambig] = useState<{
+    x: number
+    y: number
+    candidates: ClickCandidate[]
+  } | null>(null)
+
+  // Mirror ref for `disambig` so the native pointerdown/pointerup
+  // listeners (registered ONCE at mount, they don't re-bind on
+  // state change) can read the current open state cheaply. When
+  // the popover is open the picker must NOT fire — otherwise the
+  // container's native pointerup handler runs the raycaster on
+  // whatever's underneath the popover in the 3D canvas AND the
+  // row's React `onClick` runs `onPick`, so we'd `selectStar`
+  // twice with different targets. Ref-based state lookup lets one
+  // stable listener stay correct across popover open/close.
+  const disambigOpenRef = useRef(false)
+  useEffect(() => { disambigOpenRef.current = disambig !== null }, [disambig])
+
+  const handleDisambiguate = useCallback(
+    (x: number, y: number, candidates: ClickCandidate[]) => {
+      setDisambig({ x, y, candidates })
+    },
+    [],
+  )
 
   /**
    * @description Triggered by `FlyToController` when the camera finishes
@@ -1070,10 +1490,23 @@ export default function StarField({ stars }: StarFieldProps) {
 
     // Distinguish "click" from "drag": only fire raycast pick if pointer moved
     // less than ~4px between down and up, and within 400ms.
+    //
+    // While the disambiguation popover is open we DON'T update
+    // `downPosRef` and we DON'T call the picker on release. React's
+    // synthetic events on the popover (row `onClick`, backdrop
+    // dismiss) handle the interaction. If we allowed the container
+    // picker to fire, clicking a row would additionally raycast
+    // against the star underneath the popover and either overwrite
+    // the correct `selectStar` result or trigger a spurious MAST
+    // fetch. State is read from `disambigOpenRef` so this stable
+    // listener stays correct without re-binding on every popover
+    // open/close.
     const onPointerDown = (e: PointerEvent) => {
+      if (disambigOpenRef.current) return
       downPosRef.current = { x: e.clientX, y: e.clientY, t: performance.now() }
     }
     const onPointerUp = (e: PointerEvent) => {
+      if (disambigOpenRef.current) return
       const down = downPosRef.current
       downPosRef.current = null
       if (!down) return
@@ -1109,6 +1542,8 @@ export default function StarField({ stars }: StarFieldProps) {
       >
         <StarPoints ref={pointsRef} stars={stars} sprite={sprite} />
         <AnomalyMarkers stars={stars} sprite={sprite} />
+        <PatternRadarMarkers stars={stars} sprite={sprite} />
+        <SelectionMarker />
         <CameraSync stars={stars} />
         <FlyToController controlsRef={controlsRef} onArrive={handleFlyArrive} />
         <FovZoomController containerRef={containerRef} />
@@ -1116,6 +1551,7 @@ export default function StarField({ stars }: StarFieldProps) {
           pointsRef={pointsRef}
           stars={stars}
           onPick={(fn) => { pickerRef.current = fn }}
+          onDisambiguate={handleDisambiguate}
         />
         <AnomalyHoverTracker stars={stars} mouseRef={mouseRef} onChange={setHovered} />
         <OrbitControls
@@ -1142,6 +1578,172 @@ export default function StarField({ stars }: StarFieldProps) {
           zIndex: 6,
         }}
       />
+      {disambig && (
+        <ClickDisambiguationPopover
+          x={disambig.x}
+          y={disambig.y}
+          candidates={disambig.candidates}
+          onPick={(star) => {
+            void selectStarAndFetchCurve(star)
+            setDisambig(null)
+          }}
+          onDismiss={() => setDisambig(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * @description Popover shown when a click hits multiple stars within
+ * `CLICK_DISAMBIG_RADIUS_PX` in the 3D sky. Lists each candidate
+ * with id, magnitude, and screen distance from the click; clicking
+ * an entry selects that star, clicking the backdrop dismisses.
+ *
+ * A full-viewport transparent backdrop sits behind the card and
+ * intercepts clicks so a stray click on the sky doesn't re-trigger
+ * the picker AND simultaneously dismiss the popover. Per the UX
+ * spec, an off-card click dismisses WITHOUT selecting anything new.
+ * @param x Page X of the original click; card left-anchors here.
+ * @param y Page Y of the original click; card top-anchors here.
+ * @param candidates Stars that hit the click point, pre-sorted by
+ * screen distance ascending.
+ * @param onPick Called when the user chooses one entry.
+ * @param onDismiss Called when the user clicks outside the card.
+ * @returns Fixed-position backdrop + candidate card, or null when
+ * empty (shouldn't happen — parent gates on `candidates.length >= 2`).
+ */
+function ClickDisambiguationPopover({
+  x,
+  y,
+  candidates,
+  onPick,
+  onDismiss,
+}: {
+  x: number
+  y: number
+  candidates: ClickCandidate[]
+  onPick: (star: CatalogStar) => void
+  onDismiss: () => void
+}) {
+  // NOTE on event isolation: the container in the outer component
+  // registers NATIVE `pointerdown`/`pointerup` listeners on its
+  // root div via `addEventListener`. Those don't participate in
+  // React's synthetic-event tree, so `e.stopPropagation()` from a
+  // React `onClick` here would NOT prevent them from firing on
+  // bubble. Attaching a native `stopPropagation` listener on the
+  // backdrop would prevent them — but it would ALSO break React's
+  // root-level synthetic-event delegation (React 17+ listens on
+  // the react root, which sits above this popover; stopping
+  // propagation at the backdrop stops the event reaching the
+  // delegator too, so the row's `onClick` would never fire).
+  //
+  // The correct fix is state-aware in the OUTER component: the
+  // container's native picker checks `disambigOpenRef.current` and
+  // bails when the popover is open. That's implemented in the
+  // pointerup handler at `StarField`'s mount effect.
+  if (candidates.length === 0) return null
+  // Clamp the card so it never overflows the viewport when the click
+  // was near the bottom-right edge. 260 is the card width plus
+  // margin; 220 covers ~5 rows plus the header.
+  const CARD_W = 260
+  const CARD_H_APPROX = 220
+  const vw = typeof window !== 'undefined' ? window.innerWidth : 1920
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 1080
+  const left = Math.min(x + 8, vw - CARD_W - 8)
+  const top = Math.min(y + 8, vh - CARD_H_APPROX - 8)
+  return (
+    <div
+      onClick={onDismiss}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 30,
+        // Transparent — the click capture is the whole point; visuals
+        // stay minimal so the sky beneath is still readable.
+        background: 'transparent',
+        pointerEvents: 'auto',
+        fontFamily: 'JetBrains Mono, monospace',
+      }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          position: 'absolute',
+          left,
+          top,
+          width: CARD_W,
+          maxHeight: 'min(50vh, 320px)',
+          overflowY: 'auto',
+          background: 'rgba(0,0,0,0.86)',
+          border: '1px solid rgba(76,201,240,0.35)',
+          borderRadius: 6,
+          padding: 8,
+          boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
+          animation: 'sf-disambig-fade 0.12s ease',
+        }}
+      >
+        <div
+          style={{
+            fontSize: 8,
+            color: 'rgba(255,255,255,0.4)',
+            letterSpacing: 2,
+            padding: '2px 6px 6px',
+          }}
+        >
+          {candidates.length} STARS AT THIS POINT
+        </div>
+        {candidates.map(c => (
+          <button
+            key={c.star.id}
+            onClick={() => onPick(c.star)}
+            title={c.star.name}
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'baseline',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              color: 'white',
+              fontSize: 10,
+              letterSpacing: 0.5,
+              padding: '6px 8px',
+              cursor: 'pointer',
+              fontFamily: 'inherit',
+              textAlign: 'left',
+              borderRadius: 4,
+              gap: 8,
+            }}
+            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(76,201,240,0.12)' }}
+            onMouseLeave={e => { e.currentTarget.style.background = 'none' }}
+          >
+            <span
+              style={{
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                flex: 1,
+                minWidth: 0,
+              }}
+            >
+              {c.star.name}
+            </span>
+            <span style={{ color: 'rgba(255,255,255,0.55)', fontSize: 9 }}>
+              mag {c.star.magnitude.toFixed(1)}
+            </span>
+            <span style={{ color: 'rgba(76,201,240,0.75)', fontSize: 9, minWidth: 30, textAlign: 'right' }}>
+              {c.screenDistPx.toFixed(1)}px
+            </span>
+          </button>
+        ))}
+      </div>
+      <style jsx>{`
+        @keyframes sf-disambig-fade {
+          from { opacity: 0; transform: translateY(-4px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
+      `}</style>
     </div>
   )
 }

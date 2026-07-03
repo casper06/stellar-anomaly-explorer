@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { FLAGGED_KEY, VISITED_KEY, loadIdSet, saveIdSet } from './persistence'
-import type { CurveProfile } from './curveClassifier'
+import type { CurveProfile, CurvePattern } from './curveClassifier'
 
 /**
  * @description Catalog of origin for a star. Used by the renderer to pick
@@ -81,6 +81,21 @@ export interface LightcurveData {
    * classify).
    */
   profile?: CurveProfile | null
+  /**
+   * @description Which mission archive actually served the data, or
+   * null when the curve is synthetic / unavailable. Surfaced so the
+   * UI can label the time axis correctly (BKJD for Kepler, TJD for
+   * TESS) and pick mission-specific defaults like the gap threshold.
+   */
+  mission?: 'Kepler' | 'TESS' | null
+  /**
+   * @description Time gap (in days) above which two consecutive
+   * samples should be treated as different observation runs (the
+   * canvas line breaks across the gap rather than drawing a
+   * diagonal stroke). Kepler quarters → 5; TESS sectors → 2. Falls
+   * back to 5 when missing so existing behavior is preserved.
+   */
+  gapDays?: number
 }
 
 /**
@@ -166,6 +181,19 @@ interface AppState {
    * the 3D sky and the FLAGGED list panel in the HUD.
    */
   flaggedIds: Set<string>
+  /**
+   * @description Sky-radar cache: precomputed `CurvePattern` per star,
+   * hydrated on mount from `/api/pattern-cache` (which reads the
+   * shared server-side `pattern-cache.json`). Drives the extra
+   * StarField overlay layer that tints markers by classification
+   * result — IRREGULAR pops magenta, PERIODIC_UNIFORM fades to a dim
+   * green, etc. Stars absent from this map render as usual.
+   *
+   * The lazy fill-in path (from selectStar) updates this Map AND
+   * POSTs to `/api/pattern-cache` so organic exploration converges
+   * with the batch job on the same shared cache.
+   */
+  classifiedPatterns: Map<string, CurvePattern>
   setSelectedStar: (star: Star | null) => void
   setHoveredStar: (star: Star | null) => void
   setAnomalies: (anomalies: Anomaly[]) => void
@@ -199,6 +227,21 @@ interface AppState {
    * sets with whatever the user persisted in previous sessions.
    */
   hydratePersistedSets: () => void
+  /**
+   * @description Replaces the classifiedPatterns map with a fresh
+   * one. Called from `page.tsx` after fetching `/api/pattern-cache`
+   * on mount. Also used by the batch-progress poller (if wired up
+   * later) to periodically refresh the cache as new patterns land.
+   */
+  setClassifiedPatterns: (patterns: Map<string, CurvePattern>) => void
+  /**
+   * @description Records a single star's pattern into the map. Used by
+   * the lazy fill-in path: after `selectStar` runs classifyCurve, the
+   * result is dropped here so the sky-radar overlay picks it up
+   * without another server round-trip. Creates a new Map instance so
+   * React subscribers see a referential change.
+   */
+  setClassifiedPattern: (starId: string, pattern: CurvePattern) => void
 }
 
 let flyToCounter = 0
@@ -235,6 +278,7 @@ export const useStore = create<AppState>((set) => ({
   // throw on `window`-less environments.
   visitedIds: new Set<string>(),
   flaggedIds: new Set<string>(),
+  classifiedPatterns: new Map<string, CurvePattern>(),
   setSelectedStar: (star) => set({ selectedStar: star }),
   setHoveredStar: (star) => set({ hoveredStar: star }),
   setAnomalies: (anomalies) => set({ anomalies }),
@@ -269,5 +313,12 @@ export const useStore = create<AppState>((set) => ({
   hydratePersistedSets: () => set({
     visitedIds: loadIdSet(VISITED_KEY),
     flaggedIds: loadIdSet(FLAGGED_KEY),
+  }),
+  setClassifiedPatterns: (patterns) => set({ classifiedPatterns: patterns }),
+  setClassifiedPattern: (starId, pattern) => set(state => {
+    if (state.classifiedPatterns.get(starId) === pattern) return state
+    const next = new Map(state.classifiedPatterns)
+    next.set(starId, pattern)
+    return { classifiedPatterns: next }
   }),
 }))

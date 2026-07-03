@@ -6,9 +6,20 @@ import {
   generateSyntheticLightcurve,
   KEPLER_PROVENANCE,
   SYNTHETIC_PROVENANCE,
+  TESS_PROVENANCE,
   UNAVAILABLE_PROVENANCE,
 } from '@/lib/anomalyDetector'
-import { readKeplerLightcurveColumns } from '@/lib/fitsReader'
+import { readMastLightcurveColumns } from '@/lib/fitsReader'
+
+/**
+ * @description Recommended canvas-line gap-break threshold (in days) per
+ * mission. Kepler has 1–4 day inter-quarter gaps so 5 cleanly separates
+ * real observation windows from intra-quarter cadence; TESS has more
+ * frequent sector boundaries (~1 day between sectors) so 2 is tighter
+ * but still safely above the 2-min intra-sector cadence.
+ */
+const GAP_DAYS_KEPLER = 5
+const GAP_DAYS_TESS = 2
 
 /**
  * @description Cache successful real fetches for the lifetime of the server
@@ -101,37 +112,81 @@ async function writeDiskCache(
 }
 
 /**
- * @description Converts a Kepler ID (numeric or "KIC{N}"-prefixed string)
- * into Kepler's archive naming convention `kplrNNNNNNNNN` — lowercase
- * prefix, 9-digit zero-padded number. MAST's `target_name` column uses
- * this form; querying the raw KIC integer or unpadded id returns zero
- * rows. Used for ALL light-curve fetches now (KOI stars too, not just
- * the 11 hardcoded seeds), so any star with a valid KIC id can return
- * real Kepler PDC data from MAST.
- * @param id Either a numeric `kepid` or a `KIC{digits}` string.
- * @returns Kepler archive target name, or null if `id` can't be parsed.
+ * @description Identifies which MAST archive collection (if any) a star id
+ * should be fetched against. Returns `null` for ids that don't carry a
+ * direct mission cross-reference — those go through the position-based
+ * cone-search path instead. Prefix-based dispatch:
+ *   - `KIC{N}` (KOI catalog, KNOWN_ANOMALIES seeds) → Kepler.
+ *   - Bare integer (legacy / numeric kepid) → Kepler.
+ *   - `TIC{N}` (TOI catalog) → TESS.
+ *   - Anything else (HIP*, SYN*, EPIC*, etc.) → null.
+ * @param id Catalog id.
+ * @returns The mission and its archive `target_name` form, or null.
  */
-function kepidToTargetName(id: string | number): string | null {
-  if (typeof id === 'number') {
-    if (!Number.isFinite(id) || id <= 0) return null
-    return `kplr${String(Math.floor(id)).padStart(9, '0')}`
+function identifyMastTarget(
+  id: string,
+): { mission: 'Kepler' | 'TESS'; targetName: string } | null {
+  const kicMatch = id.match(/^KIC(\d+)$/)
+  if (kicMatch) {
+    return { mission: 'Kepler', targetName: `kplr${kicMatch[1].padStart(9, '0')}` }
   }
-  const match = id.match(/^KIC(\d+)$/)
-  if (!match) return null
-  return `kplr${match[1].padStart(9, '0')}`
+  const ticMatch = id.match(/^TIC(\d+)$/)
+  if (ticMatch) {
+    // TESS `target_name` in `ivoa.obscore` is the bare TIC integer (no
+    // prefix, no padding). Verified against a live TAP query — using
+    // any padded form or the `TIC` prefix returns zero rows.
+    return { mission: 'TESS', targetName: String(parseInt(ticMatch[1], 10)) }
+  }
+  const numeric = Number(id)
+  if (Number.isFinite(numeric) && numeric > 0 && /^\d+$/.test(id)) {
+    return { mission: 'Kepler', targetName: `kplr${String(Math.floor(numeric)).padStart(9, '0')}` }
+  }
+  return null
 }
 
 /**
  * @description Builds the MAST VO-TAP synchronous query URL for the
- * `ivoa.obscore` view. We pull a small set of columns for Kepler timeseries
- * products tied to a given target_name — each row carries an `access_url`
- * that downloads the FITS directly, so no second hop is needed.
- * @param targetName Kepler archive target name (e.g. "kplr008462852").
+ * `ivoa.obscore` view, scoped to one mission's timeseries products for a
+ * single target. Each row carries an `access_url` that downloads the
+ * FITS directly, so no second hop is needed.
+ * @param mission Which mission's collection to query.
+ * @param targetName Archive target name (mission-specific format).
  * @returns Fully-formed GET URL.
  */
-function mastTapQueryUrl(targetName: string): string {
-  // Kepler had 17 quarters; cap at 100 to be safe across the full mission.
-  const adql = `SELECT TOP 100 obs_id, access_url, access_format FROM ivoa.obscore WHERE obs_collection='Kepler' AND dataproduct_type='timeseries' AND target_name='${targetName}'`
+function mastTapQueryUrl(mission: 'Kepler' | 'TESS', targetName: string): string {
+  // Cap at 100 to be safe — Kepler had 17 quarters, TESS publishes ~50+
+  // sectors for stars in continuous-viewing zones. The TOP cap protects
+  // against an accidentally over-broad target_name match.
+  const adql = `SELECT TOP 100 obs_id, access_url, access_format FROM ivoa.obscore WHERE obs_collection='${mission}' AND dataproduct_type='timeseries' AND target_name='${targetName}'`
+  const params = new URLSearchParams({
+    LANG: 'ADQL',
+    FORMAT: 'json',
+    REQUEST: 'doQuery',
+    QUERY: adql,
+  })
+  return `https://mast.stsci.edu/vo-tap/api/v0.1/caom/sync?${params.toString()}`
+}
+
+/**
+ * @description Cone-search VO-TAP URL for finding ANY Kepler or TESS
+ * timeseries product near a celestial position. Used by the on-demand
+ * path when a clicked star has no KIC/TIC cross-reference — if MAST has
+ * observed within `radiusDeg` of (ra, dec), we'll find a row and can
+ * proxy through to the existing fetch path. We query Kepler and TESS in
+ * one shot via `obs_collection IN ('Kepler','TESS')` and let the caller
+ * pick mission preference.
+ * @param ra Right ascension in degrees.
+ * @param dec Declination in degrees.
+ * @param radiusDeg Search radius in degrees (default 0.001° ≈ 3.6 arcsec).
+ * @returns Fully-formed GET URL.
+ */
+function mastConeSearchUrl(ra: number, dec: number, radiusDeg = 0.001): string {
+  const adql =
+    `SELECT TOP 20 obs_id, obs_collection, target_name, access_url, access_format ` +
+    `FROM ivoa.obscore ` +
+    `WHERE obs_collection IN ('Kepler','TESS') ` +
+    `AND dataproduct_type='timeseries' ` +
+    `AND CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', ${ra}, ${dec}, ${radiusDeg}))=1`
   const params = new URLSearchParams({
     LANG: 'ADQL',
     FORMAT: 'json',
@@ -153,16 +208,18 @@ interface TapResponse {
 }
 
 /**
- * @description Downloads and parses one Kepler PDC FITS quarter, returning
- * its TIME and per-quarter-median-normalized flux as parallel arrays. Each
- * quarter is normalized independently because Kepler's instrument throughput
- * drifts across quarter boundaries — joining unnormalized quarters produces
- * stepwise jumps at the seams. Returns null on any failure.
+ * @description Downloads and parses one MAST PDC FITS segment (a Kepler
+ * quarter OR a TESS sector — both have the same BINTABLE structure and
+ * column names), returning its TIME and per-segment-median-normalized
+ * flux as parallel arrays. Each segment is normalized independently
+ * because both missions' instrument throughputs drift across segment
+ * boundaries — joining unnormalized segments produces stepwise jumps at
+ * the seams. Returns null on any failure.
  * @param accessUrl The TAP-provided `access_url` (we extract the embedded
  * `uri=` since the portal Download proxy returns 400 as of 2026).
- * @returns Parallel `times`/`flux` arrays for the quarter, or null.
+ * @returns Parallel `times`/`flux` arrays for the segment, or null.
  */
-async function fetchAndParseQuarter(
+async function fetchAndParseSegment(
   accessUrl: string,
 ): Promise<{ times: number[]; flux: number[] } | null> {
   const tag = '[lightcurve]'
@@ -171,21 +228,37 @@ async function fetchAndParseQuarter(
   // That proxy returns 400 Bad Request as of 2026 — but the embedded
   // `uri=` param IS the real, public archive URL and serves the FITS
   // directly. Pull it out and upgrade to HTTPS.
+  //
+  // TESS access_urls use a `mast:TESS/product/...` URI scheme instead of
+  // `http://archive...`. We rewrite that to the public archive HTTPS URL
+  // (`https://archive.stsci.edu/missions/tess/tid/...`) the same way.
   let downloadUrl = accessUrl
   const uriMatch = accessUrl.match(/[?&]uri=([^&]+)/)
   if (uriMatch) {
-    downloadUrl = decodeURIComponent(uriMatch[1]).replace(/^http:\/\//, 'https://')
+    const inner = decodeURIComponent(uriMatch[1])
+    if (inner.startsWith('mast:TESS/')) {
+      // mast:TESS/product/tess2020186164531-s0027-0000000261136679-0189-s_lc.fits
+      // → https://mast.stsci.edu/api/v0.1/Download/file?uri=mast:TESS/product/...
+      // The MAST API Download endpoint accepts the original mast: URI and
+      // serves the file directly — works reliably for TESS where the
+      // legacy `archive.stsci.edu` path requires deeply nested directory
+      // structure that's painful to reconstruct from the filename alone.
+      downloadUrl = `https://mast.stsci.edu/api/v0.1/Download/file?uri=${encodeURIComponent(inner)}`
+    } else {
+      downloadUrl = inner.replace(/^http:\/\//, 'https://')
+    }
   }
 
-  // Short-name label for per-quarter logs so a long URL doesn't dominate
-  // the line. Filenames look like `kplrNNNNNNNNN-YYYYDDDHHMMSS_llc.fits`;
-  // the timestamp suffix is the only part that varies per quarter.
+  // Short-name label for per-segment logs so a long URL doesn't dominate
+  // the line. Kepler filenames look like
+  // `kplrNNNNNNNNN-YYYYDDDHHMMSS_llc.fits`; TESS filenames look like
+  // `tessYYYYDDDHHMMSS-sSSSS-TTTTTTTTTTTTT-NNNN-s_lc.fits`.
   const fname = downloadUrl.split('/').pop() ?? downloadUrl
 
   try {
     const fitsRes = await fetch(downloadUrl, { signal: AbortSignal.timeout(60000) })
     if (!fitsRes.ok) {
-      console.error(`${tag} quarter ${fname} → HTTP ${fitsRes.status} ${fitsRes.statusText}`)
+      console.error(`${tag} segment ${fname} → HTTP ${fitsRes.status} ${fitsRes.statusText}`)
       return null
     }
     const fitsBuf = Buffer.from(await fitsRes.arrayBuffer())
@@ -193,11 +266,11 @@ async function fetchAndParseQuarter(
     let rawTimes: (number | null)[]
     let rawFlux: (number | null)[]
     try {
-      const cols = readKeplerLightcurveColumns(fitsBuf, ['TIME', 'PDCSAP_FLUX'])
+      const cols = readMastLightcurveColumns(fitsBuf, ['TIME', 'PDCSAP_FLUX'])
       rawTimes = cols.col1
       rawFlux = cols.col2
     } catch (e) {
-      console.error(`${tag} quarter ${fname} → FITS parse error:`, e)
+      console.error(`${tag} segment ${fname} → FITS parse error:`, e)
       return null
     }
 
@@ -212,13 +285,13 @@ async function fetchAndParseQuarter(
     }
     if (pairs.length < 50) {
       // Used to silently return null here. Make the drop visible so a
-      // missing quarter shows up in the log instead of just shrinking
+      // missing segment shows up in the log instead of just shrinking
       // the success count.
-      console.error(`${tag} quarter ${fname} → only ${pairs.length} valid rows (need 50); dropping`)
+      console.error(`${tag} segment ${fname} → only ${pairs.length} valid rows (need 50); dropping`)
       return null
     }
 
-    // Per-quarter median normalization so concatenated quarters join smoothly
+    // Per-segment median normalization so concatenated segments join smoothly
     const sortedFlux = pairs.map(p => p[1]).sort((a, b) => a - b)
     const median = sortedFlux[Math.floor(sortedFlux.length / 2)] || 1
     return {
@@ -226,31 +299,57 @@ async function fetchAndParseQuarter(
       flux: pairs.map(p => p[1] / median),
     }
   } catch (e) {
-    console.error(`${tag} quarter ${fname} → caught:`, e)
+    console.error(`${tag} segment ${fname} → caught:`, e)
     return null
   }
 }
 
 /**
- * @description Tries to fetch and parse a real Kepler PDC light curve from
- * MAST via the VO-TAP service. One TAP query returns one row per Kepler
- * quarter for the target; we download all `_llc.fits` files in parallel,
- * normalize each by its own median (so quarter seams don't jump), then
- * concatenate and sort by time. This is what makes the famous Tabby's Star
- * dips (Q8, Q16) visible — the first quarter alone is just commissioning
- * data with no anomalies.
- * @param targetName Kepler archive target name (e.g. "kplr008462852").
- * @returns Concatenated multi-quarter light curve, or null on failure.
+ * @description Returns true when an `access_url` points at a PDC
+ * light-curve FITS file for the given mission. Skips target-pixel
+ * files, data-validation reports, etc.
+ *
+ * Mission-specific suffix rules:
+ *   - Kepler: `_llc.fits` (long-cadence light curve).
+ *   - TESS: `_lc.fits` BUT NOT `_dvt.fits` / `_dvm.fits` / etc.
+ *     Note `_llc.fits` (Kepler) contains `_lc.fits` as a substring,
+ *     so the TESS filter has to check the URL ALSO contains `/TESS/`
+ *     or starts with `tess` — otherwise a Kepler URL passed to this
+ *     helper as TESS would incorrectly match.
+ */
+function isPdcLightcurveUrl(url: string, mission: 'Kepler' | 'TESS'): boolean {
+  if (mission === 'Kepler') return url.includes('_llc.fits')
+  // TESS: require `_lc.fits` (which catches both the standard `_s_lc.fits`
+  // and `_a_fast-lc.fits` cases) and a TESS path/filename indicator.
+  if (!url.includes('_lc.fits')) return false
+  if (url.includes('_llc.fits')) return false // Kepler, not TESS
+  if (url.includes('_fast-lc.fits')) return false // 20-second cadence; skip, the 2-min cadence is the main product
+  return url.includes('mast:TESS/') || url.includes('/tess/') || url.includes('/tess20')
+}
+
+/**
+ * @description Tries to fetch and parse a real PDC light curve from MAST
+ * via the VO-TAP service for either Kepler or TESS. One TAP query
+ * returns one row per mission-segment (Kepler quarter / TESS sector)
+ * for the target; we download all the PDC `_lc.fits` / `_llc.fits`
+ * files in parallel, normalize each by its own median (so the seams
+ * don't jump), then concatenate and sort by time. This is what makes
+ * the famous Tabby's Star dips (Q8, Q16) visible — the first quarter
+ * alone is just commissioning data with no anomalies.
+ * @param mission The mission whose collection to query.
+ * @param targetName Archive target name (mission-specific format).
+ * @returns Concatenated multi-segment light curve, or null on failure.
  */
 async function tryFetchRealLightcurve(
+  mission: 'Kepler' | 'TESS',
   targetName: string,
 ): Promise<{ times: number[]; flux: number[] } | null> {
   const tag = '[lightcurve]'
   try {
-    const tapUrl = mastTapQueryUrl(targetName)
-    console.error(`${tag} TAP query URL: ${tapUrl}`)
+    const tapUrl = mastTapQueryUrl(mission, targetName)
+    console.error(`${tag} ${mission} TAP query URL: ${tapUrl}`)
     const tapRes = await fetch(tapUrl, { signal: AbortSignal.timeout(60000) })
-    console.error(`${tag} TAP status: ${tapRes.status} ${tapRes.statusText}`)
+    console.error(`${tag} ${mission} TAP status: ${tapRes.status} ${tapRes.statusText}`)
     if (!tapRes.ok) {
       const body = await tapRes.text().catch(() => '<unreadable>')
       console.error(`${tag} TAP body (first 500): ${body.slice(0, 500)}`)
@@ -271,47 +370,46 @@ async function tryFetchRealLightcurve(
       return null
     }
     const rows = tap.data ?? []
-    console.error(`${tag} TAP returned ${rows.length} rows for ${targetName}`)
+    console.error(`${tag} ${mission} TAP returned ${rows.length} rows for ${targetName}`)
 
-    // Filter to PDC light curves only (skip `_tpf.fits` target pixel files,
-    // which need a completely different extraction pipeline)
+    // Filter to PDC light curves only (skip TPF target-pixel files,
+    // DV reports, etc.)
     const lcUrls: string[] = []
     for (const row of rows) {
       const u = row[accessUrlIdx]
-      if (typeof u === 'string' && u.includes('_llc.fits')) lcUrls.push(u)
+      if (typeof u === 'string' && isPdcLightcurveUrl(u, mission)) lcUrls.push(u)
     }
     // Resolve each TAP `access_url` to its underlying archive filename so
-    // logs identify quarters by their kplrNNNNNNNNN-YYYYDDDHHMMSS_llc.fits
-    // name. Helps diagnose "missing quarters" — if TAP returned only N
-    // rows you'll see exactly which timestamps came back.
+    // logs identify segments by their canonical name. Helps diagnose
+    // "missing segments" — if TAP returned only N rows you'll see
+    // exactly which timestamps came back.
     const lcFilenames = lcUrls.map(u => {
       const m = u.match(/[?&]uri=([^&]+)/)
       const inner = m ? decodeURIComponent(m[1]) : u
       return inner.split('/').pop() ?? inner
     })
+    const segmentLabel = mission === 'Kepler' ? '_llc.fits quarters' : '_lc.fits sectors'
     console.error(
-      `${tag} ${lcUrls.length} _llc.fits quarters to download in parallel: ${lcFilenames.join(', ')}`,
+      `${tag} ${lcUrls.length} ${segmentLabel} to download in parallel: ${lcFilenames.join(', ')}`,
     )
     if (lcUrls.length === 0) return null
 
-    // Download + parse all quarters in parallel
-    const quarters = await Promise.all(lcUrls.map(fetchAndParseQuarter))
-    const ok = quarters.filter((q): q is { times: number[]; flux: number[] } => q !== null)
-    if (ok.length < quarters.length) {
-      // Identify which inputs failed so the user doesn't have to cross-
-      // reference per-quarter error logs with the input list manually.
+    // Download + parse all segments in parallel
+    const segments = await Promise.all(lcUrls.map(fetchAndParseSegment))
+    const ok = segments.filter((q): q is { times: number[]; flux: number[] } => q !== null)
+    if (ok.length < segments.length) {
       const failed: string[] = []
-      quarters.forEach((q, i) => { if (q === null) failed.push(lcFilenames[i]) })
+      segments.forEach((q, i) => { if (q === null) failed.push(lcFilenames[i]) })
       console.error(
-        `${tag} ${ok.length}/${quarters.length} quarters parsed successfully; failed: ${failed.join(', ')}`,
+        `${tag} ${ok.length}/${segments.length} segments parsed successfully; failed: ${failed.join(', ')}`,
       )
     } else {
-      console.error(`${tag} ${ok.length}/${quarters.length} quarters parsed successfully`)
+      console.error(`${tag} ${ok.length}/${segments.length} segments parsed successfully`)
     }
     if (ok.length === 0) return null
 
-    // Sort quarters by first timestamp, then flatten. Within each quarter the
-    // FITS rows are already chronological, so a per-quarter sort isn't needed.
+    // Sort segments by first timestamp, then flatten. Within each segment
+    // the FITS rows are already chronological.
     ok.sort((a, b) => a.times[0] - b.times[0])
     const times: number[] = []
     const flux: number[] = []
@@ -319,9 +417,12 @@ async function tryFetchRealLightcurve(
       times.push(...q.times)
       flux.push(...q.flux)
     }
+    // BKJD for Kepler, TJD for TESS — both are just labels for the raw
+    // time offset reported by the FITS TIME column.
+    const tUnit = mission === 'Kepler' ? 'BKJD' : 'TJD'
     console.error(
-      `${tag} success: ${ok.length} quarters concatenated → ${times.length} samples, ` +
-        `time range BKJD ${times[0].toFixed(1)} → ${times[times.length - 1].toFixed(1)}`,
+      `${tag} ${mission} success: ${ok.length} segments concatenated → ${times.length} samples, ` +
+        `time range ${tUnit} ${times[0].toFixed(1)} → ${times[times.length - 1].toFixed(1)}`,
     )
     return { times, flux }
   } catch (e) {
@@ -331,89 +432,197 @@ async function tryFetchRealLightcurve(
 }
 
 /**
+ * @description Cone-searches MAST for ANY Kepler or TESS light curve
+ * near (ra, dec). Used by the on-demand path for stars without a
+ * KIC/TIC catalog id — we check whether MAST has observed that
+ * patch of sky and, if so, route to the same fetch pipeline.
+ * Returns the first MAST target found (with mission tag), or null
+ * if nothing was observed within the search radius.
+ * @param ra Right ascension in degrees.
+ * @param dec Declination in degrees.
+ * @returns Resolved target spec, or null on miss / TAP failure.
+ */
+async function resolveTargetByPosition(
+  ra: number,
+  dec: number,
+): Promise<{ mission: 'Kepler' | 'TESS'; targetName: string } | null> {
+  const tag = '[lightcurve]'
+  try {
+    const url = mastConeSearchUrl(ra, dec)
+    console.error(`${tag} cone search URL: ${url}`)
+    const res = await fetch(url, { signal: AbortSignal.timeout(30000) })
+    if (!res.ok) {
+      console.error(`${tag} cone search failed: HTTP ${res.status}`)
+      return null
+    }
+    const tap = (await res.json()) as TapResponse
+    const colIdx = Object.fromEntries((tap.info ?? []).map((c, i) => [c.name, i]))
+    const collIdx = colIdx['obs_collection']
+    const tnameIdx = colIdx['target_name']
+    if (collIdx === undefined || tnameIdx === undefined) {
+      console.error(`${tag} cone search missing expected columns`)
+      return null
+    }
+    const rows = tap.data ?? []
+    console.error(`${tag} cone search returned ${rows.length} rows at (${ra}, ${dec})`)
+    if (rows.length === 0) return null
+    // Prefer TESS if both missions have data — broader sky coverage
+    // and shorter cadence make it the better default for the
+    // on-demand path, where the user clicked something the catalogs
+    // didn't already index.
+    let kepler: { mission: 'Kepler'; targetName: string } | null = null
+    let tess: { mission: 'TESS'; targetName: string } | null = null
+    for (const row of rows) {
+      const coll = row[collIdx]
+      const tname = row[tnameIdx]
+      if (typeof tname !== 'string' || tname === '') continue
+      if (coll === 'Kepler' && !kepler) kepler = { mission: 'Kepler', targetName: tname }
+      if (coll === 'TESS' && !tess) tess = { mission: 'TESS', targetName: tname }
+      if (kepler && tess) break
+    }
+    return tess ?? kepler
+  } catch (e) {
+    console.error(`${tag} cone search caught:`, e)
+    return null
+  }
+}
+
+/**
+ * @description Picks the right provenance + gap-day pair for a mission.
+ * @param mission Mission tag from `identifyMastTarget` / cone search.
+ * @returns Provenance and gap-day threshold.
+ */
+function missionMeta(mission: 'Kepler' | 'TESS') {
+  return mission === 'Kepler'
+    ? { provenance: KEPLER_PROVENANCE, gapDays: GAP_DAYS_KEPLER }
+    : { provenance: TESS_PROVENANCE, gapDays: GAP_DAYS_TESS }
+}
+
+/**
+ * @description Successful real-data response shape.
+ */
+function realResponse(
+  data: { times: number[]; flux: number[] },
+  mission: 'Kepler' | 'TESS',
+) {
+  const m = missionMeta(mission)
+  return NextResponse.json({
+    ...data,
+    source: 'real' as const,
+    provenance: m.provenance,
+    mission,
+    gapDays: m.gapDays,
+  })
+}
+
+/**
  * @description GET /api/lightcurve/[id] — returns a star's light curve as
- * JSON. Tries real Kepler PDC data via MAST first. On failure, behavior
- * splits by environment so we never silently serve fake data in production:
- * - `NODE_ENV === 'development'`: returns a synthetic curve with
- *   `source: 'synthetic'` so the dev workflow doesn't depend on the network.
- * - Otherwise: returns empty arrays with `source: 'unavailable'`. The UI
- *   makes this state visible to the user instead of papering over it.
- * @param _req Unused Request object.
+ * JSON. The id determines which path runs:
+ *
+ *   - `KIC{N}` / bare numeric: query MAST Kepler collection.
+ *   - `TIC{N}`: query MAST TESS collection.
+ *   - Anything else (`HIP*`, `SYN*`, etc.): if `?ra=…&dec=…` were
+ *     provided, do a MAST cone search at that position to find any
+ *     observed mission target. Otherwise skip MAST entirely.
+ *
+ * Synthetic fallback policy:
+ *   - On-demand requests (`?onDemand=1`) NEVER receive synthetic data,
+ *     even in dev. They get `source: 'unavailable'` immediately on
+ *     MAST miss. This is the contract for stars the user clicked from
+ *     the Hipparcos background — we promise "real or nothing".
+ *   - Catalog-driven requests (default) get the existing behavior:
+ *     synthetic in dev, unavailable in production.
+ *
+ * @param req Request — we read `ra`/`dec`/`onDemand` from the query string.
  * @param ctx Route context carrying the dynamic `id` segment.
- * @returns JSON `{ times, flux, source: 'real' | 'unavailable' | 'synthetic' }`.
+ * @returns JSON `{ times, flux, source, provenance, mission, gapDays }`.
  */
 export async function GET(
-  _req: Request,
+  req: Request,
   ctx: { params: Promise<{ id: string }> },
 ) {
   const { id } = await ctx.params
   const tag = '[lightcurve]'
-  console.error(`${tag} GET /api/lightcurve/${id} (NODE_ENV=${process.env.NODE_ENV})`)
+  const url = new URL(req.url)
+  const onDemand = url.searchParams.get('onDemand') === '1'
+  const raParam = url.searchParams.get('ra')
+  const decParam = url.searchParams.get('dec')
+  const ra = raParam !== null ? Number(raParam) : NaN
+  const dec = decParam !== null ? Number(decParam) : NaN
+  const havePos = Number.isFinite(ra) && Number.isFinite(dec)
+  console.error(
+    `${tag} GET /api/lightcurve/${id}` +
+      ` (onDemand=${onDemand}, pos=${havePos ? `${ra},${dec}` : 'none'}, NODE_ENV=${process.env.NODE_ENV})`,
+  )
 
-  // L1: in-process cache (instant, lost on restart)
-  if (cache.has(id)) {
-    console.error(`${tag} in-process cache HIT for ${id}`)
-    const cached = cache.get(id)!
-    return NextResponse.json({
-      ...cached,
-      source: 'real' as const,
-      provenance: KEPLER_PROVENANCE,
-    })
-  }
-
-  // L2: disk cache (survives restarts; 7-day TTL)
-  const onDisk = await readDiskCache(id, tag)
-  if (onDisk) {
-    cache.set(id, onDisk) // promote to L1 for the rest of this process
-    return NextResponse.json({
-      ...onDisk,
-      source: 'real' as const,
-      provenance: KEPLER_PROVENANCE,
-    })
-  }
-
-  // Try MAST for any KIC id, not just the 11 hardcoded seeds — the KOI
-  // catalog adds thousands of real Kepler targets and they all have
-  // archived PDC light curves. The MAST cone search will either
-  // return data or 0 rows; either way the fallback path below catches
-  // it. The previous `isKnownAnomaly` gate predated the KOI catalog
-  // and is now obsolete.
-  const targetName = kepidToTargetName(id)
-  if (targetName) {
-    console.error(`${tag} ${id} → Kepler target_name='${targetName}'; querying MAST TAP`)
-    const real = await tryFetchRealLightcurve(targetName)
-    if (real) {
-      console.error(`${tag} returning REAL data for ${id}`)
-      cache.set(id, real)
-      // Fire-and-forget the disk write so we don't delay the response.
-      // Failures inside writeDiskCache are logged but don't bubble up.
-      void writeDiskCache(id, real, tag)
-      return NextResponse.json({
-        ...real,
-        source: 'real' as const,
-        provenance: KEPLER_PROVENANCE,
-      })
+  // Dispatch the id to a mission archive when possible.
+  let target = identifyMastTarget(id)
+  // If we couldn't infer a mission from the id and the caller supplied
+  // a position, cone-search MAST to see whether the patch of sky has
+  // ever been observed. This is the on-demand path for non-catalog
+  // stars (Hipparcos clicks, etc).
+  if (!target && havePos) {
+    console.error(`${tag} ${id} has no mission id; cone-searching at ${ra}, ${dec}`)
+    target = await resolveTargetByPosition(ra, dec)
+    if (target) {
+      console.error(`${tag} cone search resolved ${id} → ${target.mission}/${target.targetName}`)
     }
-    console.error(`${tag} MAST fetch returned null for ${id}`)
-  } else {
-    console.error(`${tag} ${id} is not a parseable KIC id; skipping MAST`)
   }
 
-  if (process.env.NODE_ENV === 'development') {
+  if (target) {
+    // L1: in-process cache (instant, lost on restart). Keyed by id +
+    // mission so that a Kepler hit and a TESS hit at the same RA/Dec
+    // can both cache independently — won't happen often but it's the
+    // right semantics.
+    const cacheKey = `${id}|${target.mission}`
+    if (cache.has(cacheKey)) {
+      console.error(`${tag} in-process cache HIT for ${cacheKey}`)
+      return realResponse(cache.get(cacheKey)!, target.mission)
+    }
+
+    // L2: disk cache (survives restarts; 7-day TTL). Same key.
+    const onDisk = await readDiskCache(cacheKey, tag)
+    if (onDisk) {
+      cache.set(cacheKey, onDisk)
+      return realResponse(onDisk, target.mission)
+    }
+
+    console.error(`${tag} ${id} → ${target.mission} target_name='${target.targetName}'; querying MAST TAP`)
+    const real = await tryFetchRealLightcurve(target.mission, target.targetName)
+    if (real) {
+      console.error(`${tag} returning REAL ${target.mission} data for ${id}`)
+      cache.set(cacheKey, real)
+      void writeDiskCache(cacheKey, real, tag)
+      return realResponse(real, target.mission)
+    }
+    console.error(`${tag} MAST fetch returned null for ${id} (${target.mission})`)
+  } else {
+    console.error(`${tag} ${id} is not a parseable KIC/TIC id and no position supplied; skipping MAST`)
+  }
+
+  // Synthetic fallback — gated. On-demand requests NEVER get synthetic,
+  // even in dev: the user explicitly clicked a star outside the catalog
+  // and the UI should make MAST coverage gaps visible, not paper them
+  // over with fake data.
+  if (process.env.NODE_ENV === 'development' && !onDemand) {
     console.error(`${tag} dev mode → returning SYNTHETIC for ${id}`)
     const synthetic = generateSyntheticLightcurve(id)
     return NextResponse.json({
       ...synthetic,
       source: 'synthetic' as const,
       provenance: SYNTHETIC_PROVENANCE,
+      mission: null,
+      gapDays: GAP_DAYS_KEPLER,
     })
   }
 
-  console.error(`${tag} prod mode → returning UNAVAILABLE for ${id}`)
+  console.error(`${tag} returning UNAVAILABLE for ${id}${onDemand ? ' (onDemand)' : ''}`)
   return NextResponse.json({
     times: [],
     flux: [],
     source: 'unavailable' as const,
     provenance: UNAVAILABLE_PROVENANCE,
+    mission: null,
+    gapDays: GAP_DAYS_KEPLER,
   })
 }

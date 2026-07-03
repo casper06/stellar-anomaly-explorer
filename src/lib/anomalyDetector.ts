@@ -147,42 +147,94 @@ export interface LightcurveProvenance {
  * `source` field tells the UI whether to show a "REAL DATA" or "SYNTHETIC"
  * badge so the user knows what they're looking at; `provenance` carries
  * the human-readable archive/mission/pipeline labels.
+ *
+ * `mission` is the actual archive that served the data ('Kepler' | 'TESS'),
+ * or null when the curve is synthetic / unavailable. `gapDays` is the
+ * recommended threshold (in days) for breaking the canvas line at
+ * observation-gap boundaries — Kepler has 1–4 day inter-quarter gaps so 5
+ * is safe; TESS has more frequent ~1-day sector boundaries so 2 is
+ * tighter and still safely above intra-sector cadence.
  */
 export interface LightcurveResult {
   times: number[]
   flux: number[]
   source: LightcurveSource
   provenance: LightcurveProvenance
+  mission?: 'Kepler' | 'TESS' | null
+  gapDays?: number
+}
+
+/**
+ * @description Options for `fetchLightcurve`. `ra`/`dec` are passed
+ * through to the route as a hint for the cone-search path (stars
+ * without a KIC/TIC id). `onDemand` disables the dev-only synthetic
+ * fallback — required for non-catalog stars, where we promise the
+ * user "real data or unavailable", never fake.
+ */
+export interface FetchLightcurveOptions {
+  ra?: number
+  dec?: number
+  onDemand?: boolean
 }
 
 /**
  * @description Fetches a star's light curve from our `/api/lightcurve/[id]`
- * route. The route tries real Kepler PDC data via MAST first; if MAST is
- * unreachable it returns `'unavailable'` in production or `'synthetic'` in
- * development. This client mirrors the same policy if the route itself is
- * unreachable (e.g. dev server stopped): synthetic in dev, unavailable in
- * production. Synthetic data is NEVER returned in production.
+ * route. The route tries real Kepler or TESS PDC data via MAST first
+ * (mission picked from the id prefix — KIC → Kepler, TIC → TESS). For
+ * ids that don't carry a mission cross-reference (HIP*, SYN*, etc.) we
+ * pass through `ra`/`dec` so the route can cone-search MAST for any
+ * observation at that position.
+ *
+ * If MAST has no data:
+ *   - `onDemand=false` (catalog click): synthetic in dev, unavailable
+ *     in production.
+ *   - `onDemand=true` (clicked a Hipparcos / synthetic star): NEVER
+ *     synthetic — `'unavailable'` immediately, in any environment.
+ *
+ * This client mirrors the route's policy if the route itself is
+ * unreachable (e.g. dev server stopped).
  * @param starId Catalog id (e.g. "KIC8462852").
- * @returns Times (BKJD), normalized flux, and the data source label.
+ * @param opts Optional position hint + on-demand flag.
+ * @returns Times, normalized flux, source, provenance, mission tag,
+ * and the recommended gap-break threshold.
  */
-export async function fetchLightcurve(starId: string): Promise<LightcurveResult> {
+export async function fetchLightcurve(
+  starId: string,
+  opts: FetchLightcurveOptions = {},
+): Promise<LightcurveResult> {
+  const params = new URLSearchParams()
+  if (opts.ra !== undefined && Number.isFinite(opts.ra)) params.set('ra', String(opts.ra))
+  if (opts.dec !== undefined && Number.isFinite(opts.dec)) params.set('dec', String(opts.dec))
+  if (opts.onDemand) params.set('onDemand', '1')
+  const qs = params.toString()
+  const url = `/api/lightcurve/${encodeURIComponent(starId)}${qs ? `?${qs}` : ''}`
   try {
-    const res = await fetch(`/api/lightcurve/${encodeURIComponent(starId)}`)
+    const res = await fetch(url)
     if (!res.ok) throw new Error(`lightcurve route returned ${res.status}`)
     const data = (await res.json()) as LightcurveResult
     return data
   } catch (err) {
     // Surface why we're falling back. Silent synthesis here hides real bugs
     // (CORS, JSON parse, route 500) and makes the UI lie about provenance.
-    console.error(`[fetchLightcurve] /api/lightcurve/${starId} failed, falling back:`, err)
-    if (process.env.NODE_ENV === 'development') {
+    console.error(`[fetchLightcurve] ${url} failed, falling back:`, err)
+    // On-demand never synthesizes; mirror the route's promise.
+    if (process.env.NODE_ENV === 'development' && !opts.onDemand) {
       return {
         ...generateSyntheticLightcurve(starId),
         source: 'synthetic',
         provenance: SYNTHETIC_PROVENANCE,
+        mission: null,
+        gapDays: 5,
       }
     }
-    return { times: [], flux: [], source: 'unavailable', provenance: UNAVAILABLE_PROVENANCE }
+    return {
+      times: [],
+      flux: [],
+      source: 'unavailable',
+      provenance: UNAVAILABLE_PROVENANCE,
+      mission: null,
+      gapDays: 5,
+    }
   }
 }
 
@@ -204,6 +256,13 @@ export const UNAVAILABLE_PROVENANCE: LightcurveProvenance = {
 export const KEPLER_PROVENANCE: LightcurveProvenance = {
   sourceName: 'NASA/MAST',
   mission: 'Kepler',
+  dataType: 'PDCSAP flux',
+}
+
+/** @description Provenance label used for real TESS PDC data from MAST. */
+export const TESS_PROVENANCE: LightcurveProvenance = {
+  sourceName: 'NASA/MAST',
+  mission: 'TESS',
   dataType: 'PDCSAP flux',
 }
 

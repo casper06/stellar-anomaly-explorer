@@ -15,9 +15,15 @@ const LABEL_COLOR: Record<string, string> = {
  * the pen rather than drawing a diagonal stroke across the gap. Kepler
  * intra-quarter cadence is ~30 minutes; inter-quarter gaps are 1–4
  * days; longer gaps (data outages, safe-mode events) also qualify. 5
- * days cleanly separates real observation windows from cadence noise.
+ * days cleanly separates Kepler observation windows from cadence noise.
+ *
+ * TESS uses a shorter threshold (2 days) because sector boundaries
+ * are typically ~1 day apart — at 5 days the canvas would draw a
+ * diagonal stroke across every TESS sector boundary, fusing them
+ * into one continuous line. The effective value is passed in by the
+ * `gapDays` prop (defaults to this Kepler-tuned constant).
  */
-const GAP_DAYS = 5
+const GAP_DAYS_DEFAULT = 5
 
 /**
  * @description Target output point count when LTTB-downsampling the visible
@@ -26,6 +32,19 @@ const GAP_DAYS = 5
  * ~1400-px one.
  */
 const LTTB_TARGET_POINTS = 2000
+
+/**
+ * @description Samples-per-pixel-column threshold above which a segment
+ * switches from the LTTB+dedupe stroke path to a filled envelope band
+ * (per-column min/max fill + median line). At standard Kepler
+ * long-cadence (30 min) and a ~1400-column canvas, a ~1240-day quarter
+ * packs ~40 samples per column; at 8 samples/column even a moderately
+ * quiet star's s2s noise begins to fill in visually. 8 is comfortably
+ * below the observed threshold where the LTTB path produces a blob and
+ * high enough that mid-zoom views (where the line is still readable
+ * point-to-point) stay on the LTTB path.
+ */
+const ENVELOPE_SAMPLES_PER_COL = 8
 
 /**
  * @description Largest-Triangle-Three-Buckets downsampling (Steinarsson 2013).
@@ -168,6 +187,19 @@ interface Props {
    * with their own provenance line beside the chart.
    */
   provenance?: LightcurveProvenance
+  /**
+   * Threshold (in days) above which two consecutive samples should
+   * break the canvas line. Mission-dependent: Kepler quarters → 5;
+   * TESS sectors → 2. Defaults to 5 when omitted so callers that
+   * haven't been updated still get the historical Kepler behavior.
+   */
+  gapDays?: number
+  /**
+   * Label for the time axis; Kepler uses BKJD (Barycentric Kepler
+   * Julian Date, offset from BJD 2454833), TESS uses TJD (offset
+   * from BJD 2457000). Defaults to BKJD for backward compat.
+   */
+  timeUnit?: string
 }
 
 interface Tooltip {
@@ -186,7 +218,12 @@ interface Tooltip {
  * @param dips Detected dips to shade and mark.
  * @returns Canvas + tooltip overlay + color legend.
  */
-export default function LightCurve({ times, flux, dips, width = 460, height = 200, interactive = false, fillContainer = false, provenance }: Props) {
+export default function LightCurve({ times, flux, dips, width = 460, height = 200, interactive = false, fillContainer = false, provenance, gapDays = GAP_DAYS_DEFAULT, timeUnit = 'BKJD' }: Props) {
+  // Local effective gap threshold — Kepler default unless caller
+  // passes the TESS-friendly 2-day value. All gap checks in this file
+  // use `GAP_DAYS` so renaming the prop / constant doesn't fan out
+  // through every reference.
+  const GAP_DAYS = gapDays
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const minimapRef = useRef<HTMLCanvasElement>(null)
   const animRef = useRef<number>(0)
@@ -370,7 +407,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
     }
 
     return result
-  }, [flux, times])
+  }, [flux, times, GAP_DAYS])
 
   // Percentile-based Y range using p2/p98. The previous version capped
   // the range to median ± 0.15 to defend against cosmic-ray survivors,
@@ -393,7 +430,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       }
     }
     return out
-  }, [times])
+  }, [times, GAP_DAYS])
 
   const fluxRange = useMemo(() => {
     const finite = cleanedFlux.filter((f): f is number => f != null)
@@ -464,6 +501,33 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
           if (f == null) continue
           if (f < windowMin) windowMin = f
         }
+        // ALSO fold in the raw flux at every detected dip's minimum
+        // inside the window. `cleanedFlux` sometimes NULLS a real
+        // single-sample transit (Pass 3 of the outlier filter can't
+        // distinguish a legit narrow ~1% dip from an instrument spike
+        // without physical priors). When that happens, the scan above
+        // misses the dip's true depth and the auto-fit Y range clips
+        // the marker off-canvas. Reading `flux` (raw) at `dip.minIdx`
+        // recovers the depth we know is real — the dip detector saw
+        // it in the raw series before the render-time cleanup.
+        for (const dip of dips) {
+          if (dip.peakTime < t0 || dip.peakTime > t1) continue
+          // Anomaly interface exposes peakTime but not minIdx (that's
+          // an internal Dip field). Locate the sample via binary
+          // search on `times`, same as the marker code below.
+          let lo2 = firstIdx
+          let hi2 = lastIdx
+          while (lo2 < hi2) {
+            const mid = (lo2 + hi2) >>> 1
+            if (times[mid] < dip.peakTime) lo2 = mid + 1
+            else hi2 = mid
+          }
+          const idx = lo2
+          if (idx < 0 || idx >= times.length) continue
+          const rawAtDip = flux[idx]
+          if (rawAtDip == null || !Number.isFinite(rawAtDip)) continue
+          if (rawAtDip < windowMin) windowMin = rawAtDip
+        }
         if (windowMin < minF) {
           const range = maxF - windowMin
           minF = windowMin - range * 0.05
@@ -475,7 +539,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
 
       return { W, H, plotW, plotH, minT, maxT, minF, maxF, toX, toY }
     },
-    [viewStartT, viewEndT, viewYMin, viewYMax, fluxRange, times, cleanedFlux, PAD.top, PAD.right, PAD.bottom, PAD.left],
+    [viewStartT, viewEndT, viewYMin, viewYMax, fluxRange, times, cleanedFlux, flux, dips, PAD.top, PAD.right, PAD.bottom, PAD.left],
   )
 
   /**
@@ -534,7 +598,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       ctx.textAlign = 'center'
       ctx.fillStyle = 'rgba(255,255,255,0.2)'
       ctx.font = '8px JetBrains Mono, monospace'
-      ctx.fillText('TIME (BKJD)', PAD.left + plotW / 2, H - 4)
+      ctx.fillText(`TIME (${timeUnit})`, PAD.left + plotW / 2, H - 4)
 
       // Baseline
       ctx.strokeStyle = 'rgba(255,255,255,0.08)'
@@ -653,12 +717,38 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       // pixel space; |y - medianY| has the same ordering as |flux -
       // median| since `toY` is monotonic — no need to thread the raw
       // flux values back through here.
+      //
+      // **Envelope mode (zoomed-out, dense-column path).** When a
+      // segment packs many samples per pixel column, even the
+      // 2-per-column dedupe leaves alternating high/low picks whose
+      // near-vertical strokes fill in as a solid block on quiet
+      // stars where s2s noise consumes a large fraction of the visible
+      // y-range. Standard PDC noise on a 30-min-cadence star is real —
+      // pre-smoothing would attenuate real transits — so instead we
+      // switch to an HONEST envelope viz: a filled min/max band per
+      // pixel column. The eye reads it as "noise range in this window"
+      // rather than a spurious solid line. Dip markers are drawn in a
+      // separate pass below and are unaffected by this mode switch.
       const medianY = toY(fluxRange.median)
       const totalPoints = segments.reduce((s, seg) => s + seg.xs.length, 0)
+      // Collect segments that will use envelope mode; we render them
+      // AFTER the LTTB strokes so envelope bands don't sit under the
+      // line's shadow. (Segments in envelope mode contribute nothing
+      // to the ctx.stroke() call.)
+      const envelopeSegments: { seg: { xs: number[]; ys: number[] } }[] = []
       if (totalPoints > 0) {
         for (const seg of segments) {
           const segLen = seg.xs.length
           if (segLen < 2) continue
+          // Segment's pixel span. Guard against zero-width single-point
+          // segments (segLen>=2 makes this practically safe but the
+          // clamp costs nothing).
+          const segSpanPx = Math.max(1, seg.xs[segLen - 1] - seg.xs[0])
+          const samplesPerCol = segLen / segSpanPx
+          if (samplesPerCol >= ENVELOPE_SAMPLES_PER_COL) {
+            envelopeSegments.push({ seg })
+            continue
+          }
           let segBudget: number
           if (segLen <= plotW / 2 || totalPoints <= LTTB_TARGET_POINTS) {
             // Few enough samples that LTTB has nothing to gain — stroke
@@ -709,6 +799,85 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
       }
       ctx.stroke()
       ctx.shadowBlur = 0
+
+      // Now emit envelope bands for the dense segments. Two paths per
+      // segment:
+      //   1. A translucent cyan fill between per-column min and max.
+      //   2. A thin cyan median line down the middle of the band so
+      //      the curve's trend is still readable at a glance.
+      // We reuse the segment's already-in-pixel-space xs/ys — no need
+      // to bucket into a Map; walking sorted samples and reducing into
+      // a Float32Array pair (minY/maxY per column) is O(N) with tight
+      // memory.
+      if (envelopeSegments.length > 0) {
+        for (const { seg } of envelopeSegments) {
+          const segLen = seg.xs.length
+          const colStart = Math.floor(seg.xs[0])
+          const colEnd = Math.floor(seg.xs[segLen - 1])
+          const nCols = Math.max(1, colEnd - colStart + 1)
+          const minY = new Float32Array(nCols)
+          const maxY = new Float32Array(nCols)
+          const filled = new Uint8Array(nCols)
+          for (let k = 0; k < segLen; k++) {
+            const col = Math.floor(seg.xs[k]) - colStart
+            if (col < 0 || col >= nCols) continue
+            const y = seg.ys[k]
+            if (!filled[col]) {
+              minY[col] = y
+              maxY[col] = y
+              filled[col] = 1
+            } else {
+              if (y < minY[col]) minY[col] = y
+              if (y > maxY[col]) maxY[col] = y
+            }
+          }
+          // Filled band: walk right along the top edge (min y in canvas
+          // space = highest flux, since toY inverts), then left along
+          // the bottom edge, close. Skip empty columns to avoid drawing
+          // spurious bridges (rare — happens only when a column is
+          // entirely null after the outlier filter).
+          ctx.beginPath()
+          let first = true
+          for (let c = 0; c < nCols; c++) {
+            if (!filled[c]) continue
+            const x = colStart + c + 0.5
+            if (first) {
+              ctx.moveTo(x, minY[c])
+              first = false
+            } else {
+              ctx.lineTo(x, minY[c])
+            }
+          }
+          for (let c = nCols - 1; c >= 0; c--) {
+            if (!filled[c]) continue
+            const x = colStart + c + 0.5
+            ctx.lineTo(x, maxY[c])
+          }
+          ctx.closePath()
+          ctx.fillStyle = 'rgba(76, 201, 240, 0.35)'
+          ctx.fill()
+
+          // Median line through the band. (min + max) / 2 in pixel
+          // space is the vertical midpoint — for a symmetric noise
+          // distribution it's a fair proxy for the local median.
+          ctx.beginPath()
+          ctx.strokeStyle = '#4cc9f0'
+          ctx.lineWidth = 1
+          let firstMid = true
+          for (let c = 0; c < nCols; c++) {
+            if (!filled[c]) continue
+            const x = colStart + c + 0.5
+            const midY = (minY[c] + maxY[c]) * 0.5
+            if (firstMid) {
+              ctx.moveTo(x, midY)
+              firstMid = false
+            } else {
+              ctx.lineTo(x, midY)
+            }
+          }
+          ctx.stroke()
+        }
+      }
       ctx.restore()
 
       // Dip markers (only after curve has passed them). Skip dips outside
@@ -752,12 +921,25 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
         const renderList: DipRender[] = []
         // bucket index → winning dip's renderList index
         const bucketWinner = new Map<number, number>()
+        // Plot-rect y bounds for clamping. Dip markers MUST render on
+        // the chart even if the dip's raw flux falls outside the
+        // current Y range (e.g. the user manually zoomed Y past the
+        // dip depth). Clamp to a small inset below the top / above the
+        // bottom so the label still has room. Any dip that's listed
+        // in the panel MUST be visible on the canvas — hiding it
+        // would break the "if it's in the list, it's on the chart"
+        // contract.
+        const clampInsetTop = 12    // room for the label above the dot
+        const clampInsetBottom = 4  // just past the axis line
+        const yMinClamp = PAD.top + clampInsetTop
+        const yMaxClamp = PAD.top + plotH - clampInsetBottom
         for (const dip of dips) {
           if (dip.peakTime < minT || dip.peakTime > maxT) continue
           const x = toX(dip.peakTime)
           const dipFluxIdx = times.findIndex(t => t >= dip.peakTime)
           const dipFlux = dipFluxIdx >= 0 ? flux[dipFluxIdx] : 0.98
-          const y = toY(dipFlux)
+          const rawY = toY(dipFlux)
+          const y = Math.max(yMinClamp, Math.min(yMaxClamp, rawY))
           const idx = renderList.length
           renderList.push({ dip, x, y })
           const bucket = Math.floor(x / bucketWidth)
@@ -788,7 +970,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
         }
       }
     },
-    [times, flux, cleanedFlux, dips, getCanvasCoords, PAD.top, PAD.right, PAD.bottom, PAD.left],
+    [times, flux, cleanedFlux, dips, getCanvasCoords, PAD.top, PAD.right, PAD.bottom, PAD.left, GAP_DAYS],
   )
 
   // Reveal animation: drive `progressRef` 0→1 over 1.8s when the underlying
@@ -1228,7 +1410,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
     ctx.strokeStyle = 'rgba(76,201,240,0.7)'
     ctx.lineWidth = 1
     ctx.strokeRect(wx1 + 0.5, 0.5, Math.max(1, wx2 - wx1 - 1), H - 1)
-  }, [times, cleanedFlux, fluxRange, viewStartT, viewEndT, fullStart, fullEnd])
+  }, [times, cleanedFlux, fluxRange, viewStartT, viewEndT, fullStart, fullEnd, GAP_DAYS])
 
   // Redraw minimap whenever data or window changes
   useEffect(() => {
@@ -1370,7 +1552,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
             Score: {Math.round(tooltip.dip.score * 100)}%<br />
             Depth: -{(tooltip.dip.depth * 100).toFixed(2)}%<br />
             Duration: {tooltip.dip.duration.toFixed(2)}d<br />
-            Peak: {tooltip.dip.peakTime.toFixed(2)} BKJD
+            Peak: {tooltip.dip.peakTime.toFixed(2)} {timeUnit}
           </div>
         </div>
       )}
@@ -1404,6 +1586,7 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
         <PinnedDipTooltip
           dip={pinnedDip}
           provenance={provenance}
+          timeUnit={timeUnit}
           onDismiss={() => setPinnedDip(null)}
         />
       )}
@@ -1438,10 +1621,12 @@ export default function LightCurve({ times, flux, dips, width = 460, height = 20
 function PinnedDipTooltip({
   dip,
   provenance,
+  timeUnit,
   onDismiss,
 }: {
   dip: Anomaly
   provenance?: LightcurveProvenance
+  timeUnit: string
   onDismiss: () => void
 }) {
   const accent = LABEL_COLOR[dip.label]
@@ -1488,7 +1673,7 @@ function PinnedDipTooltip({
         Score: {Math.round(dip.score * 100)}%<br />
         Depth: −{(dip.depth * 100).toFixed(2)}%<br />
         Duration: {dip.duration.toFixed(2)} d<br />
-        Peak: {dip.peakTime.toFixed(2)} BKJD
+        Peak: {dip.peakTime.toFixed(2)} {timeUnit}
       </div>
       {provenance && (
         <div

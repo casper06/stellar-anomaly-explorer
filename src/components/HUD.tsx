@@ -3,6 +3,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { useStore, type Star } from '@/lib/store'
 import { KNOWN_ANOMALIES } from '@/lib/starCatalog'
 import { ALL_QUADRANT_IDS, quadrantCenter } from '@/lib/quadrants'
+import StarSearch from './StarSearch'
+import { selectStarAndFetchCurve } from '@/lib/selectStar'
 
 /**
  * @description Threshold (degrees, camera FOV) below which the quadrant
@@ -154,8 +156,6 @@ export default function HUD() {
     requestFlyTo,
     visitedIds,
     flaggedIds,
-    setSelectedStar,
-    setMode,
   } = useStore()
 
   // Transient toast for "NO ANOMALIES IN VIEW" feedback. Local state with
@@ -311,14 +311,17 @@ export default function HUD() {
           background: 'linear-gradient(180deg, rgba(0,0,0,0.8) 0%, transparent 100%)',
         }}
       >
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: 3, color: 'white' }}>
-              STELLAR ANOMALY EXPLORER
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 20, flex: 1, minWidth: 0 }}>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: 3, color: 'white' }}>
+                STELLAR ANOMALY EXPLORER
+              </div>
+              <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginTop: 2 }}>
+                KEPLER · TESS · GAIA · HIPPARCOS
+              </div>
             </div>
-            <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginTop: 2 }}>
-              KEPLER · TESS · GAIA · HIPPARCOS
-            </div>
+            <StarSearch />
           </div>
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 1 }}>
@@ -516,8 +519,10 @@ export default function HUD() {
           anomalyStars={anomalyStars}
           onFlyTo={(star) => {
             requestFlyTo(star.ra, star.dec)
-            setSelectedStar(star)
-            setMode('analyze')
+            // Full selection flow — otherwise the AnomalyPanel would
+            // open on the flagged star while showing the light curve
+            // from whatever was selected before.
+            void selectStarAndFetchCurve(star)
           }}
         />
         <QuadrantPanel

@@ -12,6 +12,7 @@ import {
 import HUD from '@/components/HUD'
 import AnomalyPanel from '@/components/AnomalyPanel'
 import { useStore } from '@/lib/store'
+import type { CurvePattern } from '@/lib/curveClassifier'
 
 const StarField = dynamic(() => import('@/components/StarField'), { ssr: false })
 
@@ -44,6 +45,7 @@ export default function Home() {
   const setToiError = useStore(s => s.setToiError)
   const setAnomalyStars = useStore(s => s.setAnomalyStars)
   const hydratePersistedSets = useStore(s => s.hydratePersistedSets)
+  const setClassifiedPatterns = useStore(s => s.setClassifiedPatterns)
 
   // One-shot rehydration of visited/flagged sets from localStorage.
   // Runs only on the client (useEffect doesn't fire during SSR), so
@@ -51,6 +53,30 @@ export default function Home() {
   useEffect(() => {
     hydratePersistedSets()
   }, [hydratePersistedSets])
+
+  // Sky-radar hydration: pull whatever the server-side pattern cache
+  // has and stash it in the store so the StarField overlay can tint
+  // classified markers on first paint. Best-effort — if the endpoint
+  // is down or empty the sky still renders in the un-tinted default
+  // color scheme. Runs once at mount; the lazy fill-in path from
+  // selectStar keeps the local map current from there.
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/pattern-cache')
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`pattern-cache HTTP ${r.status}`))))
+      .then((data: { entries?: Record<string, { pattern: string }> }) => {
+        if (cancelled || !data.entries) return
+        const map = new Map<string, CurvePattern>()
+        for (const [id, entry] of Object.entries(data.entries)) {
+          if (entry && typeof entry.pattern === 'string') {
+            map.set(id, entry.pattern as CurvePattern)
+          }
+        }
+        setClassifiedPatterns(map)
+      })
+      .catch(err => { console.warn('[pattern-cache] hydrate failed', err) })
+    return () => { cancelled = true }
+  }, [setClassifiedPatterns])
 
   useEffect(() => {
     let cancelled = false
