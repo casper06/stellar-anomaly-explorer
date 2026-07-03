@@ -1102,7 +1102,17 @@ function CameraSync({ stars }: { stars: CatalogStar[] }) {
   const { camera } = useThree()
   const { selectedStar, setCameraTarget, setZoom } = useStore()
   const flyTo = useStore(s => s.flyTo)
-  const autoSelectedRef = useRef<string | null>(null)
+  // Id of the anomaly inside the auto-select cone (within
+  // `halfFov * 0.5` of center) as of the previous frame, or null when
+  // none was. Auto-select fires only on a TRANSITION of this value to
+  // a new star — i.e. camera movement bringing a different anomaly to
+  // center. It must NEVER fire because `selectedStar` changed out from
+  // under it: an explicit pick (popover row, direct click) of an
+  // off-center star leaves the centered anomaly unchanged, so with
+  // transition semantics the pick survives. The previous design
+  // (guard ref synced to `selectedStar`) re-armed on every explicit
+  // pick and stole the selection back within one frame.
+  const centeredAnomalyRef = useRef<string | null>(null)
   // Timestamp of the most recent fly-to command. Auto-select is
   // suppressed until this many ms have passed, giving the tween time
   // to arrive without any intermediate frame's `closest` anomaly
@@ -1130,22 +1140,14 @@ function CameraSync({ stars }: { stars: CatalogStar[] }) {
   // fly-to path passes within `halfFov * 0.5` of a different
   // anomaly. Verified failure case: search picks K02357.02
   // (KIC7449554); K07016.01 (KIC8311864) sits 2.36° away; at FOV≤28°
-  // (auto-select threshold) `halfFov*0.5 = 7°` easily catches it,
-  // and the identity guard doesn't help because the two stars have
-  // different ids.
+  // (auto-select threshold) `halfFov*0.5 = 7°` easily catches it.
+  // The transition guard alone wouldn't cover this: mid-tween the
+  // centered anomaly genuinely changes frame to frame, so those ARE
+  // transitions — the time window is still needed to mute them.
   useEffect(() => {
     if (!flyTo) return
     flyToSuppressUntilRef.current = performance.now() + 1300
   }, [flyTo])
-
-  // Keep the identity guard in sync with any external selection so
-  // manual zoom/pan onto the SAME anomaly the user just picked
-  // doesn't re-fire auto-select once the suppression window
-  // expires. This is the pre-existing guard's original purpose — the
-  // fly-to window above is the new belt.
-  useEffect(() => {
-    if (selectedStar) autoSelectedRef.current = selectedStar.id
-  }, [selectedStar])
 
   useFrame(() => {
     const dir = new THREE.Vector3()
@@ -1169,12 +1171,24 @@ function CameraSync({ stars }: { stars: CatalogStar[] }) {
       }
       // Within ~½ of the current half-FOV → centered enough to lock on
       const halfFovRad = (fov / 2) * (Math.PI / 180)
-      if (closest && closestAngle < halfFovRad * 0.5 && autoSelectedRef.current !== closest.star.id) {
-        autoSelectedRef.current = closest.star.id
-        void selectStarAndFetchCurve(closest.star)
+      const centeredId =
+        closest && closestAngle < halfFovRad * 0.5 ? closest.star.id : null
+      // Fire only when the centered anomaly TRANSITIONS to a new star.
+      // A frame where the centered star is unchanged never fires — no
+      // matter what `selectedStar` is — so an explicit pick of an
+      // off-center star (popover row, direct click) is never stolen
+      // back by whatever happens to sit at screen center.
+      if (centeredId !== centeredAnomalyRef.current) {
+        centeredAnomalyRef.current = centeredId
+        if (centeredId && closest && centeredId !== selectedStar?.id) {
+          void selectStarAndFetchCurve(closest.star)
+        }
       }
     } else if (fov > AUTO_SELECT_FOV) {
-      if (!selectedStar) autoSelectedRef.current = null
+      // Wide FOV = outside the auto-select regime. Reset so zooming
+      // back in re-evaluates from scratch (a fresh transition onto
+      // whatever is centered then).
+      centeredAnomalyRef.current = null
     }
   })
 

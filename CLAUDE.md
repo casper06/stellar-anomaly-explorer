@@ -575,6 +575,53 @@ ANOMALY ▸` — those are "position the camera on a star"
 gestures, not "open its analysis panel" gestures; the user still
 has to click through if they want the light curve.
 
+**Selection staleness guard**: `selectStarAndFetchCurve` claims a
+module-level `selectionGeneration` counter at entry; after its
+`fetchLightcurve` await resolves it only writes lightcurve/anomaly
+state (and only clears `lightcurveLoading`) if it is STILL the
+latest generation. Without this, two racing selections (explicit
+pick immediately followed by auto-select, or rapid clicks while
+the MAST cold path takes ~60s) let whichever fetch resolves LAST
+win the store — pairing star A's panel header with star B's curve.
+The synchronous pre-fetch writes (`setSelectedStar`, `markVisited`,
+`setLightcurveLoading(true)`) are intentionally unguarded: the
+latest call always runs them last.
+
+### Auto-select on center (CameraSync) — transition semantics
+`CameraSync` in StarField.tsx auto-selects an anomaly when the user
+is zoomed in (FOV ≤ `AUTO_SELECT_FOV = 28`) and an anomaly sits
+within `halfFov * 0.5` of screen center. Two guards keep it from
+stealing explicit selections; both are needed, they cover different
+failure shapes:
+
+1. **Transition guard** (`centeredAnomalyRef`): auto-select fires
+   ONLY when the id of the centered anomaly CHANGES from the
+   previous frame — i.e. camera movement brought a *different*
+   anomaly to center. A frame where the centered star is unchanged
+   never fires, no matter what `selectedStar` is. This is what lets
+   an explicit pick of an OFF-CENTER star survive (disambiguation
+   popover row, direct click): the pick changes `selectedStar` but
+   not the centered star, so no transition, no override. The
+   previous design (a guard ref synced to `selectedStar` via
+   useEffect) re-armed on every explicit pick — `ref` became the
+   picked id, the centered star's id then differed, and auto-select
+   stole the selection back within one frame. Symptoms: popover
+   pick "didn't register" (snapped back to the already-selected
+   centered star) or "opened a different star". The ref resets to
+   null at FOV > 28 so zooming back in re-evaluates fresh.
+2. **Fly-to suppression window** (`flyToSuppressUntilRef`): any
+   `flyTo` command mutes auto-select for ~1.3s (tween is ~1s).
+   The transition guard alone can't cover this: mid-tween the
+   centered anomaly GENUINELY changes frame to frame, so those are
+   real transitions. Verified failure case without it: search picks
+   K02357.02 (KIC7449554); K07016.01 sits 2.36° away and gets
+   latched mid-flight.
+
+Consequence of (1): after an explicit off-center pick, ANY camera
+rotation that changes which anomaly is centered will fire auto-
+select and replace the selection. That's the feature's intent
+("zoomed in + centered = lock on"), accepted behavior.
+
 ### Anomaly cycle navigation
 Two HUD buttons cycle through the merged KOI catalog. Both fall back
 to the 11 hardcoded `KNOWN_ANOMALIES` while the KOI fetch is still
