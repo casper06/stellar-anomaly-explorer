@@ -14,6 +14,18 @@ import { selectStarAndFetchCurve } from '@/lib/selectStar'
  */
 const QUADRANT_PANEL_FOV_THRESHOLD = 45
 
+/**
+ * @description Horizontal clearance (CSS px) applied to the bottom-right
+ * HUD stack (FlaggedPanel + QuadrantPanel column, and the Minimap) while
+ * the AnomalyPanel is open. The AnomalyPanel is a fixed 300px-wide
+ * right-edge column at z-index 20; the HUD root sits at z-index 10, so
+ * without this offset every bottom-right HUD element is rendered
+ * UNDERNEATH the open panel — invisible and unclickable (clicking the
+ * flagged list while a star was selected silently hit the panel
+ * instead). 300px panel + the standard 24px gutter.
+ */
+const PANEL_CLEARANCE_RIGHT = 324
+
 const ONBOARDING_KEY = 'sae:onboarded:v1'
 
 const ONBOARDING_STEPS = [
@@ -505,7 +517,12 @@ export default function HUD() {
         style={{
           position: 'absolute',
           bottom: 130,
-          right: 24,
+          // Slide clear of the AnomalyPanel when it's open — otherwise
+          // this whole stack sits under the panel (z 10 vs 20) and the
+          // flagged list can't be seen or clicked while a star is
+          // selected.
+          right: selectedStar ? PANEL_CLEARANCE_RIGHT : 24,
+          transition: 'right 0.25s ease',
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'flex-end',
@@ -539,6 +556,7 @@ export default function HUD() {
         ra={cameraTarget.ra}
         dec={cameraTarget.dec}
         onPick={(targetRa, targetDec) => requestFlyTo(targetRa, targetDec)}
+        panelOpen={selectedStar !== null}
       />
 
       {/* Selected star label */}
@@ -576,16 +594,20 @@ export default function HUD() {
  * @param ra Current camera RA in degrees [0, 360).
  * @param dec Current camera Dec in degrees [-90, 90].
  * @param onPick Called with the RA/Dec corresponding to the clicked pixel.
+ * @param panelOpen Whether the AnomalyPanel is open; shifts the map left
+ * by `PANEL_CLEARANCE_RIGHT` so it isn't buried under the panel.
  * @returns Absolutely-positioned 160×80 minimap with a title row above.
  */
 function Minimap({
   ra,
   dec,
   onPick,
+  panelOpen,
 }: {
   ra: number
   dec: number
   onPick: (ra: number, dec: number) => void
+  panelOpen: boolean
 }) {
   const W = 160
   const H = 80
@@ -641,7 +663,8 @@ function Minimap({
       style={{
         position: 'absolute',
         bottom: 24,
-        right: 24,
+        right: panelOpen ? PANEL_CLEARANCE_RIGHT : 24,
+        transition: 'right 0.25s ease',
       }}
     >
       <div

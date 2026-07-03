@@ -788,6 +788,17 @@ next selection).
   hardcoded `bottom` swaps when expanded, which collided when both
   were active.
 
+  **Panel clearance**: while a star is selected, the column AND the
+  Minimap shift left to `right: PANEL_CLEARANCE_RIGHT = 324` (0.25s
+  ease). The AnomalyPanel is a 300px-wide right-edge column at
+  z-index 20; the HUD root is z-index 10, so at `right: 24` every
+  bottom-right HUD element rendered UNDERNEATH the open panel —
+  invisible, and clicks aimed at the flagged list silently hit the
+  panel instead (reported as "clicking a flagged star does
+  nothing"). The data path was never at fault: FlaggedPanel rows
+  always went through `selectStarAndFetchCurve`; the click just
+  never reached the row while the panel was open.
+
 **Bookmark button in AnomalyPanel**: next to the star name in the
 header, before the data-source badge. Outline ☆ when unflagged,
 solid ★ (white) when flagged. Clicking toggles
