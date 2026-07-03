@@ -15,8 +15,18 @@ import type { Dip } from './anomalyDetector'
  *   floor.
  * - `SPARSE`: fewer than three dips, not enough to characterize a
  *   pattern.
+ * - `UNCERTAIN`: the raw periodicity/consistency numbers looked good
+ *   but the candidate period is physically implausible (below the
+ *   shortest confirmed transiting-planet period) or the dip cadence
+ *   is high enough to suggest we're locking onto sampling noise
+ *   rather than a real signal.
  */
-export type CurvePattern = 'PERIODIC_UNIFORM' | 'IRREGULAR' | 'HIGH_VARIABILITY' | 'SPARSE'
+export type CurvePattern =
+  | 'PERIODIC_UNIFORM'
+  | 'IRREGULAR'
+  | 'HIGH_VARIABILITY'
+  | 'SPARSE'
+  | 'UNCERTAIN'
 
 /**
  * @description Descriptive shape of the dominant dips in a light curve.
@@ -128,6 +138,26 @@ const SHAPE_FLANK_SAMPLES = 3
 const SHAPE_VOTE_TOP_N = 5
 
 /**
+ * @description Shortest period we're willing to call a real signal, in
+ * days. The record-holding confirmed transiting exoplanet (K2-137 b) sits
+ * near 0.18 d; 0.2 d gives a small margin below that. A "best-fit
+ * period" below this floor is far more likely to be the classifier
+ * locking onto Kepler's ~0.0204 d cadence (or a low multiple of it)
+ * because a noisy star triggered many near-consecutive dips.
+ */
+const MIN_PLAUSIBLE_PERIOD_DAYS = 0.2
+
+/**
+ * @description Maximum plausible number of dips per day of coverage. A
+ * planet on a 0.2-day orbit still only transits ~5×/day. Anything
+ * substantially above that (we use 8) means the dip detector is being
+ * driven by baseline flicker crossing threshold repeatedly, not by
+ * astrophysical events. When crossed, the pattern label is downgraded
+ * to UNCERTAIN regardless of periodicity / consistency scores.
+ */
+const MAX_DIPS_PER_DAY = 8
+
+/**
  * @description Computes a `CurveProfile` from a light curve and its
  * detected dips. All four measurements (periodicity, depth
  * consistency, dip shape, baseline RMS) are derived from the input
@@ -165,11 +195,31 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
   const depthConsistency = computeDepthConsistency(dipsByTime)
   const dipShape = computeDipShape(times, flux, dipsByTime)
 
+  // Coverage in days is used by the dip-density sanity check. Falls
+  // back to a positive floor so single-sample edge cases don't divide
+  // by zero.
+  const first = dipsByTime[0].peakTime
+  const last = dipsByTime[dipsByTime.length - 1].peakTime
+  const coverageDays = Math.max(1, last - first)
+
   const pattern = pickPattern({
     periodicity,
     depthConsistency,
     baselineRMS,
+    bestFitPeriodDays,
+    dipCount,
+    coverageDays,
   })
+
+  // Surface the "best-fit period" ONLY when the pattern label is
+  // PERIODIC_UNIFORM. Outside that branch the candidate period is
+  // meaningless — and displaying it CONTRADICTS the label. The previous
+  // gate (`pattern !== 'UNCERTAIN' && periodicity >= threshold`) leaked
+  // exactly that case: Tabby's Star measures periodicity 0.601 with
+  // depthConsistency 0, labels IRREGULAR, and still surfaced a
+  // physically implausible 0.307 d period next to the IRREGULAR badge.
+  // Pinned by the KIC8462852 fixture in the data regression test.
+  const reportedPeriod = pattern === 'PERIODIC_UNIFORM' ? bestFitPeriodDays : null
 
   return {
     pattern,
@@ -177,38 +227,59 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
     depthConsistency,
     dipShape,
     baselineRMS,
-    // Only surface the period when periodicity is confident enough
-    // to mean anything — a "best-fit period" with 12% periodicity
-    // would be more misleading than useful.
-    bestFitPeriodDays: periodicity >= PERIODIC_THRESHOLD ? bestFitPeriodDays : null,
+    bestFitPeriodDays: reportedPeriod,
     dipCount,
   }
 }
 
 /**
- * @description Picks the descriptive pattern label from the three
- * computed scalars. `HIGH_VARIABILITY` takes precedence whenever the
- * baseline is noisier than `HIGH_VARIABILITY_RMS` — a noisy
- * backdrop makes any pattern call unreliable, so we surface the
- * noise first. Otherwise `PERIODIC_UNIFORM` if both periodicity and
- * depth consistency are above their thresholds, else `IRREGULAR`.
- * @param scores Periodicity, depth consistency, and baseline RMS.
+ * @description Picks the descriptive pattern label from the computed
+ * scalars plus two sanity checks that guard against locking onto
+ * sampling noise. `HIGH_VARIABILITY` takes precedence whenever the
+ * baseline is noisier than `HIGH_VARIABILITY_RMS` — a noisy backdrop
+ * makes any pattern call unreliable, so we surface the noise first.
+ *
+ * Sanity checks (both applied when the raw scores WOULD produce
+ * `PERIODIC_UNIFORM`):
+ * 1. If the best-fit period is below `MIN_PLAUSIBLE_PERIOD_DAYS`, the
+ *    classifier is almost certainly folding to Kepler's cadence
+ *    (~0.02 d) or a low multiple of it — downgrade to `UNCERTAIN`.
+ * 2. If dip density exceeds `MAX_DIPS_PER_DAY`, dip detection is being
+ *    driven by baseline flicker rather than real events — downgrade
+ *    to `UNCERTAIN`.
+ * Otherwise `PERIODIC_UNIFORM` if both periodicity and depth
+ * consistency are above their thresholds, else `IRREGULAR`.
+ * @param scores Measured scalars plus the candidate period, dip count,
+ * and observation coverage (days spanned by the dips).
  * @returns The CurvePattern label.
  */
 function pickPattern({
   periodicity,
   depthConsistency,
   baselineRMS,
+  bestFitPeriodDays,
+  dipCount,
+  coverageDays,
 }: {
   periodicity: number
   depthConsistency: number
   baselineRMS: number
+  bestFitPeriodDays: number | null
+  dipCount: number
+  coverageDays: number
 }): CurvePattern {
   if (baselineRMS >= HIGH_VARIABILITY_RMS) return 'HIGH_VARIABILITY'
-  if (
+  const wouldBePeriodic =
     periodicity >= PERIODIC_THRESHOLD &&
     depthConsistency >= DEPTH_CONSISTENCY_THRESHOLD
-  ) return 'PERIODIC_UNIFORM'
+  if (wouldBePeriodic) {
+    if (
+      bestFitPeriodDays !== null &&
+      bestFitPeriodDays < MIN_PLAUSIBLE_PERIOD_DAYS
+    ) return 'UNCERTAIN'
+    if (dipCount / coverageDays > MAX_DIPS_PER_DAY) return 'UNCERTAIN'
+    return 'PERIODIC_UNIFORM'
+  }
   return 'IRREGULAR'
 }
 

@@ -32,15 +32,19 @@ src/
     layout.tsx            # JetBrains Mono, metadata
     globals.css           # Reset, black background, scrollbar
     api/
-      stars/route.ts            # Proxies VizieR Hipparcos catalog (avoids CORS)
-      lightcurve/[id]/route.ts  # Fetches & parses Kepler PDC FITS from MAST
-      koi/route.ts              # Proxies NASA Exoplanet Archive KOI cumulative table
-      toi/route.ts              # Proxies NASA Exoplanet Archive TOI catalog (TESS)
+      stars/route.ts                 # Proxies VizieR Hipparcos catalog (avoids CORS)
+      lightcurve/[id]/route.ts       # Fetches & parses Kepler PDC FITS from MAST
+      koi/route.ts                   # Proxies NASA Exoplanet Archive KOI cumulative table
+      toi/route.ts                   # Proxies NASA Exoplanet Archive TOI catalog (TESS)
+      pattern-cache/route.ts         # GET/POST sky-radar precomputed pattern cache
+      batch-classify/route.ts        # POST start / stop the batch classifier
+      batch-classify/status/route.ts # GET live progress of the batch job
   components/
     StarField.tsx         # 3D sky with Three.js — THE MAIN COMPONENT
     HUD.tsx               # Overlay UI (header, crosshair, counter, minimap, onboarding)
     AnomalyPanel.tsx      # Side panel shown when a star is selected
     LightCurve.tsx        # Canvas 2D light curve chart
+    StarSearch.tsx        # Header search field + suggestion dropdown
   lib/
     starCatalog.ts        # Catalog client (calls /api/stars; synthetic fallback)
     anomalyDetector.ts    # Dip detection + lightcurve client (calls /api/lightcurve)
@@ -49,6 +53,9 @@ src/
     quadrants.ts          # 6×6 Kepler-field grid (A1–F6); RA/Dec ↔ quadrant id
     persistence.ts        # localStorage Set helpers (visited / flagged)
     curveClassifier.ts    # Descriptive light-curve profile (periodicity / shape / RMS)
+    patternCache.ts       # Server-side pattern cache read/write (pattern-cache.json)
+    batchClassifier.ts    # Shared runtime state + worker for the batch classify job
+    selectStar.ts         # Shared "select + fly + fetch curve" flow used by clicks and search
 ```
 
 ## UI language
@@ -100,10 +107,13 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 - Persistent visited (`sae_visited`) and flagged (`sae_flagged`) sets in localStorage. Visited anomalies render at 0.5 opacity so unvisited ones stand out; flagged stars get a white ring overlay. Bookmark (★) toggle in the AnomalyPanel; collapsible FLAGGED list panel in the HUD with click-to-fly-and-select
 - Global progress bar in the header: `EXPLORED: N / TOTAL (P.P%)` based on intersection of visited set and anomaly subset
 - Light-curve classifier (`lib/curveClassifier.ts`): measures periodicity, depth consistency, dominant dip shape (U/V), and baseline RMS for each curve. Surfaces a descriptive pattern label (PERIODIC_UNIFORM / IRREGULAR / HIGH_VARIABILITY / SPARSE) in the fullscreen overlay's top-left readout. Strictly descriptive — never asserts a physical cause
+- **TESS light curves**: `/api/lightcurve` fetches both Kepler quarters (KIC/kepid → `kplrNNNNNNNNN`) and TESS sectors (TIC → bare integer target_name). Same FITS reader (`readMastLightcurveColumns`) — verified same BINTABLE + column names. Mission-aware gap threshold: 5 days for Kepler quarters, 2 days for TESS sectors. Axis label switches BKJD ↔ TJD based on which mission served the data.
+- **On-demand analysis for any star**: VIEW LIGHT CURVE is always visible in the AnomalyPanel — even for Hipparcos background stars. The route position-cone-searches MAST when the id isn't a KIC/TIC/EPIC catalog id; if nothing was observed at that position the panel shows "DATA UNAVAILABLE — this star has not been observed by Kepler or TESS". On-demand fetches NEVER return synthetic data, in any environment.
+- **Selection reticle in the 3D sky**: a "you are here" cyan crosshair-in-ring marker that follows the currently-selected star at any FOV. Distinct from the flagged white ring (thinner/static/anomaly-only) and the anomaly pulse (mission-colored, FOV-gated). Clears when the AnomalyPanel is closed.
 - First-run onboarding overlay (persists dismissal in localStorage)
 - FOV-based zoom (wheel changes camera FOV, telescope-style) with damping
 - Drag to rotate the view (OrbitControls, keyboard disabled)
-- Click-to-select via native raycasting; opens AnomalyPanel
+- Click-to-select via native raycasting; opens AnomalyPanel. Dense-field disambiguation: when a click hits 2+ stars within a 6-CSS-pixel screen radius, a popover appears at the click site listing each candidate (name, ΔRA/ΔDec from the clicked sky position in arcminutes) so the user can pick the intended one. Clicking off-card dismisses without selecting.
 - Star visualization SVG (radial gradient by B-V + corona + anomaly ring)
 - Glossary tooltips (?) for MAG/RA/DEC/COLOR/DIP/SCORE/DEPTH/DURATION/BKJD
 
@@ -222,70 +232,150 @@ of 11 when missing. `colorIndex` defaults to 0.65 (solar-yellow) since
 TAP doesn't return photometric color.
 
 ### `/api/lightcurve/[id]`
-- For any parseable KIC id (`KIC{N}` string or numeric kepid): maps via
-  `kepidToTargetName(id)` to Kepler's archive convention
-  `kplrNNNNNNNNN` (9-digit zero-padded), then runs one ADQL query
-  against the MAST VO-TAP service
-  (`https://mast.stsci.edu/vo-tap/api/v0.1/caom/sync`) on the
-  `ivoa.obscore` view filtering by `target_name`. Each row returns a
-  direct `access_url` to a Kepler quarter's `_llc.fits`. The previous
-  `isKnownAnomaly` gate (limiting MAST fetches to the 11 hardcoded
-  seeds) was removed when the KOI catalog landed — any of the
-  ~6,000 KOIs can now return real Kepler PDC data. Stars that aren't
-  in MAST simply get the no-data fallback path.
-- **Downloads ALL quarters in parallel** (up to 100, capped in the TAP `TOP`),
-  parses each FITS for `TIME` + `PDCSAP_FLUX` via `lib/fitsReader.ts`,
-  normalizes each quarter by its own median (so seams don't jump), then
-  concatenates and sorts by time. This is what makes the famous Tabby's
-  Star dips visible — they're in Q8 (BKJD ~793) and Q16 (BKJD ~1519); the
-  first quarter alone is just commissioning data with no anomalies.
-- The TAP `access_url` points at the MAST portal Download proxy which
-  returns 400 Bad Request as of 2026 — we extract the embedded `uri=`
-  param and download directly from `archive.stsci.edu` over HTTPS.
-- Response shape: `{ times: number[], flux: number[], source: 'real' | 'unavailable' | 'synthetic', provenance: { sourceName, mission, dataType } }`
-- **Two-level cache** (Kepler PDC files are static, so caching is safe):
-  - **L1 in-process** `Map<id, {times, flux}>` — instant, but lost on
-    every dev-server restart.
-  - **L2 disk** at `<os.tmpdir()>/stellar-cache/{id}.json` with a
-    **7-day TTL** (`stat.mtimeMs` vs `Date.now()`). Survives restarts.
-    Atomic writes via temp-file + rename so a crash mid-write can't
-    leave a corrupt JSON on disk. The id is sanitized
-    (`/[^A-Za-z0-9_-]/g → _`) so unexpected characters can't escape
-    the cache directory.
-  - Request order: L1 → L2 (promotes to L1 on hit) → MAST. Only
-    successful full-concatenation results are written; never empty
-    arrays or partial fetches. The disk write is fire-and-forget
-    (`void writeDiskCache(...)`) so it doesn't delay the response.
-- First real fetch can take 30–90s (parallel download of ~17 FITS files,
-  ~80KB each); subsequent ones are instant from cache — even after a
-  dev-server restart, thanks to L2.
-- Do NOT use the legacy `mast.stsci.edu/api/v0/invoke` Mashup endpoint — it
-  hangs indefinitely as of 2026. The VO-TAP service is the replacement.
-- **Per-quarter diagnostic logging**: when a quarter fails to download
-  or parse, the log line names it by filename
-  (`kplrNNNNNNNNN-YYYYDDDHHMMSS_llc.fits`) plus the failure reason
-  (HTTP status, parse error, or "too few valid rows"). Aggregate
-  success log also lists the *failed* filenames when any drop out, so
-  "missing quarters" can be diagnosed from a single log read without
-  cross-referencing per-quarter errors with the input list.
+Serves BOTH Kepler and TESS PDC light curves via one route. Dispatch
+based on id prefix — `identifyMastTarget(id)` returns
+`{ mission, targetName }` or null:
+- **`KIC{N}` / bare numeric** → Kepler collection. `targetName =
+  kplrNNNNNNNNN` (9-digit zero-padded). Verified against MAST VO-TAP.
+- **`TIC{N}`** → TESS collection. `targetName` is the **bare TIC
+  integer** (no `TIC` prefix, no padding — verified live; the padded
+  or prefixed forms return zero rows in `ivoa.obscore`).
+- **Anything else** (HIP*, SYN*, EPIC*, etc.) → null → the route
+  falls through to the on-demand cone search if `?ra=…&dec=…` were
+  provided, else returns `unavailable` immediately.
+
+**Query params**:
+- `ra`, `dec` — position hint. Required by the on-demand path (any
+  id not KIC/TIC) so the route can cone-search MAST for coverage.
+- `onDemand=1` — disables the dev-only synthetic fallback even in
+  dev. The client sets this whenever the star id is NOT a
+  KIC/TIC/EPIC catalog id, so Hipparcos background clicks get "real
+  data or unavailable" and never fake output.
+
+**Fetch pipeline** (one ADQL query per mission target, ~1 sync round-
+trip):
+- `SELECT TOP 100 obs_id, access_url, access_format FROM ivoa.obscore
+  WHERE obs_collection='<Kepler|TESS>' AND dataproduct_type='timeseries'
+  AND target_name='<targetName>'`
+- Filter response rows to PDC lightcurve files: `_llc.fits` for
+  Kepler, `_lc.fits` for TESS. TESS filter also rejects
+  `_fast-lc.fits` (20-second cadence — we use the 2-min standard) and
+  `_llc.fits` (which contains `_lc.fits` as a substring but is
+  Kepler). URL / path must include a TESS indicator (`mast:TESS/`,
+  `/tess/`, `/tess20…`) to distinguish.
+- Download all segments in parallel (up to 100 — TESS continuous-
+  viewing-zone stars can have 50+ sectors). Parse each via
+  `lib/fitsReader.ts` (same reader for both missions — verified same
+  BINTABLE structure and same `TIME` + `PDCSAP_FLUX` column names).
+  Normalize each segment by its own median (Kepler throughput and
+  TESS pointing/aperture drift both cause seam jumps).
+- TESS access_urls use a `mast:TESS/product/…` URI scheme. The route
+  rewrites them to `https://mast.stsci.edu/api/v0.1/Download/file?uri=…`
+  (the Download API accepts the raw `mast:` URI). Kepler URLs use
+  `archive.stsci.edu` paths via the existing `uri=` extraction.
+- Kepler quarters carry `TIME = BJD − 2454833` (BKJD); TESS sectors
+  carry `TIME = BJD − 2457000` (TJD). Both are just linear day
+  offsets for the consumer — dip detection and gap detection work
+  identically, only the axis label differs.
+
+**Cone-search fallback** (on-demand path): when `identifyMastTarget`
+returns null but `ra`/`dec` are supplied, run
+`resolveTargetByPosition` — a `CONTAINS(POINT, CIRCLE(ra, dec, 0.001°))`
+ADQL query across BOTH Kepler and TESS collections. If any row
+comes back, use its `target_name` and `obs_collection` as if it were
+a KIC/TIC id and continue through the fetch pipeline. Prefers TESS
+when both missions cover the position (broader sky coverage, more
+current).
+
+**Response shape**:
+```
+{
+  times: number[],
+  flux: number[],
+  source: 'real' | 'unavailable' | 'synthetic',
+  provenance: { sourceName, mission, dataType },
+  mission: 'Kepler' | 'TESS' | null,
+  gapDays: number   // 5 for Kepler, 2 for TESS
+}
+```
+
+**`gapDays`** is the recommended canvas-line-break threshold in days.
+Kepler has 1–4 day inter-quarter gaps → 5 is safe. TESS sector
+boundaries are typically ~1 day → 2 is tighter and still safely
+above the 2-min intra-sector cadence. If Kepler's 5-day threshold
+were used for TESS the canvas would draw a diagonal line across
+every sector boundary, fusing them.
+
+**Two-level cache** (both mission PDC products are static, so
+caching is safe):
+- **L1 in-process** `Map<key, {times, flux}>` keyed by
+  `<id>|<mission>`. Instant, lost on dev-server restart.
+- **L2 disk** at `<os.tmpdir()>/stellar-cache/<key>.json` with a
+  **7-day TTL**. Same atomic-write pattern. The mission tag in the
+  key means a Kepler hit and a TESS hit at the same star can cache
+  independently — rare but the right semantics.
+
+**L2 entries are schema-versioned** (`CACHE_SCHEMA_VERSION` in the
+route; currently 1). Each entry stores `schemaVersion`, `fetchedAt`
+(ISO timestamp), `sampleCount`, and `segmentFiles` (the archive
+filenames that parsed successfully) BEFORE the times/flux arrays, so
+`head`-ing the JSON answers "when / which schema / which segments"
+without parsing megabytes. On read, an entry whose `schemaVersion`
+doesn't match the current constant (including pre-versioning entries
+with none) is logged and treated as a MISS — refetched, never
+served. **Bump the constant whenever the fetch pipeline changes in a
+way that can alter the arrays** (segment filtering, per-segment
+normalization, stitching, FITS parsing, TAP query). Why this exists:
+during the 2026-06/07 dev period, 7-day-TTL entries written by older
+route iterations kept being served after the code changed —
+K02357.02's dip measured 1.08% deep from a stale-provenance entry vs
+1.00% from a fresh fetch (leave-one-quarter-out testing ruled out
+MAST segment availability: it moves depth ≤0.0001 pp). Versioning
+eliminates mixed-provenance data as a class. L1 needs no version —
+it dies with the process that wrote it.
+
+**Per-segment diagnostic logging**: when a segment fails to download
+or parse, the log line names it by filename plus the failure reason.
+Aggregate success log also lists the *failed* filenames when any
+drop out, so "missing segments" can be diagnosed from a single log
+read. Log prefix includes mission tag.
+
+Do NOT use the legacy `mast.stsci.edu/api/v0/invoke` Mashup endpoint —
+it hangs indefinitely as of 2026. The VO-TAP service is the
+replacement for both Kepler and TESS.
 
 ### Fallback policy (important)
-**Synthetic data is never shown to production users.** When the real MAST
-fetch fails:
-- `NODE_ENV === 'development'` → returns `generateSyntheticLightcurve(id)` with
-  `source: 'synthetic'` so the local dev workflow doesn't depend on a network
-  round-trip to MAST.
-- Otherwise → returns `{ times: [], flux: [], source: 'unavailable' }`. No
-  fake curve is substituted; the UI must surface this state to the user.
+**Synthetic data is never shown to production users, and never for
+on-demand clicks in any environment.** When the real MAST fetch fails:
+- Catalog stars (KIC/TIC/EPIC), `NODE_ENV === 'development'` →
+  returns `generateSyntheticLightcurve(id)` with `source: 'synthetic'`
+  so the local dev workflow doesn't depend on a network round-trip
+  to MAST. This is the ONLY case that produces synthetic data.
+- Catalog stars, production → `source: 'unavailable'`.
+- **On-demand stars** (`?onDemand=1`, set when the id is not
+  KIC/TIC/EPIC) → `source: 'unavailable'` in EVERY environment,
+  even dev. The user explicitly clicked a Hipparcos background
+  star; the UI promises "real data or a clear 'not observed'
+  message", never fake. Enforced in both the route and the client
+  (`fetchLightcurve` mirror).
 
-The client `fetchLightcurve` mirrors the same policy if the route itself is
-unreachable (dev server stopped, etc).
+The client `fetchLightcurve(id, { ra, dec, onDemand })` passes
+through to the route with matching query params. `StarField.selectStar`
+sets `onDemand: !/^(KIC|TIC|EPIC)\d+$/.test(id)` and always includes
+the star's RA/Dec so the cone-search path has what it needs.
 
 ### `lib/fitsReader.ts`
-- Server-side only, no dependencies; ~150 lines hand-rolled FITS BINTABLE reader
-- Only supports the types Kepler files use (`D`, `E`, `J`, `I`)
-- Walks HDUs to find the first BINTABLE, then reads two named columns
-- DO NOT import this from client code (uses Node Buffer)
+- Server-side only, no dependencies; ~150 lines hand-rolled FITS BINTABLE reader.
+- Supports the types Kepler AND TESS PDC files use (`D`, `E`, `J`, `I`).
+  Both mission products share the same HDU layout, the same BINTABLE
+  structure, and the same `TIME` / `PDCSAP_FLUX` column names —
+  verified against a live TESS `_lc.fits` sample. Only the TIME
+  offset differs (Kepler = BJD−2454833 = BKJD; TESS = BJD−2457000 =
+  TJD), and the consumer treats time as opaque days.
+- Exported as `readMastLightcurveColumns` (renamed from the earlier
+  `readKeplerLightcurveColumns` when TESS support landed).
+- Walks HDUs to find the first BINTABLE, then reads two named columns.
+- DO NOT import this from client code (uses Node Buffer).
 
 ### Dip detector calibration
 `detectDips()` in `lib/anomalyDetector.ts` is tuned against real Kepler
@@ -351,6 +441,205 @@ All three are valid. The first two answer "how big is each mission's
 catalog?", the third answers "is there something interesting in this
 specific star's light curve?". HUD's `MissionCount` helper renders
 the per-mission rows.
+
+### Sky radar (precomputed classifier patterns)
+A cross-session cache of `CurvePattern` results, driving an extra
+tint layer over the anomaly markers so the user can see which stars
+have already been classified — and which pattern they landed in —
+without opening each light curve.
+
+**Persistence** (`lib/patternCache.ts`, server-side): single JSON
+file at `<os.tmpdir()>/stellar-cache/pattern-cache.json`, shape
+`{ entries: { [starId]: { pattern, computedAt } } }`. No TTL — a
+star's PDC data doesn't change over time, so cached patterns live
+until manually deleted. Full ~9k-star population is ~500 KB; we
+rewrite the whole file on every mutation (atomic temp+rename, same
+pattern as the lightcurve cache). Concurrent writers serialize
+through a `writeChain` promise so batch + organic fill can't race.
+
+**Endpoints**:
+- **GET `/api/pattern-cache`** → `{ entries }`. Read once by
+  `page.tsx` on mount and stashed in the store's `classifiedPatterns`
+  Map<starId, CurvePattern>. Payload is small enough that
+  streaming/paginating adds no value.
+- **POST `/api/pattern-cache`** with `{ starId, pattern }` → the
+  lazy fill-in write path. Called from `selectStar` in StarField
+  after any organic click that produces a `profile`. Server-side
+  uses `onlyIfMissing: true` so the batch job's fresh entry wins
+  when both paths race on the same star.
+- **POST `/api/batch-classify`** → starts the batch. Idempotent
+  (a POST while a run is in flight returns `{ started: false,
+  alreadyRunning: true }`). When body is empty the route pulls
+  the KOI + TOI catalogs from our own `/api/koi` + `/api/toi`
+  and uses their union as input.
+- **POST `/api/batch-classify?action=stop`** → cancels the run
+  after the current chunk. No-op if nothing is running.
+- **GET `/api/batch-classify/status`** → live progress snapshot:
+  `{ running, processed, total, currentStar, startedAt,
+  lastUpdatedAt, lastError, succeeded, skippedNoData, errored }`.
+  Poll every few seconds during a run.
+
+**Batch behavior** (`lib/batchClassifier.ts`):
+- Detached async worker running inside the Next.js server process.
+  Killing the process ends it; a page reload does NOT.
+- **Resumable**: at start time we read the current pattern cache
+  and skip any star already present. Restarting after an
+  interruption picks up where the last run left off. Progress
+  counters reflect the FULL input length (already-cached stars
+  count as "processed").
+- Reuses `/api/lightcurve` end-to-end for each fetch, so the
+  batch is essentially a bulk pre-warm of the lightcurve disk
+  cache AND the pattern cache simultaneously. When the batch
+  hits a star that's already in the lightcurve L2 cache
+  (previous cold fetch), classification is near-instant
+  (~10ms) — otherwise it pays the cold MAST round-trip.
+- `MAX_CONCURRENCY = 5` in-flight fetches at a time, with a
+  `BATCH_DELAY_MS = 250` pause between chunks to avoid bursting
+  MAST. Adjust in-source only; not exposed as a runtime param.
+- Stars where MAST returned `source: 'unavailable'` are skipped
+  silently (counted in `skippedNoData`) — no pattern cache
+  entry is written. Next batch will retry them.
+- Full ~9k-star cold pass: **realistic ~28 hours** (14–40h
+  range depending on how many stars hit the disk cache). Meant
+  to run as a background overnight job, resumable across
+  sessions. Progress is durable to the disk cache so a Ctrl-C
+  loses at most `MAX_CONCURRENCY` in-flight stars.
+
+**Client rendering** (`PatternRadarMarkers` in StarField.tsx):
+- Extra `<points>` overlay layer drawn just after `AnomalyMarkers`
+  and before `SelectionMarker`. One `<points>` mesh per pattern
+  bucket (IRREGULAR / PERIODIC_UNIFORM / HIGH_VARIABILITY); SPARSE
+  and UNCERTAIN intentionally have NO radar entry — the
+  classifier is admitting it can't tell, so those stars keep their
+  plain mission-color marker with no tint.
+- Colors: **IRREGULAR** = `#ff2ea6` (bright magenta, "worth a
+  closer look"), **PERIODIC_UNIFORM** = `#4ade80` (dim green,
+  "boring, known"), **HIGH_VARIABILITY** = `#facc15` (dim yellow,
+  "noisy backdrop").
+- Sits at `STAR_SPHERE_RADIUS - 3` so the radar dot always draws on
+  top of the anomaly cores at −1. `depthTest: false + depthWrite:
+  false` avoids Z-fighting at near-equal radii.
+- Follows the same FOV tier gates as `AnomalyMarkers` — hidden at
+  FOV ≥ ANOMALY_HARD_CUTOFF_FOV = 55° (so the wide-view sky doesn't
+  gain a rash of new colored dots), linear fade across 40°–50°,
+  full opacity below 40°.
+- Static-latch pattern (`isStaticRef`) mirrors the anomaly layer:
+  material size/opacity are mutated ONCE on the transition into
+  wide-FOV, then the useFrame short-circuits.
+
+**Kicking off the batch** (dev-only; no user-facing UI):
+```
+# Start (no body → auto-loads KOI + TOI catalog):
+curl -X POST http://localhost:3000/api/batch-classify
+
+# Or start with an explicit star list:
+curl -X POST http://localhost:3000/api/batch-classify \
+  -H 'content-type: application/json' \
+  -d '{"stars":[{"id":"KIC8462852","ra":301.5642,"dec":44.4567}]}'
+
+# Poll progress:
+curl -s http://localhost:3000/api/batch-classify/status | jq
+
+# Stop the run (finishes current chunk, then exits):
+curl -X POST "http://localhost:3000/api/batch-classify?action=stop"
+```
+
+### Star search (header search field)
+`<StarSearch>` in the HUD header lets the user find a specific star
+by identifier when they don't want to hunt through the sky. Input
+sits next to the app title, dropdown appears below at ≥2 chars.
+
+**Match rules** (`rank()` in `StarSearch.tsx`, lower is better):
+- 0 — exact match on `id` OR `name` (after normalization).
+- 1 — prefix match on either.
+- 2 — substring match on either.
+- 3 — KOI/TOI "stem" match: query contains `.` and the pre-dot
+  segment equals the star name's pre-dot segment. Handles the
+  after-dedupe gap where the sibling KOI name is what got stored
+  (catalog stores one KOI per KIC — the highest-scoring sibling
+  wins in `fetchKOICatalog`, which can be `.01`, `.02`, or higher
+  depending on which planet scored best). Example: on KIC7449554
+  the raw KOI catalog carries both `K02357.01` (score 0.999) and
+  `K02357.02` (score 1.000), so `.02` wins the dedupe; searching
+  `K02357.01` still finds the star via the stem `K02357`.
+
+Normalization strips non-alphanumeric-dot characters and
+lowercases, so `KIC 8462852`, `kic8462852`, `KIC-8462852`, etc. all
+key the same way.
+
+**Search dataset**: `anomalyStars` from the store (post-KOI+TOI merge,
+plus the 11 `KNOWN_ANOMALIES` seeds like "Tabby's Star"). Hipparcos
+background stars are NOT searchable — their names are literal
+`"Star 3421"` placeholders and would clutter the dropdown without
+being findable by a human-meaningful query.
+
+**Interaction**:
+- ≥2 chars → dropdown; typing debounced 120 ms.
+- ↓ / ↑ move highlight, Enter selects, Esc dismisses.
+- Click a row → picks; click outside → dismisses.
+
+**On select**: calls `selectStarAndFetchCurve(star)` from
+`lib/selectStar.ts` — the shared "fly + selectStar + fetch
+lightcurve + classify + write pattern cache" flow. Every entry
+point that opens the AnomalyPanel with a new star routes through
+this same helper (sky click, click disambiguation popover, auto-
+select-on-center, search dropdown pick, FlaggedPanel row click).
+StarField.tsx used to carry an in-file copy of the same logic; it
+was deleted when FlaggedPanel was fixed so there's only one
+source of truth going forward. `QuadrantPanel` and the Minimap
+click do NOT select a star (they navigate the camera to a REGION,
+not to a specific target), so they intentionally stay on plain
+`requestFlyTo`. Same for `GO TO NEAREST ANOMALY` and `NEXT
+ANOMALY ▸` — those are "position the camera on a star"
+gestures, not "open its analysis panel" gestures; the user still
+has to click through if they want the light curve.
+
+**Selection staleness guard**: `selectStarAndFetchCurve` claims a
+module-level `selectionGeneration` counter at entry; after its
+`fetchLightcurve` await resolves it only writes lightcurve/anomaly
+state (and only clears `lightcurveLoading`) if it is STILL the
+latest generation. Without this, two racing selections (explicit
+pick immediately followed by auto-select, or rapid clicks while
+the MAST cold path takes ~60s) let whichever fetch resolves LAST
+win the store — pairing star A's panel header with star B's curve.
+The synchronous pre-fetch writes (`setSelectedStar`, `markVisited`,
+`setLightcurveLoading(true)`) are intentionally unguarded: the
+latest call always runs them last.
+
+### Auto-select on center (CameraSync) — transition semantics
+`CameraSync` in StarField.tsx auto-selects an anomaly when the user
+is zoomed in (FOV ≤ `AUTO_SELECT_FOV = 28`) and an anomaly sits
+within `halfFov * 0.5` of screen center. Two guards keep it from
+stealing explicit selections; both are needed, they cover different
+failure shapes:
+
+1. **Transition guard** (`centeredAnomalyRef`): auto-select fires
+   ONLY when the id of the centered anomaly CHANGES from the
+   previous frame — i.e. camera movement brought a *different*
+   anomaly to center. A frame where the centered star is unchanged
+   never fires, no matter what `selectedStar` is. This is what lets
+   an explicit pick of an OFF-CENTER star survive (disambiguation
+   popover row, direct click): the pick changes `selectedStar` but
+   not the centered star, so no transition, no override. The
+   previous design (a guard ref synced to `selectedStar` via
+   useEffect) re-armed on every explicit pick — `ref` became the
+   picked id, the centered star's id then differed, and auto-select
+   stole the selection back within one frame. Symptoms: popover
+   pick "didn't register" (snapped back to the already-selected
+   centered star) or "opened a different star". The ref resets to
+   null at FOV > 28 so zooming back in re-evaluates fresh.
+2. **Fly-to suppression window** (`flyToSuppressUntilRef`): any
+   `flyTo` command mutes auto-select for ~1.3s (tween is ~1s).
+   The transition guard alone can't cover this: mid-tween the
+   centered anomaly GENUINELY changes frame to frame, so those are
+   real transitions. Verified failure case without it: search picks
+   K02357.02 (KIC7449554); K07016.01 sits 2.36° away and gets
+   latched mid-flight.
+
+Consequence of (1): after an explicit off-center pick, ANY camera
+rotation that changes which anomaly is centered will fire auto-
+select and replace the selection. That's the feature's intent
+("zoomed in + centered = lock on"), accepted behavior.
 
 ### Anomaly cycle navigation
 Two HUD buttons cycle through the merged KOI catalog. Both fall back
@@ -435,6 +724,37 @@ animation). Hidden at FOV ≥ ANOMALY_TIER_HIGH_FOV so the wide
 view doesn't gain noise just because the user flagged things.
 Flagged+visited overlap shows BOTH effects: dim core + white ring.
 
+**Selection reticle (`<SelectionMarker />`)** — a "you are here"
+overlay drawn at the currently-`selectedStar` position, distinct
+from every other marker so a user in a dense field never loses
+track of what they clicked. Rendered as a single `<points>` mesh
+using a procedural 128×128 sprite (`makeReticleTexture`): a solid
+white ring with four short crosshair ticks poking inward and a
+subtle cyan halo. Material is bright cyan (`#4cc9f0`) with
+additive blending so it pops against dark space and dense
+backgrounds. `useFrame` breathes the size ±15% and modulates
+opacity 0.55–0.9 on offset sine phases at `SELECTION_PULSE_OMEGA
+= 2π/2.2s` — slower than the anomaly pulse (`2π/1.5s`) so the two
+read as distinct when they co-occur on a flagged/anomaly star
+that's ALSO the current selection.
+
+**Visible at ALL FOVs** — unlike the anomaly pulse (gated at 40°/
+50°/55°), the reticle renders at any zoom level. The user needs to
+find their selection regardless of how far out they've zoomed. A
+gentle `fovBoost` (1× at FOV_MAX, up to 1.6× at narrow FOV) keeps
+it proportional to the star point as the user zooms in.
+
+Rendered AFTER `AnomalyMarkers` in the Canvas tree so it draws on
+top of any anomaly pulse at the same position. `depthTest: false`
+guarantees the reticle stays visible even when a Hipparcos
+foreground star might otherwise occlude it (all `Points` sit at
+`STAR_SPHERE_RADIUS`, but Z-fighting near equal radii is
+unpredictable). Position buffer is a single `Float32Array(3)`
+mutated in place via a `useEffect([selectedStar])` — no full mesh
+remount on selection change. Renders `size=0 opacity=0` when
+`selectedStar` is null (mesh stays mounted but invisible for the
+next selection).
+
 **HUD additions** (`components/HUD.tsx`):
 - **Global progress bar** in the header row: thin cyan bar +
   `EXPLORED: N / TOTAL (P.P%)` label. Count is the INTERSECTION
@@ -467,6 +787,17 @@ Flagged+visited overlap shows BOTH effects: dim core + white ring.
   Previous layout used two absolutely-positioned siblings with
   hardcoded `bottom` swaps when expanded, which collided when both
   were active.
+
+  **Panel clearance**: while a star is selected, the column AND the
+  Minimap shift left to `right: PANEL_CLEARANCE_RIGHT = 324` (0.25s
+  ease). The AnomalyPanel is a 300px-wide right-edge column at
+  z-index 20; the HUD root is z-index 10, so at `right: 24` every
+  bottom-right HUD element rendered UNDERNEATH the open panel —
+  invisible, and clicks aimed at the flagged list silently hit the
+  panel instead (reported as "clicking a flagged star does
+  nothing"). The data path was never at fault: FlaggedPanel rows
+  always went through `selectStarAndFetchCurve`; the click just
+  never reached the row while the panel was open.
 
 **Bookmark button in AnomalyPanel**: next to the star name in the
 header, before the data-source badge. Outline ☆ when unflagged,
@@ -703,9 +1034,14 @@ a conclusion.
 3. `SPARSE` if dip count < `MIN_DIPS_FOR_PATTERN = 3`.
 4. `IRREGULAR` otherwise.
 
-`bestFitPeriodDays` is only surfaced when `periodicity ≥ 0.5` —
-reporting a period under that threshold would be more misleading
-than useful.
+`bestFitPeriodDays` is only surfaced when the pattern label is
+`PERIODIC_UNIFORM` — outside that branch the candidate period is
+meaningless and displaying it contradicts the label. (The earlier
+gate was `periodicity ≥ 0.5` + not-UNCERTAIN, which leaked the
+contradiction on Tabby's Star: periodicity 0.601 with
+depthConsistency 0 → IRREGULAR, yet a bogus 0.307 d period rendered
+next to the IRREGULAR badge. Fixed 2026-07-03; pinned by the
+KIC8462852 fixture in the data regression test.)
 
 **Flow:** `selectStar` in `StarField.tsx` calls `classifyCurve`
 after `detectDips`, stuffs the result into `lightcurve.profile`,
@@ -716,6 +1052,44 @@ best-fit period when present + dips counted, with a one-line
 descriptive note keyed off the pattern. `profile` is `null` when
 the lightcurve source is `'unavailable'` (no data to classify) —
 the readout returns null in that case.
+
+### Data regression test (`npm run test:data`)
+`src/lib/__tests__/dataRegression.test.ts` runs `detectDips` +
+`classifyCurve` against four frozen real-data fixtures
+(`src/lib/__tests__/fixtures/*.json.gz`, gzipped MAST Kepler PDC
+curves captured 2026-07-02/03) and compares to hand-verified
+expected values (dip count, pattern label, top-dip label / peak
+time / depth, best-fit period). Fails loudly (per-field diff +
+exit 1) on any drift.
+
+**Run it BEFORE and AFTER any change to** `anomalyDetector.ts`,
+`curveClassifier.ts`, `fitsReader.ts`, or the `/api/lightcurve`
+fetch/normalization layer. Plain Node ≥ 22.6 executes the TS via
+native type stripping — no test framework, no extra deps
+(`allowImportingTsExtensions` was added to tsconfig for the `.ts`
+imports; the two libs under test import nothing but types).
+
+After an INTENTIONAL algorithm change: `npm run test:data -- --print`
+dumps the newly-measured values; re-verify them by hand, then update
+`EXPECTED` in the test file.
+
+Fixtures: Tabby's Star (KIC8462852 — 9 dips, D1519 −20.7% top),
+K02357.02 (KIC7449554 — 1 dip, NOTABLE, t=1273.1, SPARSE),
+K00931.01 (KIC9166862 — 351 dips ≈ NASA's 3.856 d period over the
+baseline; hand-verified via transit-count agreement), K01725.01
+(KIC10905746 — 53 variability dips, UNCERTAIN via the
+implausible-period guard; its real 0.15% transits are below the 1%
+dip threshold).
+
+One KNOWN classifier quirk is deliberately frozen by the
+expectations (changing it should trip the test so it's a conscious
+decision): K00931.01, a textbook periodic transiter, computes
+periodicity ≈ 0.4996 — a hair under the 0.5 cutoff — and
+therefore labels IRREGULAR with no period. (A second quirk —
+Tabby's IRREGULAR profile surfacing a meaningless 0.307 d best-fit
+period — was FIXED on 2026-07-03: the classifier now returns a
+period only for PERIODIC_UNIFORM, and the KIC8462852 fixture
+asserts `bestFitPeriodDays: null` so it can't regress.)
 
 ### Interactive LightCurve mode
 `<LightCurve interactive />` (used in the fullscreen overlay) adds:
@@ -897,6 +1271,93 @@ When source is `'unavailable'`:
 - Stars MUST render as `Points` with `BufferGeometry`, NEVER as individual meshes
 - With 8000+ stars individual meshes destroy the GPU
 - Anomaly halos are a second `Points` layer on top, animated via `useFrame`
+
+### Click disambiguation (`ClickRaycastBridge` + `ClickDisambiguationPopover`)
+Dense KOI/TOI clusters often stack multiple stars onto the same
+screen pixel. Single-hit raycasting was silently picking whichever
+sample the raycaster returned first — the user had no signal that
+other stars were there. Fix:
+
+1. `raycaster.intersectObject(mesh)` returns EVERY hit along the
+   ray (already does; we just weren't using them all).
+2. For each hit, project the STAR'S OWN world position (read from
+   the geometry position buffer at `hit.index`) to screen space via
+   `camera.project` + NDC-to-CSS-pixels, and compute the Euclidean
+   distance from the click point in CSS pixels.
+   **Pitfall (was a live bug)**: do NOT project `intersection.point`
+   — for `THREE.Points`, raycasting sets it to the closest point ON
+   THE RAY (`Ray.closestPointToPoint`), not the star's position, so
+   it projects back onto the click pixel for every hit. With that,
+   the 6px screen filter passed EVERYTHING inside the world-space
+   Points threshold (~0.5° of sky at the star-sphere radius) and
+   dense-field popovers listed 20–30 "candidates" up to ~27′ from
+   the cursor, all reading 0.0px. Measured on a fixed 16-click grid
+   over the Kepler field at FOV ≈ 24°: before = 10/16 popovers,
+   5–30 candidates (mean 15.6); after = 5/16 popovers, 2–4
+   candidates, the rest direct-select.
+3. Keep only hits within `CLICK_DISAMBIG_RADIUS_PX = 6`. That's the
+   direct "clicked on this spot" filter — wider world-space
+   raycaster thresholds catch stars that are far off in perspective
+   at narrow FOV; this filter re-anchors to what the user actually
+   clicked.
+4. **0 candidates**: fall back to the single closest-to-ray hit
+   (`distanceToRay`) so a slightly-off click still selects
+   something — matches the old edge-case behavior.
+5. **1 candidate**: select immediately, no UI change.
+6. **2+ candidates**: open `<ClickDisambiguationPopover>` at the
+   click coordinates. Popover lists each candidate sorted by
+   ascending screen distance, showing name · ΔRA · ΔDec, where the
+   deltas are the star's angular offset from the clicked sky
+   position in arcminutes (ΔRA cos δ-corrected, RA-seam-wrapped;
+   sub-0.1′ values get two decimals). The previous mag · px columns
+   rendered identically for every row in dense KOI stacks (mag 13.5
+   · 0.0px — the KOI default magnitude and a sub-pixel projected
+   distance) and gave zero signal to tell candidates apart;
+   `screenDistPx` is still computed as the sort key, just not
+   displayed. Click a row → select + close. Click the backdrop →
+   close without selecting.
+
+The popover's backdrop is a full-viewport transparent
+`position: fixed` layer that captures React `onClick` to dismiss.
+The card `stopPropagation`s its own click so backdrop dismiss
+doesn't fire from a card click.
+
+**Native-event isolation** (this was a real bug for one iteration):
+the outer container registers NATIVE `pointerdown`/`pointerup`
+listeners on its root div via `addEventListener` — those don't
+participate in React's synthetic-event tree, so React
+`stopPropagation` on the backdrop does NOT stop them from
+firing on bubble. First attempt at fixing this attached a native
+`stopPropagation` listener on the backdrop; but the backdrop
+sits BELOW the react root, and React 17+ delegates its synthetic
+events on the root, so stopping propagation at the backdrop
+prevented the row's `onClick` from firing at all — the whole
+popover broke.
+
+Correct fix: the container's native `pointerdown`/`pointerup`
+listeners check `disambigOpenRef.current` and bail immediately
+when the popover is open. The ref mirrors the `disambig` state
+via a `useEffect([disambig])`, so the ONE stable listener stays
+correct without re-binding on every open/close. While the
+popover is up:
+- Container pointerdown → skip (no `downPosRef` update).
+- Container pointerup → skip (picker never fires, no raycaster,
+  no `selectStar` on the star underneath the popover).
+- Row `onClick` fires normally in React's synthetic tree →
+  `onPick(star)` → correct selection.
+- Backdrop `onClick` fires when the click misses the card →
+  dismiss without selecting.
+
+This makes "no event reaches the raycaster while the popover is
+open" literal, and preserves React's synthetic event flow for
+the popover's own interactions.
+
+Popover position is clamped to `viewport - card size - 8px` so
+clicks near the bottom-right edge don't push the card off-screen.
+
+No fetching happens until the user picks — the raycaster + reproject
+pass is pure computation, and `selectStar` (which triggers the MAST
+fetch) only fires from the row-click handler.
 
 ### Camera / zoom model
 - Camera orbits the origin at a tiny `CAMERA_RADIUS = 0.1`

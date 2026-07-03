@@ -19,6 +19,7 @@ const GLOSSARY: Record<string, string> = {
   DEPTH: 'Dip depth: percentage of light lost relative to normal brightness.',
   DURATION: 'Dip duration in days.',
   BKJD: 'Barycentric Kepler Julian Date: time system used by the Kepler telescope.',
+  TJD: 'TESS Julian Date: time system used by the TESS telescope (BJD − 2457000).',
 }
 
 /**
@@ -324,6 +325,8 @@ function LightCurveFullscreen({
   dips,
   provenance,
   profile,
+  gapDays,
+  timeUnit,
   onClose,
 }: {
   starName: string
@@ -333,6 +336,8 @@ function LightCurveFullscreen({
   dips: Anomaly[]
   provenance?: LightcurveProvenance
   profile: CurveProfile | null
+  gapDays?: number
+  timeUnit?: string
   onClose: () => void
 }) {
   useEffect(() => {
@@ -464,6 +469,8 @@ function LightCurveFullscreen({
             interactive
             fillContainer
             provenance={provenance}
+            gapDays={gapDays}
+            timeUnit={timeUnit}
           />
         </div>
 
@@ -543,6 +550,11 @@ const PATTERN_COPY: Record<CurvePattern, { label: string; note: string; color: s
     label: 'SPARSE',
     note: 'Too few dips detected to characterize a pattern.',
     color: 'rgba(255,255,255,0.4)',
+  },
+  UNCERTAIN: {
+    label: 'UNCERTAIN',
+    note: 'Pattern detected may be sampling noise rather than a real signal — period is below plausible transit timescales.',
+    color: '#f4a261',
   },
 }
 
@@ -741,6 +753,76 @@ function LoadingProgress() {
 }
 
 /**
+ * @description Returns true when a star id is NOT a KIC/TIC/EPIC catalog
+ * id — i.e. the user clicked a Hipparcos background star or a synthetic
+ * filler and we need to cone-search MAST. Used by the panel to pick
+ * between the pipeline narration (`LoadingProgress`) and the lighter
+ * spinner (`SearchingMAST`), and to swap the "unavailable" copy between
+ * "transient MAST failure" and "not observed by Kepler or TESS".
+ * @param id Catalog id.
+ */
+function isOnDemandId(id: string): boolean {
+  return !/^(KIC|TIC|EPIC)\d+$/.test(id)
+}
+
+/**
+ * @description Lighter loading indicator used for on-demand clicks
+ * (Hipparcos background stars, etc). The MAST cone search is
+ * typically 1–3s, so the multi-step pipeline narration is
+ * misleading — this variant just spins with a single line of copy
+ * that matches what's actually happening.
+ * @returns A bordered card with animated bar.
+ */
+function SearchingMAST() {
+  return (
+    <div
+      style={{
+        background: 'rgba(76,201,240,0.06)',
+        border: '1px solid rgba(76,201,240,0.3)',
+        borderRadius: 6,
+        padding: '12px 14px',
+        marginBottom: 16,
+      }}
+    >
+      <div style={{ fontSize: 10, color: '#4cc9f0', letterSpacing: 1, lineHeight: 1.6 }}>
+        Searching MAST archive…
+      </div>
+      <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.5)', marginTop: 4, lineHeight: 1.5 }}>
+        Checking whether Kepler or TESS observed this star.
+      </div>
+      <div
+        style={{
+          position: 'relative',
+          height: 3,
+          marginTop: 10,
+          background: 'rgba(255,255,255,0.06)',
+          borderRadius: 2,
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            height: '100%',
+            width: '35%',
+            background: 'linear-gradient(90deg, transparent, #4cc9f0, transparent)',
+            animation: 'sm-loading-sweep 1.4s ease-in-out infinite',
+          }}
+        />
+      </div>
+      <style jsx>{`
+        @keyframes sm-loading-sweep {
+          0%   { transform: translateX(-100%); }
+          100% { transform: translateX(370%); }
+        }
+      `}</style>
+    </div>
+  )
+}
+
+/**
  * @description One-line citation under each dip card showing where the
  * underlying time-series came from. Pulls labels straight from the
  * lightcurve's `provenance` so adding a new mission (TESS, K2) doesn't
@@ -891,9 +973,14 @@ export default function AnomalyPanel() {
         <Divider />
 
         {/* Loading state takes priority over dips/chart/explanation so a slow
-            MAST fetch doesn't make the panel look frozen. */}
+            MAST fetch doesn't make the panel look frozen. Catalog stars
+            (KIC/TIC/EPIC) get the multi-step MAST pipeline narration
+            (cold path can take 30–90s); on-demand clicks on background
+            stars get a lighter "Searching MAST archive…" spinner
+            (typical 1–3s cone-search) since the pipeline narration
+            would misrepresent what's actually happening. */}
         {lightcurveLoading ? (
-          <LoadingProgress />
+          isOnDemandId(selectedStar.id) ? <SearchingMAST /> : <LoadingProgress />
         ) : lightcurve?.source === 'unavailable' && selectedStar.hasAnomaly ? (
           <>
             <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.3)', letterSpacing: 2, marginBottom: 8, display: 'flex', alignItems: 'center' }}>
@@ -980,7 +1067,7 @@ export default function AnomalyPanel() {
                       {dip.duration.toFixed(1)}d
                     </span>
                     <span style={{ fontSize: 8, color: 'rgba(255,255,255,0.35)' }}>
-                      t={dip.peakTime.toFixed(1)} BKJD
+                      t={dip.peakTime.toFixed(1)} {lightcurve.mission === 'TESS' ? 'TJD' : 'BKJD'}
                     </span>
                   </div>
                   {/* Score bar */}
@@ -1004,11 +1091,16 @@ export default function AnomalyPanel() {
           </>
         )}
 
-        {/* Light curve toggle + chart — only when we actually have data to plot.
-            When the real MAST fetch failed we show an explanation instead so
-            the user knows the data is genuinely missing, not synthetic.
-            Hidden entirely while the fetch is in flight (the progress bar
-            above is covering that real estate). */}
+        {/* Light curve toggle + button. Always visible so any clicked star
+            can be inspected — Hipparcos background clicks trigger an
+            on-demand MAST cone search via `selectStar`. Three states:
+            - Data available (real or synthetic): button opens the fullscreen chart.
+            - `unavailable` for a catalog star: MAST fetch failed for a
+              documented target; probably transient, tell the user that.
+            - `unavailable` for an on-demand star: MAST cone search found
+              no observation at that position; the star hasn't been
+              looked at by either mission. Different copy — this isn't
+              a temporary failure, it's a real coverage gap. */}
         {lightcurveLoading ? null : lightcurve?.source === 'unavailable' ? (
           <div
             style={{
@@ -1021,9 +1113,21 @@ export default function AnomalyPanel() {
               color: 'rgba(255,255,255,0.6)',
             }}
           >
-            Real light curve data could not be fetched from NASA/MAST. This
-            star exists and has documented anomalies, but the raw data is
-            temporarily unavailable.
+            {isOnDemandId(selectedStar.id) ? (
+              <>
+                <strong style={{ color: 'rgba(255,255,255,0.85)', letterSpacing: 1 }}>
+                  DATA UNAVAILABLE
+                </strong>
+                {' — '}
+                This star has not been observed by Kepler or TESS.
+              </>
+            ) : (
+              <>
+                Real light curve data could not be fetched from NASA/MAST.
+                This star exists and has documented anomalies, but the raw
+                data is temporarily unavailable.
+              </>
+            )}
           </div>
         ) : (
           <ActionButton
@@ -1071,6 +1175,8 @@ export default function AnomalyPanel() {
         dips={lightcurve.dips}
         provenance={lightcurve.provenance}
         profile={lightcurve.profile ?? null}
+        gapDays={lightcurve.gapDays}
+        timeUnit={lightcurve.mission === 'TESS' ? 'TJD' : 'BKJD'}
         onClose={() => setShowLightcurve(false)}
       />
     )}

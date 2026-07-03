@@ -1,7 +1,18 @@
 /**
- * @description Minimal FITS reader scoped to the Kepler PDC light-curve use
- * case: walk the Header Data Units (HDUs), find the first BINTABLE extension
- * (the time-series), and pull two specific columns by name.
+ * @description Minimal FITS reader scoped to MAST PDC light-curve files (both
+ * Kepler and TESS — they share the same HDU layout, the same BINTABLE
+ * structure, and the same `TIME` / `PDCSAP_FLUX` column names). The reader
+ * walks the Header Data Units (HDUs), finds the first BINTABLE extension
+ * (the time-series), and pulls two specific columns by name.
+ *
+ * Verified against:
+ * - Kepler `_llc.fits` (BJD - 2454833 = BKJD; ~30-min cadence quarters)
+ * - TESS `_lc.fits` (BJD - 2457000 = TJD; ~2-min cadence sectors)
+ *
+ * The TIME axis offsets differ (BKJD vs TJD), but our consumer treats time
+ * as opaque days from `times[0]` for gap detection and from a per-sample
+ * relative axis for dip detection, so the mission-specific epoch doesn't
+ * matter inside this code.
  *
  * FITS spec summary used here:
  * - File is a stream of 2880-byte blocks.
@@ -10,7 +21,7 @@
  * - Header ends with an `END` line; data starts at the next 2880-byte boundary.
  * - BINTABLE data size = NAXIS1 (row bytes) × NAXIS2 (rows), padded to 2880.
  * - TFORM`n` describes column type (`D` = float64, `E` = float32, `J` = int32,
- *   `I` = int16). We support D and E since Kepler TIME/PDCSAP_FLUX are 'D' and 'E'.
+ *   `I` = int16). We support all four since Kepler/TESS PDC files use them.
  */
 
 const BLOCK = 2880
@@ -64,14 +75,15 @@ const TYPE_INFO: Record<string, { size: number; read: (b: Buffer, o: number) => 
 
 /**
  * @description Extracts two named columns from the first BINTABLE extension
- * found in a Kepler PDC FITS file. Returns parallel arrays of `number | null`
- * (null preserved for NaN entries so dip detection can skip them).
+ * found in a MAST PDC FITS file (Kepler `_llc.fits` or TESS `_lc.fits`).
+ * Returns parallel arrays of `number | null` (null preserved for NaN entries
+ * so dip detection can skip them).
  * @param buf FITS file contents as a Buffer.
  * @param colNames Pair of column names to extract, e.g. ['TIME', 'PDCSAP_FLUX'].
  * @returns Parallel arrays for the two columns, in row order.
  * @throws Error if the file has no BINTABLE or a requested column isn't found.
  */
-export function readKeplerLightcurveColumns(
+export function readMastLightcurveColumns(
   buf: Buffer,
   colNames: [string, string],
 ): { col1: (number | null)[]; col2: (number | null)[] } {
