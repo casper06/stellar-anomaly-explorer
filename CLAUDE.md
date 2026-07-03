@@ -1080,12 +1080,10 @@ expected values (dip count, pattern label, top-dip label / peak
 time / depth, best-fit period). Fails loudly (per-field diff +
 exit 1) on any drift.
 
-**Run it BEFORE and AFTER any change to** `anomalyDetector.ts`,
-`curveClassifier.ts`, `fitsReader.ts`, or the `/api/lightcurve`
-fetch/normalization layer. Plain Node ≥ 22.6 executes the TS via
-native type stripping — no test framework, no extra deps
-(`allowImportingTsExtensions` was added to tsconfig for the `.ts`
-imports; the two libs under test import nothing but types).
+Plain Node ≥ 22.6 executes the TS via native type stripping — no
+test framework, no extra deps (`allowImportingTsExtensions` was
+added to tsconfig for the `.ts` imports). When to run it: see the
+**pre-change checklist** in the Testing section below.
 
 After an INTENTIONAL algorithm change: `npm run test:data -- --print`
 dumps the newly-measured values; re-verify them by hand, then update
@@ -1108,6 +1106,57 @@ Tabby's IRREGULAR profile surfacing a meaningless 0.307 d best-fit
 period — was FIXED on 2026-07-03: the classifier now returns a
 period only for PERIODIC_UNIFORM, and the KIC8462852 fixture
 asserts `bestFitPeriodDays: null` so it can't regress.)
+
+### Testing — layers & pre-change checklist
+Three test layers, one lookup table. **Run the matching commands
+BEFORE and AFTER touching the listed area:**
+
+| Touching | Run |
+|---|---|
+| `anomalyDetector` / `curveClassifier` / `fitsReader` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
+| `selectStar` / `store` / `persistence` | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
+| `StarField` selection paths / CameraSync / disambiguation popover / HUD panels | `npm run test:e2e` |
+| anything else | `npx tsc --noEmit` + verify in the browser, as always |
+
+`npm test` = `test:unit && test:data` — the fast no-browser gate
+(~5 s total), safe to run reflexively.
+
+**Layer 1 — unit (`npm run test:unit`)**: `node --test` over
+`src/lib/__tests__/*.unit.test.ts`. Zero dependencies — plain Node
+≥ 22.6 native type stripping plus `scripts/register-ts-resolver.mjs`,
+a module hook that retries the app's bundler-style extensionless
+relative imports with `.ts` (Node's ESM loader alone rejects them).
+Covers: `fitsReader` (synthetic FITS buffers built to spec — HDU
+walking, TTYPE lookup, TFORM D/E/J/I, repeat-count offsets,
+NaN→null, multi-block headers, both error paths), the
+`selectStar` selection-generation guard (stubbed `globalThis.fetch`
+with manually-ordered deferred responses — both stale orderings,
+loading-flag ownership, pattern-cache POST suppression), and store
+contracts (new Set/Map references on mutation, idempotence
+short-circuits, cursor reset, flyTo command ids, localStorage
+persistence + private-mode swallow via a shim).
+
+**Layer 2 — data regression (`npm run test:data`)**: see the
+section above.
+
+**Layer 3 — E2E (`npm run test:e2e`)**: Playwright (`@playwright/
+test` devDependency; one-time `npx playwright install chromium`).
+Config in `playwright.config.ts`: boots `npm run dev` itself, or
+reuses a server already on :3000 (`reuseExistingServer`); 1 worker
+(specs share server caches); SwiftShader flag for headless WebGL.
+Specs in `e2e/` formalize scenarios previously only verified by
+hand:
+- `auto-select-transition.spec.ts` — transition-on-center fires,
+  search picks survive the suppression window, drags re-fire.
+- `popover-disambiguation.spec.ts` — dense-field candidate counts
+  stay single-digit (the screen-distance fix) and an off-center
+  pick sticks.
+- `selection-race.spec.ts` — the stale-response race made
+  deterministic: `page.route()` serves the repo's gzipped fixtures
+  and holds the stale star's response until after the newer pick
+  resolves. No cold MAST, fully offline-reproducible.
+Full E2E run ≈ 3–5 min warm; first-ever run adds the chromium
+download and cold catalog fetches.
 
 ### Interactive LightCurve mode
 `<LightCurve interactive />` (used in the fullscreen overlay) adds:
