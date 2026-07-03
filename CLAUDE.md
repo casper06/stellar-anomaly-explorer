@@ -1018,6 +1018,43 @@ descriptive note keyed off the pattern. `profile` is `null` when
 the lightcurve source is `'unavailable'` (no data to classify) —
 the readout returns null in that case.
 
+### Data regression test (`npm run test:data`)
+`src/lib/__tests__/dataRegression.test.ts` runs `detectDips` +
+`classifyCurve` against four frozen real-data fixtures
+(`src/lib/__tests__/fixtures/*.json.gz`, gzipped MAST Kepler PDC
+curves captured 2026-07-02/03) and compares to hand-verified
+expected values (dip count, pattern label, top-dip label / peak
+time / depth, best-fit period). Fails loudly (per-field diff +
+exit 1) on any drift.
+
+**Run it BEFORE and AFTER any change to** `anomalyDetector.ts`,
+`curveClassifier.ts`, `fitsReader.ts`, or the `/api/lightcurve`
+fetch/normalization layer. Plain Node ≥ 22.6 executes the TS via
+native type stripping — no test framework, no extra deps
+(`allowImportingTsExtensions` was added to tsconfig for the `.ts`
+imports; the two libs under test import nothing but types).
+
+After an INTENTIONAL algorithm change: `npm run test:data -- --print`
+dumps the newly-measured values; re-verify them by hand, then update
+`EXPECTED` in the test file.
+
+Fixtures: Tabby's Star (KIC8462852 — 9 dips, D1519 −20.7% top),
+K02357.02 (KIC7449554 — 1 dip, NOTABLE, t=1273.1, SPARSE),
+K00931.01 (KIC9166862 — 351 dips ≈ NASA's 3.856 d period over the
+baseline; hand-verified via transit-count agreement), K01725.01
+(KIC10905746 — 53 variability dips, UNCERTAIN via the
+implausible-period guard; its real 0.15% transits are below the 1%
+dip threshold).
+
+Two KNOWN classifier quirks are deliberately frozen by the
+expectations (changing them should trip the test so it's a
+conscious decision): (1) Tabby's IRREGULAR profile still surfaces a
+meaningless 0.307 d best-fit period because the implausible-period
+guard only runs on the would-be-PERIODIC branch; (2) K00931.01, a
+textbook periodic transiter, computes periodicity ≈ 0.4996 — a hair
+under the 0.5 cutoff — and therefore labels IRREGULAR with no
+period.
+
 ### Interactive LightCurve mode
 `<LightCurve interactive />` (used in the fullscreen overlay) adds:
 - **Wheel zoom**: plain scroll zooms the X axis around the cursor (factor

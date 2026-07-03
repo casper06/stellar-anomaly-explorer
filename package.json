@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:data": "node src/lib/__tests__/dataRegression.test.ts"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.7",
