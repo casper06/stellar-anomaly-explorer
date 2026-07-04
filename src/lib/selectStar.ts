@@ -1,6 +1,6 @@
 import { useStore, type Star } from './store'
 import { fetchLightcurve, detectDips } from './anomalyDetector'
-import { classifyCurve } from './curveClassifier'
+import { classifyCurveAsync } from './classifyAsync'
 
 /**
  * @description Monotonic generation counter for selection requests. Each
@@ -86,10 +86,16 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
       peakTime: d.peakTime,
       label: d.label,
     }))
+    // Classification includes the ~1–2 s BLS search; in the browser it
+    // runs in a Web Worker (classifyCurveAsync) so the sky stays
+    // responsive. Because it awaits, a NEWER selection can supersede
+    // this one mid-classify — re-check the generation afterwards, same
+    // rule as the fetch above.
     const profile =
       source === 'unavailable' || times.length === 0
         ? null
-        : classifyCurve(times, flux, dips)
+        : await classifyCurveAsync(times, flux, dips)
+    if (generation !== selectionGeneration) return
     setLightcurve({
       times,
       flux,

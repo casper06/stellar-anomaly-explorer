@@ -9,7 +9,7 @@
     "lint": "eslint",
     "test": "npm run test:unit && npm run test:data",
     "test:unit": "node --import ./scripts/register-ts-resolver.mjs --test src/lib/__tests__/*.unit.test.ts",
-    "test:data": "node src/lib/__tests__/dataRegression.test.ts",
+    "test:data": "node --import ./scripts/register-ts-resolver.mjs src/lib/__tests__/dataRegression.test.ts",
     "test:e2e": "playwright test"
   },
   "dependencies": {

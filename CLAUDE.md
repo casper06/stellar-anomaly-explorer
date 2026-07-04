@@ -468,9 +468,15 @@ without opening each light curve.
 
 **Persistence** (`lib/patternCache.ts`, server-side): single JSON
 file at `<os.tmpdir()>/stellar-cache/pattern-cache.json`, shape
-`{ entries: { [starId]: { pattern, computedAt } } }`. No TTL — a
-star's PDC data doesn't change over time, so cached patterns live
-until manually deleted. Full ~9k-star population is ~500 KB; we
+`{ entries: { [starId]: { pattern, computedAt, classifierVersion } } }`.
+No TTL — a star's PDC data doesn't change over time — but the
+ALGORITHM does: entries record the `CLASSIFIER_VERSION` that computed
+them, `getCachedIds()` (the batch resume skip-list) only counts
+current-version entries, and `onlyIfMissing` writes overwrite
+old-version entries. Bumping the version therefore makes the next
+batch run re-classify the whole catalog instead of serving
+mixed-provenance labels. The GET endpoint still serves old-version
+entries to the radar until the re-batch replaces them. Full ~9k-star population is ~500 KB; we
 rewrite the whole file on every mutation (atomic temp+rename, same
 pattern as the lightcurve cache). Concurrent writers serialize
 through a `writeChain` promise so batch + organic fill can't race.
@@ -1043,23 +1049,52 @@ a conclusion.
   any `[dip.startIdx, dip.endIdx]`. Returned as a fraction, so
   0.002 = 0.2% noise.
 
-**Pattern label priority:**
-1. `HIGH_VARIABILITY` if `baselineRMS ≥ 0.01` (1% noise floor).
-   Takes precedence — a noisy backdrop makes any pattern call
-   unreliable, so we surface the noise first.
-2. `PERIODIC_UNIFORM` if `periodicity ≥ 0.5` AND
-   `depthConsistency ≥ 0.5`. Both conditions required.
-3. `SPARSE` if dip count < `MIN_DIPS_FOR_PATTERN = 3`.
-4. `IRREGULAR` otherwise.
+**BLS period search (classifier v2, 2026-07-04)**: `lib/bls.ts` is a
+budgeted plain-TS Box Least Squares search (no deps): upper-only MAD
+clip → 3 h time-binning → log-spaced coarse frequency grid capped by
+an ops budget (P 0.5–120 d, 200 phase bins, 6 box durations) → SDE
+statistic over the SR spectrum → 15× refinement around the peak.
+~1–2 s per full-mission curve; `BLS_SDE_THRESHOLD = 7.5` is the
+confidence bar. Documented approximations: sensitivity degrades for
+durations ≲ 3 h and periods ≲ 1 d unless the signal is deep; red
+noise suppresses SDE (sub-threshold = "no confident detection",
+never "no signal"). `CurveProfile.bls` carries the raw result
+(period/epoch/depth/duration/SDE) REGARDLESS of pattern label — the
+readout shows it as its own "Statistical periodic signal detected
+(BLS)" line. A SPARSE star with a confident BLS line is the
+NASA-score-vs-local-detector desync case made self-explanatory
+(e.g. K02357.02: 1 visible dip, but BLS finds the sibling planet
+K02357.01 at P=2.4210 d / 157 ppm, matching NASA to 5e-5).
 
-`bestFitPeriodDays` is only surfaced when the pattern label is
-`PERIODIC_UNIFORM` — outside that branch the candidate period is
-meaningless and displaying it contradicts the label. (The earlier
-gate was `periodicity ≥ 0.5` + not-UNCERTAIN, which leaked the
-contradiction on Tabby's Star: periodicity 0.601 with
-depthConsistency 0 → IRREGULAR, yet a bogus 0.307 d period rendered
-next to the IRREGULAR badge. Fixed 2026-07-03; pinned by the
-KIC8462852 fixture in the data regression test.)
+**Pattern label priority (v2):**
+1. `HIGH_VARIABILITY` if `baselineRMS ≥ 0.01` (1% noise floor).
+   Takes precedence — even over a confident BLS hit (the BLS line
+   still shows separately).
+2. `SPARSE` if dip count < `MIN_DIPS_FOR_PATTERN = 3`. This gate is
+   deliberate: PERIODIC_UNIFORM's copy describes the VISIBLE dip
+   pattern, so a confident BLS signal with 0–2 visible dips must NOT
+   promote — that would make the label describe something the user
+   can't verify by looking at the curve (describe-don't-diagnose).
+3. `PERIODIC_UNIFORM` if the BLS search found a confident signal
+   (SDE ≥ 7.5, period ≥ MIN_PLAUSIBLE_PERIOD_DAYS). Replaced the old
+   interval-folding gate + implausible-period/dip-density guards — a
+   real phase-folding search inherently rejects cadence lock-on.
+4. `UNCERTAIN` if the raw scalars look periodic (periodicity ≥ 0.5
+   AND depthConsistency ≥ 0.5) but BLS found nothing confident — the
+   signature of the dip detector locking onto flicker.
+5. `IRREGULAR` otherwise.
+
+`bestFitPeriodDays` is sourced from BLS and surfaced only when the
+label is `PERIODIC_UNIFORM` (anywhere else a period would contradict
+the label). `CLASSIFIER_VERSION` (currently 2) must be bumped on any
+change that can alter labels — pattern-cache entries record it, and
+the batch treats old-version entries as missing (re-classifies).
+
+**Client thread**: classification (dominated by BLS) runs in a Web
+Worker via `lib/classifyAsync.ts` → `workers/classify.worker.ts`;
+Node paths (batch, unit tests) and any worker failure fall back to a
+direct call. `selectStar` re-checks its selection generation after
+the await, same rule as after the fetch.
 
 **Flow:** `selectStar` in `StarField.tsx` calls `classifyCurve`
 after `detectDips`, stuffs the result into `lightcurve.profile`,
@@ -1097,15 +1132,15 @@ baseline; hand-verified via transit-count agreement), K01725.01
 implausible-period guard; its real 0.15% transits are below the 1%
 dip threshold).
 
-One KNOWN classifier quirk is deliberately frozen by the
-expectations (changing it should trip the test so it's a conscious
-decision): K00931.01, a textbook periodic transiter, computes
-periodicity ≈ 0.4996 — a hair under the 0.5 cutoff — and
-therefore labels IRREGULAR with no period. (A second quirk —
-Tabby's IRREGULAR profile surfacing a meaningless 0.307 d best-fit
-period — was FIXED on 2026-07-03: the classifier now returns a
-period only for PERIODIC_UNIFORM, and the KIC8462852 fixture
-asserts `bestFitPeriodDays: null` so it can't regress.)
+Expectations were re-frozen 2026-07-04 for classifier v2 (BLS): the
+old K00931.01 quirk (periodicity 0.4996, a hair under the cutoff →
+IRREGULAR) is RESOLVED — BLS promotes it to PERIODIC_UNIFORM at
+P ≈ 3.85563 d (NASA: 3.855603916, 6e-6 relative agreement). The
+fixtures now also pin BLS behavior: Tabby must NOT fold confidently
+(aperiodic), K02357.02 must find the sibling planet's 2.4210 d
+signal while staying SPARSE (promotion gate), and K01725.01's
+variability-driven raw periodicity must stay UNCERTAIN because BLS
+finds no confident signal in its red noise.
 
 ### Testing — layers & pre-change checklist
 Three test layers, one lookup table. **Run the matching commands
@@ -1125,12 +1160,17 @@ BEFORE and AFTER touching the listed area:**
 `src/lib/__tests__/*.unit.test.ts`. Zero dependencies — plain Node
 ≥ 22.6 native type stripping plus `scripts/register-ts-resolver.mjs`,
 a module hook that retries the app's bundler-style extensionless
-relative imports with `.ts` (Node's ESM loader alone rejects them).
-Covers: `fitsReader` (synthetic FITS buffers built to spec — HDU
-walking, TTYPE lookup, TFORM D/E/J/I, repeat-count offsets,
-NaN→null, multi-block headers, both error paths), the
-`selectStar` selection-generation guard (stubbed `globalThis.fetch`
-with manually-ordered deferred responses — both stale orderings,
+relative imports with `.ts` (Node's ESM loader alone rejects them;
+`test:data` uses the same hook since the classifier now imports
+`./bls` at runtime). Covers: `fitsReader` (synthetic FITS buffers
+built to spec — HDU walking, TTYPE lookup, TFORM D/E/J/I,
+repeat-count offsets, NaN→null, multi-block headers, both error
+paths), the BLS engine (`bls.unit.test.ts`: deterministic synthetic
+transit injections — deep/short-period and shallow 500 ppm at
+full-mission scale with a 3 s wall-clock budget — plus pure-noise
+and aperiodic-dips null tests), the `selectStar`
+selection-generation guard (stubbed `globalThis.fetch` with
+manually-ordered deferred responses — both stale orderings,
 loading-flag ownership, pattern-cache POST suppression), and store
 contracts (new Set/Map references on mutation, idempotence
 short-circuits, cursor reset, flyTo command ids, localStorage

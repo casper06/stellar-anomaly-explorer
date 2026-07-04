@@ -25,6 +25,7 @@ import zlib from 'node:zlib'
 import { fileURLToPath } from 'node:url'
 import { detectDips } from '../anomalyDetector.ts'
 import { classifyCurve } from '../curveClassifier.ts'
+import { BLS_SDE_THRESHOLD } from '../bls.ts'
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures')
 
@@ -50,6 +51,10 @@ interface Expectation {
   topDipDepth?: number
   /** Classifier best-fit period in days, or null when it must not report one. Tolerance PERIOD_TOL. */
   bestFitPeriodDays: number | null
+  /** Whether the BLS search must produce a CONFIDENT detection (SDE ≥ threshold). */
+  blsConfident: boolean
+  /** BLS period in days when confident (tolerance PERIOD_TOL); ignored otherwise. */
+  blsPeriodDays?: number
   /** Independent NASA Exoplanet Archive orbital period (days) for context; not asserted. */
   nasaPeriodDays?: number
 }
@@ -59,38 +64,29 @@ const DEPTH_TOL = 0.005 // absolute fraction (0.5 percentage points)
 const PERIOD_TOL = 0.05 // days
 
 /**
- * @description Hand-verified expected values, frozen 2026-07-03. These
- * freeze CURRENT measured behavior on the frozen fixture data — including
- * two classifier quirks documented below — so any code change that shifts
+ * @description Hand-verified expected values, re-frozen 2026-07-04 for
+ * classifier v2 (BLS period search). These freeze CURRENT measured
+ * behavior on the frozen fixture data so any code change that shifts
  * them is surfaced and must be re-verified deliberately.
  * - KIC8462852 (Tabby's Star): 9 dips led by the famous D1519 −20.7%
- *   event (D792 −14.2% is second) — matches the live panel observed in
- *   the 2026-07-02 verification session. IRREGULAR (depthConsistency 0).
- *   `bestFitPeriodDays` MUST be null: periodicity computes 0.601, and
- *   the classifier used to surface a physically meaningless 0.307 d
- *   "best-fit period" alongside the IRREGULAR label. The period is now
- *   surfaced ONLY when the pattern is PERIODIC_UNIFORM; this fixture
- *   pins that (fixed 2026-07-03, don't regress).
- * - KIC7449554 (K02357.02): matches the live-session values (1 dip,
- *   NOTABLE, t=1273.1 BKJD, SPARSE), not re-derived. Depth on this
- *   fixture measures 1.00% (the session panel displayed −1.08% from an
- *   earlier cache copy — per-quarter segment availability can shift the
- *   normalization slightly between fetches; the fixture freezes the
- *   2026-07-03 fetch).
- * - KIC9166862 (K00931.01): CONFIRMED planet, 16,653 ppm transits.
- *   351 dips ≈ the ~360 transits NASA's 3.8556 d period predicts over
- *   the ~1,421 d baseline (minus gaps) — strong independent agreement.
- *   Quirk: periodicity computes ≈0.4996, a hair UNDER the 0.5 cutoff,
- *   so this textbook periodic transiter labels IRREGULAR and surfaces
- *   no period. Frozen as-is; if classifier tuning ever fixes this, the
- *   test fails and the expectation should be updated to
- *   PERIODIC_UNIFORM with P ≈ 3.856 d.
- * - KIC10905746 (K01725.01): the CONFIRMED planet's 1,473 ppm (0.15%)
- *   transits are BELOW the detector's 1% threshold; the 53 detected
- *   dips are the star's own variability (baselineRMS 0.58%). Raw scores
- *   look periodic (0.995/0.884) but the candidate period is implausibly
- *   short, so the sanity guard downgrades to UNCERTAIN and suppresses
- *   the period. Guards both the dip threshold and the UNCERTAIN branch.
+ *   event — IRREGULAR, no period, and the BLS search must NOT reach a
+ *   confident detection (aperiodic dips refuse to fold; measured
+ *   SDE ≈ 4.9 vs threshold 7.5).
+ * - KIC7449554 (K02357.02): 1 visible dip → SPARSE (the dipCount ≥ 3
+ *   promotion gate holds), but BLS confidently finds P ≈ 2.4210 d at
+ *   ~157 ppm — which is the SIBLING planet K02357.01 (NASA period
+ *   2.42088277 d, 223 ppm): more transits than the 15.9 d .02 planet,
+ *   so it wins the fold-SNR. Independent NASA cross-check to 5e-5
+ *   relative. The "statistical signal on a SPARSE star" case, pinned.
+ * - KIC9166862 (K00931.01): CONFIRMED planet, deep transits. Under v1
+ *   this was the frozen quirk (periodicity 0.4996, a hair under the
+ *   0.5 cutoff → IRREGULAR). BLS resolves it: PERIODIC_UNIFORM with
+ *   P ≈ 3.85563 d vs NASA 3.855603916 d — 6e-6 relative agreement.
+ * - KIC10905746 (K01725.01): red-noise canary. Raw scalars look
+ *   periodic (0.995/0.884) because the dips are variability-driven,
+ *   but BLS finds no confident fold (SDE ≈ 5.3) → UNCERTAIN, no
+ *   period. The real 1,473 ppm/9.88 d planet stays below detection in
+ *   this noise — an honest non-claim.
  */
 const EXPECTED: Expectation[] = [
   {
@@ -102,6 +98,7 @@ const EXPECTED: Expectation[] = [
     topDipPeakTime: 1519.52,
     topDipDepth: 0.2069,
     bestFitPeriodDays: null,
+    blsConfident: false,
   },
   {
     id: 'KIC7449554',
@@ -112,17 +109,21 @@ const EXPECTED: Expectation[] = [
     topDipPeakTime: 1273.06,
     topDipDepth: 0.01,
     bestFitPeriodDays: null,
+    blsConfident: true,
+    blsPeriodDays: 2.4209, // = sibling K02357.01; NASA 2.42088277 d
     nasaPeriodDays: 15.9042402,
   },
   {
     id: 'KIC9166862',
     label: 'K00931.01',
     dipCount: 351,
-    pattern: 'IRREGULAR',
+    pattern: 'PERIODIC_UNIFORM',
     topDipLabel: 'NOTABLE',
     topDipPeakTime: 718.18,
     topDipDepth: 0.0197,
-    bestFitPeriodDays: null,
+    bestFitPeriodDays: 3.8556,
+    blsConfident: true,
+    blsPeriodDays: 3.8556,
     nasaPeriodDays: 3.855603916,
   },
   {
@@ -134,6 +135,7 @@ const EXPECTED: Expectation[] = [
     topDipPeakTime: 1364.48,
     topDipDepth: 0.0158,
     bestFitPeriodDays: null,
+    blsConfident: false,
     nasaPeriodDays: 9.8786461,
   },
 ]
@@ -187,6 +189,12 @@ for (const exp of EXPECTED) {
     console.log(`  dipCount=${dips.length} pattern=${profile.pattern} bestFitPeriodDays=${profile.bestFitPeriodDays}`)
     console.log(`  periodicity=${profile.periodicity.toFixed(3)} depthConsistency=${profile.depthConsistency.toFixed(3)} baselineRMS=${profile.baselineRMS.toFixed(5)} dipShape=${profile.dipShape}`)
     if (top) console.log(`  topDip: label=${top.label} peakTime=${top.peakTime.toFixed(2)} depth=${top.depth.toFixed(5)} duration=${top.duration.toFixed(2)}d score=${top.score.toFixed(3)}`)
+    if (profile.bls) {
+      const b = profile.bls
+      console.log(`  bls: P=${b.periodDays.toFixed(4)}d depth=${b.depthPpm.toFixed(0)}ppm dur=${b.durationHours.toFixed(1)}h epoch=${b.epochDays.toFixed(2)} SDE=${b.sde.toFixed(1)}`)
+    } else {
+      console.log('  bls: null')
+    }
     continue
   }
 
@@ -194,6 +202,11 @@ for (const exp of EXPECTED) {
   check(failures, 'dipCount', dips.length, exp.dipCount)
   check(failures, 'pattern', profile.pattern, exp.pattern)
   check(failures, 'bestFitPeriodDays', profile.bestFitPeriodDays, exp.bestFitPeriodDays, PERIOD_TOL)
+  const measuredBlsConfident = profile.bls !== null && profile.bls.sde >= BLS_SDE_THRESHOLD
+  check(failures, 'blsConfident', String(measuredBlsConfident), String(exp.blsConfident))
+  if (exp.blsConfident && exp.blsPeriodDays !== undefined) {
+    check(failures, 'bls.periodDays', profile.bls?.periodDays ?? null, exp.blsPeriodDays, PERIOD_TOL)
+  }
   if (exp.dipCount > 0) {
     check(failures, 'topDip.label', top?.label ?? null, exp.topDipLabel ?? null)
     check(failures, 'topDip.peakTime', top?.peakTime ?? null, exp.topDipPeakTime ?? null, TIME_TOL)
@@ -202,7 +215,10 @@ for (const exp of EXPECTED) {
 
   if (failures.length === 0) {
     const period = profile.bestFitPeriodDays === null ? 'no period' : `P=${profile.bestFitPeriodDays.toFixed(3)}d`
-    console.log(`✅ ${exp.id} (${exp.label}): ${dips.length} dips · ${profile.pattern} · ${period}`)
+    const blsNote = measuredBlsConfident && profile.bls
+      ? `BLS P=${profile.bls.periodDays.toFixed(4)}d SDE ${profile.bls.sde.toFixed(1)}`
+      : 'BLS: no confident signal'
+    console.log(`✅ ${exp.id} (${exp.label}): ${dips.length} dips · ${profile.pattern} · ${period} · ${blsNote}`)
   } else {
     anyFailure = true
     console.error(`❌ ${exp.id} (${exp.label}) DRIFTED from hand-verified values:`)

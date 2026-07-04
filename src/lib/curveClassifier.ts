@@ -1,4 +1,18 @@
 import type { Dip } from './anomalyDetector'
+import { runBls, BLS_SDE_THRESHOLD, type BlsResult } from './bls'
+
+/**
+ * @description Version of the classification algorithm. BUMP THIS on any
+ * change that can alter a star's pattern label or profile fields —
+ * pattern-cache entries record the version they were computed under, and
+ * the batch classifier treats entries from older versions as missing
+ * (re-classifies them) instead of serving mixed-provenance labels. Same
+ * lesson as the lightcurve cache's CACHE_SCHEMA_VERSION.
+ * v2: BLS period search added; PERIODIC_UNIFORM now requires a confident
+ * BLS detection (gated on ≥3 visible dips); bestFitPeriodDays sourced
+ * from BLS.
+ */
+export const CLASSIFIER_VERSION = 2
 
 /**
  * @description Pattern label assigned by the classifier. Purely
@@ -16,10 +30,9 @@ import type { Dip } from './anomalyDetector'
  * - `SPARSE`: fewer than three dips, not enough to characterize a
  *   pattern.
  * - `UNCERTAIN`: the raw periodicity/consistency numbers looked good
- *   but the candidate period is physically implausible (below the
- *   shortest confirmed transiting-planet period) or the dip cadence
- *   is high enough to suggest we're locking onto sampling noise
- *   rather than a real signal.
+ *   but the BLS phase-folding search found no confident periodic box
+ *   signal — the signature of the dip detector locking onto sampling
+ *   noise or baseline flicker rather than a real repeating event.
  */
 export type CurvePattern =
   | 'PERIODIC_UNIFORM'
@@ -71,13 +84,23 @@ export interface CurveProfile {
    */
   baselineRMS: number
   /**
-   * Best-fit period in days if periodicity > PERIODIC_THRESHOLD,
-   * otherwise null. Reported separately from `periodicity` so the UI
-   * can choose not to display a confidence-weak period.
+   * Best-fit period in days, sourced from the BLS search, surfaced
+   * ONLY when the pattern label is PERIODIC_UNIFORM (anywhere else a
+   * period would contradict the label). Null otherwise.
    */
   bestFitPeriodDays: number | null
   /** Number of dips that contributed to the analysis. */
   dipCount: number
+  /**
+   * Raw BLS search result — an INDEPENDENT statistical detection,
+   * reported regardless of the pattern label (a SPARSE star can carry
+   * a confident sub-threshold-depth BLS signal; that is exactly the
+   * NASA-score-vs-local-detector desync case). Null when the curve was
+   * too small/short to search. Consumers show it as its own line
+   * ("statistical periodic signal"), never as a property of the
+   * visible dip pattern.
+   */
+  bls: BlsResult | null
 }
 
 /**
@@ -148,16 +171,6 @@ const SHAPE_VOTE_TOP_N = 5
 const MIN_PLAUSIBLE_PERIOD_DAYS = 0.2
 
 /**
- * @description Maximum plausible number of dips per day of coverage. A
- * planet on a 0.2-day orbit still only transits ~5×/day. Anything
- * substantially above that (we use 8) means the dip detector is being
- * driven by baseline flicker crossing threshold repeatedly, not by
- * astrophysical events. When crossed, the pattern label is downgraded
- * to UNCERTAIN regardless of periodicity / consistency scores.
- */
-const MAX_DIPS_PER_DAY = 8
-
-/**
  * @description Computes a `CurveProfile` from a light curve and its
  * detected dips. All four measurements (periodicity, depth
  * consistency, dip shape, baseline RMS) are derived from the input
@@ -175,6 +188,17 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
   const dipCount = dips.length
   const baselineRMS = computeBaselineRMS(flux, dips)
 
+  // BLS runs unconditionally — its result is an independent statistical
+  // detection surfaced even for SPARSE curves (that's the honest answer
+  // to "NASA scores this high but I see no dips": the transit is often
+  // detectable statistically while being far below the 1% visible-dip
+  // threshold).
+  const bls = runBls(times, flux)
+  const blsConfident =
+    bls !== null &&
+    bls.sde >= BLS_SDE_THRESHOLD &&
+    bls.periodDays >= MIN_PLAUSIBLE_PERIOD_DAYS
+
   if (dipCount < MIN_DIPS_FOR_PATTERN) {
     return {
       pattern: 'SPARSE',
@@ -184,6 +208,7 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
       baselineRMS,
       bestFitPeriodDays: null,
       dipCount,
+      bls,
     }
   }
 
@@ -191,35 +216,22 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
   // regardless of the input order (detectDips returns by score desc).
   const dipsByTime = [...dips].sort((a, b) => a.peakTime - b.peakTime)
 
-  const { periodicity, bestFitPeriodDays } = computePeriodicity(dipsByTime)
+  const { periodicity } = computePeriodicity(dipsByTime)
   const depthConsistency = computeDepthConsistency(dipsByTime)
   const dipShape = computeDipShape(times, flux, dipsByTime)
-
-  // Coverage in days is used by the dip-density sanity check. Falls
-  // back to a positive floor so single-sample edge cases don't divide
-  // by zero.
-  const first = dipsByTime[0].peakTime
-  const last = dipsByTime[dipsByTime.length - 1].peakTime
-  const coverageDays = Math.max(1, last - first)
 
   const pattern = pickPattern({
     periodicity,
     depthConsistency,
     baselineRMS,
-    bestFitPeriodDays,
-    dipCount,
-    coverageDays,
+    blsConfident,
   })
 
-  // Surface the "best-fit period" ONLY when the pattern label is
-  // PERIODIC_UNIFORM. Outside that branch the candidate period is
-  // meaningless — and displaying it CONTRADICTS the label. The previous
-  // gate (`pattern !== 'UNCERTAIN' && periodicity >= threshold`) leaked
-  // exactly that case: Tabby's Star measures periodicity 0.601 with
-  // depthConsistency 0, labels IRREGULAR, and still surfaced a
-  // physically implausible 0.307 d period next to the IRREGULAR badge.
-  // Pinned by the KIC8462852 fixture in the data regression test.
-  const reportedPeriod = pattern === 'PERIODIC_UNIFORM' ? bestFitPeriodDays : null
+  // The surfaced period comes from BLS (a real phase-folding search),
+  // ONLY when the pattern label is PERIODIC_UNIFORM — anywhere else a
+  // period would contradict the label. (The old interval-heuristic
+  // period is gone; `periodicity` remains as a descriptive scalar.)
+  const reportedPeriod = pattern === 'PERIODIC_UNIFORM' && bls ? bls.periodDays : null
 
   return {
     pattern,
@@ -229,57 +241,50 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
     baselineRMS,
     bestFitPeriodDays: reportedPeriod,
     dipCount,
+    bls,
   }
 }
 
 /**
- * @description Picks the descriptive pattern label from the computed
- * scalars plus two sanity checks that guard against locking onto
- * sampling noise. `HIGH_VARIABILITY` takes precedence whenever the
- * baseline is noisier than `HIGH_VARIABILITY_RMS` — a noisy backdrop
- * makes any pattern call unreliable, so we surface the noise first.
- *
- * Sanity checks (both applied when the raw scores WOULD produce
- * `PERIODIC_UNIFORM`):
- * 1. If the best-fit period is below `MIN_PLAUSIBLE_PERIOD_DAYS`, the
- *    classifier is almost certainly folding to Kepler's cadence
- *    (~0.02 d) or a low multiple of it — downgrade to `UNCERTAIN`.
- * 2. If dip density exceeds `MAX_DIPS_PER_DAY`, dip detection is being
- *    driven by baseline flicker rather than real events — downgrade
- *    to `UNCERTAIN`.
- * Otherwise `PERIODIC_UNIFORM` if both periodicity and depth
- * consistency are above their thresholds, else `IRREGULAR`.
- * @param scores Measured scalars plus the candidate period, dip count,
- * and observation coverage (days spanned by the dips).
+ * @description Picks the descriptive pattern label. Priority:
+ * 1. `HIGH_VARIABILITY` whenever the baseline is noisier than
+ *    `HIGH_VARIABILITY_RMS` — a noisy backdrop makes any pattern call
+ *    unreliable, so we surface the noise first (even over a confident
+ *    BLS detection; the BLS line is still shown separately).
+ * 2. `PERIODIC_UNIFORM` when the BLS search found a CONFIDENT periodic
+ *    box signal (SDE ≥ threshold, plausible period). This replaced the
+ *    old interval-folding heuristic + implausible-period/dip-density
+ *    guards: a real phase-folding search either finds the period or it
+ *    doesn't, so the guards' job (rejecting cadence lock-on and
+ *    flicker) is inherent. Note the caller only reaches this function
+ *    with ≥ MIN_DIPS_FOR_PATTERN visible dips — a confident BLS signal
+ *    with 0–2 visible dips stays SPARSE by design (the label describes
+ *    the VISIBLE dip pattern; the BLS detection is surfaced as its own
+ *    independent line).
+ * 3. `UNCERTAIN` when the raw interval scalars LOOK periodic but BLS
+ *    found nothing confident — the signature of the dip detector
+ *    locking onto sampling noise or baseline flicker.
+ * 4. `IRREGULAR` otherwise.
+ * @param scores Measured scalars plus the BLS confidence flag.
  * @returns The CurvePattern label.
  */
 function pickPattern({
   periodicity,
   depthConsistency,
   baselineRMS,
-  bestFitPeriodDays,
-  dipCount,
-  coverageDays,
+  blsConfident,
 }: {
   periodicity: number
   depthConsistency: number
   baselineRMS: number
-  bestFitPeriodDays: number | null
-  dipCount: number
-  coverageDays: number
+  blsConfident: boolean
 }): CurvePattern {
   if (baselineRMS >= HIGH_VARIABILITY_RMS) return 'HIGH_VARIABILITY'
-  const wouldBePeriodic =
+  if (blsConfident) return 'PERIODIC_UNIFORM'
+  const rawLooksPeriodic =
     periodicity >= PERIODIC_THRESHOLD &&
     depthConsistency >= DEPTH_CONSISTENCY_THRESHOLD
-  if (wouldBePeriodic) {
-    if (
-      bestFitPeriodDays !== null &&
-      bestFitPeriodDays < MIN_PLAUSIBLE_PERIOD_DAYS
-    ) return 'UNCERTAIN'
-    if (dipCount / coverageDays > MAX_DIPS_PER_DAY) return 'UNCERTAIN'
-    return 'PERIODIC_UNIFORM'
-  }
+  if (rawLooksPeriodic) return 'UNCERTAIN'
   return 'IRREGULAR'
 }
 

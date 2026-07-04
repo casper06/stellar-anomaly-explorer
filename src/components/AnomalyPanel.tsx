@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react'
 import { useStore, type Anomaly, type LightcurveProvenance } from '@/lib/store'
 import type { CurveProfile, CurvePattern, DipShape } from '@/lib/curveClassifier'
+import { BLS_SDE_THRESHOLD } from '@/lib/bls'
 import LightCurve from './LightCurve'
 
 /**
@@ -612,6 +613,31 @@ function ClassifierReadout({ profile }: { profile: CurveProfile }) {
         />
       )}
       <ReadoutRow label="Dips counted" value={profile.dipCount.toLocaleString()} />
+      {/* Independent statistical detection line — shown whenever the BLS
+          search found a confident periodic box signal, REGARDLESS of the
+          pattern label. A SPARSE star with a confident BLS line is the
+          NASA-score-vs-local-detector desync case made self-explanatory:
+          the signal is real but far shallower than the 1% visible-dip
+          threshold. Descriptive only — reports the detection, never a
+          cause. */}
+      {profile.bls && profile.bls.sde >= BLS_SDE_THRESHOLD && (
+        <div
+          style={{
+            marginTop: 8,
+            paddingTop: 8,
+            borderTop: '1px solid rgba(255,255,255,0.08)',
+            fontSize: 9,
+            color: '#9d8cff',
+            letterSpacing: 0.5,
+            lineHeight: 1.4,
+          }}
+        >
+          Statistical periodic signal detected (BLS): P=
+          {profile.bls.periodDays.toFixed(profile.bls.periodDays >= 10 ? 2 : 3)}d,
+          depth≈{Math.round(profile.bls.depthPpm).toLocaleString()}ppm,
+          SDE {profile.bls.sde.toFixed(1)}
+        </div>
+      )}
       <div
         style={{
           marginTop: 8,
