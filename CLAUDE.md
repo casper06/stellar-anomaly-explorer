@@ -98,7 +98,8 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 ## Current project state
 
 ### What works ✅
-- Navigable 3D sky with ~8000 stars rendered as `Points` (WebGL)
+- Navigable 3D sky with ~8,800 real Hipparcos stars (Vmag < 6.5,
+  naked-eye, all-sky) rendered as `Points` (WebGL)
 - Real star colors based on B-V index (blue=hot, red=cool)
 - 11 hardcoded known anomalies as seeds (Tabby's Star, KIC 6543674, KIC 4150804, KIC 11610797, EPIC 201637175, KIC 11852982, KIC 3542116, KIC 8548587, KIC 5955033, KIC 12557548 disintegrating-planet candidate, KIC 10195478) + ~6,000 unique KOI stars loaded from the NASA Exoplanet Archive
 - Hover-proximity labels over anomalies (one at a time, closest to cursor)
@@ -147,12 +148,29 @@ Both the star catalog and per-star light curves go through Next.js API routes
 so the browser never talks to external archives directly (CORS).
 
 ### `/api/stars`
-- Proxies `https://vizier.cds.unistra.fr/.../I/239/hip_main` (Hipparcos main catalog)
-- Parses TSV, prepends `KNOWN_ANOMALIES`, caches the parsed catalog in-process
+- Proxies the Hipparcos main catalog (I/239/hip_main) from VizieR via
+  **`/viz-bin/asu-tsv`** — the older `/viz-bin/TSV` path 404s as of
+  2026-07 (VizieR moved it), which silently pushed the app onto the
+  synthetic fallback for an unknown period before the 2026-07-04 audit
+  caught it.
+- Selection: **`Vmag < 6.5` (naked-eye stars, ~8,785 rows), all-sky**.
+  Replaces the old unfiltered `-out.max=5000`, which — because HIP ids
+  are assigned in RA order — accidentally returned a thin RA 0–16°
+  slice instead of a sky.
+- Position columns are the catalog-native **`RAICRS` / `DEICRS`**
+  (degrees). The previously-requested `RArad`/`DErad` names are no
+  longer honored; VizieR silently DROPS unknown requested columns, so
+  the parser now locates columns BY NAME from the header row and
+  throws if a required column is missing (contract-change detection
+  instead of garbage coordinates).
+- Parses TSV, prepends `KNOWN_ANOMALIES`, caches the parsed catalog
+  in-process; sanity-rejects responses with < 1,000 usable rows.
 - Response shape: `{ stars: CatalogStar[], source: 'real' | 'fallback' }`
-- On any failure returns just `KNOWN_ANOMALIES` with `source: 'fallback'`; the
-  client (`fetchHipparcosCatalog`) then pads with synthetic stars so the sky
-  isn't sparse
+- On any failure returns just `KNOWN_ANOMALIES` with `source: 'fallback'`
+  — and logs the reason LOUDLY (`[stars] VizieR fetch FAILED`); the
+  client (`fetchHipparcosCatalog`) then pads with synthetic stars so
+  the sky isn't sparse. Silent fallback is how the endpoint breakage
+  went undetected.
 
 ### `/api/koi`
 - Proxies the NASA Exoplanet Archive's KOI cumulative table via TAP
