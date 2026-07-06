@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react'
 import { useStore, type Anomaly, type LightcurveProvenance } from '@/lib/store'
 import type { CurveProfile, CurvePattern, DipShape } from '@/lib/curveClassifier'
+import { BLS_SDE_THRESHOLD } from '@/lib/bls'
 import LightCurve from './LightCurve'
 
 /**
@@ -259,6 +260,52 @@ function DataSourceBadge({ source }: { source?: 'real' | 'unavailable' | 'synthe
 }
 
 /**
+ * @description Amber "PARTIAL N/M QUARTERS" badge shown next to the
+ * REAL DATA badge when MAST served fewer segments than its listing said
+ * exist. This is the loud partial-data signal — a truncated curve can
+ * make the classifier report SPARSE/UNCERTAIN where the full curve would
+ * be periodic (the K00931.01 case), so the user must see that data is
+ * missing rather than trust an incomplete verdict. Renders nothing when
+ * the curve is complete.
+ * @param partial Whether the served curve is incomplete.
+ * @param segments `{ recovered, expected }` segment coverage, when known.
+ * @param mission Serving mission (labels the segment unit — quarters vs sectors).
+ * @returns Inline amber badge, or null when not partial.
+ */
+function PartialDataBadge({
+  partial,
+  segments,
+  mission,
+}: {
+  partial?: boolean
+  segments?: { recovered: number; expected: number }
+  mission?: 'Kepler' | 'TESS' | null
+}) {
+  if (!partial || !segments) return null
+  const unit = mission === 'TESS' ? 'SECTORS' : 'QUARTERS'
+  return (
+    <span
+      title={`MAST served ${segments.recovered} of ${segments.expected} available ${unit.toLowerCase()}; the curve and any classification below may be incomplete.`}
+      style={{
+        display: 'inline-block',
+        fontSize: 8,
+        letterSpacing: 1.5,
+        padding: '2px 6px',
+        borderRadius: 3,
+        background: 'rgba(244,162,97,0.14)',
+        border: '1px solid rgba(244,162,97,0.6)',
+        color: '#f4a261',
+        fontWeight: 700,
+        lineHeight: 1.3,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {`PARTIAL ${segments.recovered}/${segments.expected} ${unit}`}
+    </span>
+  )
+}
+
+/**
  * @description Human-readable spectral classification label for a B-V color index, shown
  * in the panel's COLOR row.
  * @param bv B-V color index.
@@ -327,6 +374,9 @@ function LightCurveFullscreen({
   profile,
   gapDays,
   timeUnit,
+  partial,
+  segments,
+  mission,
   onClose,
 }: {
   starName: string
@@ -338,6 +388,9 @@ function LightCurveFullscreen({
   profile: CurveProfile | null
   gapDays?: number
   timeUnit?: string
+  partial?: boolean
+  segments?: { recovered: number; expected: number }
+  mission?: 'Kepler' | 'TESS' | null
   onClose: () => void
 }) {
   useEffect(() => {
@@ -405,7 +458,9 @@ function LightCurveFullscreen({
             absolute positioning keeps it on top without z-index
             gymnastics. Contains only measured features; no causal
             interpretation. */}
-        {profile && <ClassifierReadout profile={profile} />}
+        {profile && (
+          <ClassifierReadout profile={profile} partial={partial} segments={segments} mission={mission} />
+        )}
         {/* Top bar — fixed-height header */}
         <div
           style={{
@@ -422,6 +477,7 @@ function LightCurveFullscreen({
               {starName}
             </div>
             <DataSourceBadge source={source} />
+            <PartialDataBadge partial={partial} segments={segments} mission={mission} />
             <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 2 }}>
               LIGHT CURVE
             </div>
@@ -576,8 +632,19 @@ const SHAPE_COPY: Record<DipShape, string> = {
  * @param profile Measurements from `classifyCurve`.
  * @returns Absolutely-positioned panel; renders nothing if profile is null.
  */
-function ClassifierReadout({ profile }: { profile: CurveProfile }) {
+function ClassifierReadout({
+  profile,
+  partial,
+  segments,
+  mission,
+}: {
+  profile: CurveProfile
+  partial?: boolean
+  segments?: { recovered: number; expected: number }
+  mission?: 'Kepler' | 'TESS' | null
+}) {
   const copy = PATTERN_COPY[profile.pattern]
+  const unit = mission === 'TESS' ? 'sectors' : 'quarters'
   return (
     <div
       style={{
@@ -601,6 +668,29 @@ function ClassifierReadout({ profile }: { profile: CurveProfile }) {
       <div style={{ fontSize: 12, fontWeight: 700, color: copy.color, letterSpacing: 1, marginBottom: 8 }}>
         {copy.label}
       </div>
+      {/* Partial-data caveat — makes a label like SPARSE/UNCERTAIN read as
+          provisional when the curve is missing quarters. Directly addresses
+          the K00931.01 case: a truncated fetch produced a misleading label
+          with no signal that data was incomplete. */}
+      {partial && segments && (
+        <div
+          style={{
+            marginBottom: 8,
+            padding: '5px 7px',
+            borderRadius: 4,
+            background: 'rgba(244,162,97,0.12)',
+            border: '1px solid rgba(244,162,97,0.5)',
+            fontSize: 9,
+            color: '#f4a261',
+            letterSpacing: 0.3,
+            lineHeight: 1.4,
+          }}
+        >
+          ⚠ PARTIAL DATA — {segments.recovered}/{segments.expected} {unit}. This
+          profile is measured from an incomplete curve and may change once all
+          {` ${unit}`} are available.
+        </div>
+      )}
       <ReadoutRow label="Periodicity" value={`${Math.round(profile.periodicity * 100)}%`} />
       <ReadoutRow label="Depth consistency" value={`${Math.round(profile.depthConsistency * 100)}%`} />
       <ReadoutRow label="Dominant shape" value={SHAPE_COPY[profile.dipShape]} />
@@ -612,6 +702,31 @@ function ClassifierReadout({ profile }: { profile: CurveProfile }) {
         />
       )}
       <ReadoutRow label="Dips counted" value={profile.dipCount.toLocaleString()} />
+      {/* Independent statistical detection line — shown whenever the BLS
+          search found a confident periodic box signal, REGARDLESS of the
+          pattern label. A SPARSE star with a confident BLS line is the
+          NASA-score-vs-local-detector desync case made self-explanatory:
+          the signal is real but far shallower than the 1% visible-dip
+          threshold. Descriptive only — reports the detection, never a
+          cause. */}
+      {profile.bls && profile.bls.sde >= BLS_SDE_THRESHOLD && (
+        <div
+          style={{
+            marginTop: 8,
+            paddingTop: 8,
+            borderTop: '1px solid rgba(255,255,255,0.08)',
+            fontSize: 9,
+            color: '#9d8cff',
+            letterSpacing: 0.5,
+            lineHeight: 1.4,
+          }}
+        >
+          Statistical periodic signal detected (BLS): P=
+          {profile.bls.periodDays.toFixed(profile.bls.periodDays >= 10 ? 2 : 3)}d,
+          depth≈{Math.round(profile.bls.depthPpm).toLocaleString()}ppm,
+          SDE {profile.bls.sde.toFixed(1)}
+        </div>
+      )}
       <div
         style={{
           marginTop: 8,
@@ -906,7 +1021,10 @@ export default function AnomalyPanel() {
           <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.3)', letterSpacing: 2 }}>
             {selectedStar.hasAnomaly ? '⚠ KNOWN ANOMALY' : 'STAR'}
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+          {/* flexWrap: the PARTIAL badge can't fit next to name + ★ +
+              REAL DATA inside the 300px panel; it wraps to its own line
+              instead of clipping at the panel edge. */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4, flexWrap: 'wrap' }}>
             <div style={{ fontSize: 14, fontWeight: 700, color: 'white', lineHeight: 1.3 }}>
               {selectedStar.name}
             </div>
@@ -932,6 +1050,11 @@ export default function AnomalyPanel() {
               {flaggedIds.has(selectedStar.id) ? '★' : '☆'}
             </button>
             <DataSourceBadge source={lightcurve?.source} />
+            <PartialDataBadge
+              partial={lightcurve?.partial}
+              segments={lightcurve?.segments}
+              mission={lightcurve?.mission}
+            />
           </div>
         </div>
         <button
@@ -1177,6 +1300,9 @@ export default function AnomalyPanel() {
         profile={lightcurve.profile ?? null}
         gapDays={lightcurve.gapDays}
         timeUnit={lightcurve.mission === 'TESS' ? 'TJD' : 'BKJD'}
+        partial={lightcurve.partial}
+        segments={lightcurve.segments}
+        mission={lightcurve.mission}
         onClose={() => setShowLightcurve(false)}
       />
     )}

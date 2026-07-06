@@ -7,7 +7,11 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:data": "node src/lib/__tests__/dataRegression.test.ts"
+    "test": "npm run test:unit && npm run test:data",
+    "test:unit": "node --import ./scripts/register-ts-resolver.mjs --test src/lib/__tests__/*.unit.test.ts",
+    "test:data": "node --import ./scripts/register-ts-resolver.mjs src/lib/__tests__/dataRegression.test.ts",
+    "test:external-health": "node --import ./scripts/register-ts-resolver.mjs scripts/external-health.mjs",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.7",
@@ -21,6 +25,7 @@
     "zustand": "^5.0.14"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",

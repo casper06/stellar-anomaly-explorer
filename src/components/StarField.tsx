@@ -8,6 +8,7 @@ import { CatalogStar } from '@/lib/starCatalog'
 import { useStore } from '@/lib/store'
 import { selectStarAndFetchCurve } from '@/lib/selectStar'
 import type { CurvePattern } from '@/lib/curveClassifier'
+import { RADAR_COLOR_HEX } from '@/lib/radarPalette'
 
 const STAR_SPHERE_RADIUS = 500
 // Camera orbits the origin at a fixed radius — "zoom" is done via FOV, not by
@@ -174,8 +175,53 @@ function makeReticleTexture(): THREE.Texture {
  * by `depthScale(fov, STAR_DEPTH_MAX_SCALE)` each frame to give a sense
  * of getting closer when the user zooms in.
  */
-const STAR_BASE_SIZE = 3
 const STAR_DEPTH_MAX_SCALE = 2.5
+
+/**
+ * @description Vertex shader for the catalog star field. Honors the
+ * per-vertex `size` (magnitude-driven point size in CSS px) and
+ * per-vertex `alpha` (magnitude-driven opacity) attributes that the old
+ * default `PointsMaterial` ignored. `uDepthScale` is the FOV depth-feel
+ * multiplier, updated per frame from the CPU; `uPixelRatio` keeps point
+ * size consistent across HiDPI displays. `gl_PointSize` is set directly
+ * (no size attenuation) so screen size tracks magnitude, not distance —
+ * every catalog star sits on the same sphere anyway.
+ */
+const STAR_VERTEX_SHADER = /* glsl */ `
+  attribute float size;
+  attribute float alpha;
+  uniform float uDepthScale;
+  uniform float uPixelRatio;
+  varying vec3 vColor;
+  varying float vAlpha;
+  void main() {
+    vColor = color;
+    vAlpha = alpha;
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    gl_PointSize = size * uDepthScale * uPixelRatio;
+    gl_Position = projectionMatrix * mvPosition;
+  }
+`
+
+/**
+ * @description Fragment shader for the catalog star field. Multiplies the
+ * per-vertex color by the circular sprite's alpha mask (so points render
+ * as soft round dots, not squares) AND by the per-vertex magnitude-driven
+ * alpha, then discards near-transparent fragments so overlapping faint
+ * stars don't build up a grey haze. `sRGB` is applied via the renderer's
+ * output color space; we output linear here as three.js expects.
+ */
+const STAR_FRAGMENT_SHADER = /* glsl */ `
+  uniform sampler2D uSprite;
+  varying vec3 vColor;
+  varying float vAlpha;
+  void main() {
+    float mask = texture2D(uSprite, gl_PointCoord).a;
+    float a = mask * vAlpha;
+    if (a < 0.01) discard;
+    gl_FragColor = vec4(vColor, a);
+  }
+`
 
 const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite: THREE.Texture }>(
   function StarPoints({ stars, sprite }, ref) {
@@ -184,10 +230,11 @@ const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite
     const internalRef = useRef<THREE.Points>(null)
     const { camera } = useThree()
 
-    const { positions, colors, sizes } = useMemo(() => {
+    const { positions, colors, sizes, alphas } = useMemo(() => {
       const positions = new Float32Array(stars.length * 3)
       const colors = new Float32Array(stars.length * 3)
       const sizes = new Float32Array(stars.length)
+      const alphas = new Float32Array(stars.length)
 
       stars.forEach((star, i) => {
         const [x, y, z] = raDecToXYZ(star.ra, star.dec, STAR_SPHERE_RADIUS)
@@ -197,8 +244,8 @@ const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite
 
         // Anomaly stars override B-V color with a hot white-red core so they
         // pop against the catalog. Bias toward white at the center because
-        // PointsMaterial paints a single color across the soft sprite — a
-        // very red point disappears into the surrounding red halo.
+        // the soft sprite paints one color across the point — a very red
+        // point disappears into the surrounding red halo.
         if (star.hasAnomaly) {
           colors[i * 3] = 1.0
           colors[i * 3 + 1] = 0.55
@@ -210,23 +257,43 @@ const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite
           colors[i * 3 + 2] = color.b
         }
 
-        sizes[i] = Math.max(1.5, 8 - star.magnitude * 0.5)
-        if (star.hasAnomaly) sizes[i] *= 3
+        // Magnitude-driven size AND alpha. With the full ~118k catalog the
+        // faint tail (mag 8–13) vastly outnumbers the bright stars; scaling
+        // both size and opacity by brightness keeps the bright naked-eye
+        // stars dominant and lets the faint multitude recede into a dim
+        // backdrop instead of flattening into a uniform wall of dots.
+        // Vmag ~ -1.5 (Sirius) → 12+ (faint Hipparcos tail).
+        sizes[i] = Math.max(1.0, 7.0 - star.magnitude * 0.55)
+        // Opacity ramps from ~1.0 at mag ≤ 3 down to ~0.28 at mag ≥ 10.
+        const aRaw = 1.05 - (star.magnitude - 3.0) * 0.11
+        alphas[i] = Math.max(0.28, Math.min(1.0, aRaw))
+        if (star.hasAnomaly) {
+          sizes[i] *= 3
+          alphas[i] = 1.0
+        }
       })
 
-      return { positions, colors, sizes }
+      return { positions, colors, sizes, alphas }
     }, [stars])
 
-    // Depth-feel: scale point size by FOV each frame. Default
-    // `pointsMaterial` ignores the per-vertex `attributes-size` buffer
-    // (no custom shader), so the single `material.size` scalar is what
-    // actually controls rendered size; we modulate that here.
+    // Stable uniforms object — depth scale is mutated per frame, sprite +
+    // pixel ratio are set once. Kept in a ref so the material isn't
+    // recreated (which would drop the GPU buffers) on every render.
+    const uniforms = useRef({
+      uSprite: { value: sprite },
+      uDepthScale: { value: 1 },
+      uPixelRatio: { value: typeof window !== 'undefined' ? Math.min(window.devicePixelRatio, 2) : 1 },
+    })
+    // Keep the sprite uniform current if the texture identity changes.
+    useEffect(() => { uniforms.current.uSprite.value = sprite }, [sprite])
+
+    // Depth-feel: scale point size by FOV each frame via the uDepthScale
+    // uniform. The custom shader reads it in gl_PointSize, so this now
+    // modulates ALL per-vertex sizes uniformly rather than a single global
+    // material.size scalar.
     useFrame(() => {
-      const mesh = internalRef.current
-      if (!mesh) return
       const fov = (camera as THREE.PerspectiveCamera).fov ?? FOV_MAX
-      const mat = mesh.material as THREE.PointsMaterial
-      mat.size = STAR_BASE_SIZE * depthScale(fov, STAR_DEPTH_MAX_SCALE)
+      uniforms.current.uDepthScale.value = depthScale(fov, STAR_DEPTH_MAX_SCALE)
     })
 
     // Compose the forwarded ref with our internal one so the parent's
@@ -243,16 +310,16 @@ const StarPoints = React.forwardRef<THREE.Points, { stars: CatalogStar[]; sprite
           <bufferAttribute attach="attributes-position" args={[positions, 3]} />
           <bufferAttribute attach="attributes-color" args={[colors, 3]} />
           <bufferAttribute attach="attributes-size" args={[sizes, 1]} />
+          <bufferAttribute attach="attributes-alpha" args={[alphas, 1]} />
         </bufferGeometry>
-        <pointsMaterial
+        <shaderMaterial
           vertexColors
-          sizeAttenuation={false}
           transparent
-          opacity={0.95}
-          size={STAR_BASE_SIZE}
-          map={sprite}
-          alphaTest={0.01}
           depthWrite={false}
+          uniforms={uniforms.current}
+          vertexShader={STAR_VERTEX_SHADER}
+          fragmentShader={STAR_FRAGMENT_SHADER}
+          toneMapped={false}
         />
       </points>
     )
@@ -858,23 +925,6 @@ function FlaggedRingMarkers({
       />
     </points>
   )
-}
-
-/**
- * @description Color palette for the sky-radar overlay, keyed by
- * `CurvePattern`. IRREGULAR pops in bright magenta so it reads as
- * "interesting — worth a closer look"; PERIODIC_UNIFORM is a dim,
- * calm green so classified planetary-signal-looking stars fade into
- * the background. HIGH_VARIABILITY gets a dim yellow to flag "noisy,
- * take results with a grain of salt". SPARSE and UNCERTAIN
- * intentionally have no radar entry — the classifier is admitting
- * it can't tell, so we let those stars keep their default
- * mission-color anomaly marker with no radar tint.
- */
-const RADAR_COLOR_HEX: Partial<Record<CurvePattern, string>> = {
-  IRREGULAR: '#ff2ea6',        // bright magenta — pops as "interesting"
-  PERIODIC_UNIFORM: '#4ade80', // dim green — "boring, known"
-  HIGH_VARIABILITY: '#facc15', // dim yellow — "noisy backdrop"
 }
 
 /**
@@ -1664,9 +1714,11 @@ function formatArcmin(arcmin: number): string {
 /**
  * @description Popover shown when a click hits multiple stars within
  * `CLICK_DISAMBIG_RADIUS_PX` in the 3D sky. Lists each candidate
- * with its name and its ΔRA/ΔDec angular offset from the clicked
- * sky position (arcminutes, ΔRA cos δ-corrected); clicking an entry
- * selects that star, clicking the backdrop dismisses. Rows stay
+ * with a sky-radar pattern swatch (the star's radar tint from
+ * `classifiedPatterns`; transparent for SPARSE / UNCERTAIN /
+ * unclassified), its name, and its ΔRA/ΔDec angular offset from the
+ * clicked sky position (arcminutes, ΔRA cos δ-corrected); clicking
+ * an entry selects that star, clicking the backdrop dismisses. Rows stay
  * sorted by projected screen distance (nearest first) — the offsets
  * replaced the old mag/px columns only as the DISPLAYED values,
  * because in dense KOI stacks those rendered identically for every
@@ -1699,6 +1751,11 @@ function ClickDisambiguationPopover({
   onPick: (star: CatalogStar) => void
   onDismiss: () => void
 }) {
+  // Sky-radar pattern lookup for the per-row swatch — same data the
+  // radar overlay tints markers with (loaded from pattern-cache.json
+  // on mount, lazily filled by organic clicks). Hook must run before
+  // the early return below.
+  const classifiedPatterns = useStore(s => s.classifiedPatterns)
   // NOTE on event isolation: the container in the outer component
   // registers NATIVE `pointerdown`/`pointerup` listeners on its
   // root div via `addEventListener`. Those don't participate in
@@ -1776,7 +1833,14 @@ function ClickDisambiguationPopover({
         >
           ΔRA · ΔDEC FROM CLICK (ARCMIN)
         </div>
-        {candidates.map(c => (
+        {candidates.map(c => {
+          // Swatch = the star's radar tint. Only IRREGULAR /
+          // HIGH_VARIABILITY / PERIODIC_UNIFORM have colors; SPARSE,
+          // UNCERTAIN, and unclassified stars render a transparent
+          // placeholder so row text stays aligned.
+          const pattern = classifiedPatterns.get(c.star.id)
+          const tint = pattern ? RADAR_COLOR_HEX[pattern] : undefined
+          return (
           <button
             key={c.star.id}
             onClick={() => onPick(c.star)}
@@ -1802,6 +1866,18 @@ function ClickDisambiguationPopover({
             onMouseLeave={e => { e.currentTarget.style.background = 'none' }}
           >
             <span
+              title={pattern}
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: '50%',
+                flexShrink: 0,
+                background: tint ?? 'transparent',
+                boxShadow: tint ? `0 0 4px ${tint}` : 'none',
+                alignSelf: 'center',
+              }}
+            />
+            <span
               style={{
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
@@ -1819,7 +1895,8 @@ function ClickDisambiguationPopover({
               {formatArcmin(c.dDecArcmin)}
             </span>
           </button>
-        ))}
+          )
+        })}
       </div>
       <style jsx>{`
         @keyframes sf-disambig-fade {

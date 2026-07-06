@@ -5,6 +5,8 @@ import { KNOWN_ANOMALIES } from '@/lib/starCatalog'
 import { ALL_QUADRANT_IDS, quadrantCenter } from '@/lib/quadrants'
 import StarSearch from './StarSearch'
 import { selectStarAndFetchCurve } from '@/lib/selectStar'
+import { RADAR_COLOR_HEX } from '@/lib/radarPalette'
+import type { CurvePattern } from '@/lib/curveClassifier'
 
 /**
  * @description Threshold (degrees, camera FOV) below which the quadrant
@@ -168,6 +170,7 @@ export default function HUD() {
     requestFlyTo,
     visitedIds,
     flaggedIds,
+    classifiedPatterns,
   } = useStore()
 
   // Transient toast for "NO ANOMALIES IN VIEW" feedback. Local state with
@@ -435,6 +438,8 @@ export default function HUD() {
           <MissionCount label="TESS" count={toiCount} error={toiError} accent="#00e5ff" />
         </div>
 
+        <RadarLegend patterns={classifiedPatterns} fov={zoom} />
+
         <button
           onClick={goToNearestAnomaly}
           style={{
@@ -581,6 +586,71 @@ export default function HUD() {
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * @description FOV (degrees) above which the sky-radar legend hides.
+ * Matches `ANOMALY_HARD_CUTOFF_FOV = 55` in StarField — the radar tint
+ * layer itself is hidden at ≥ 55°, and a legend for invisible dots is
+ * noise.
+ */
+const RADAR_LEGEND_FOV_CUTOFF = 55
+
+/**
+ * @description Legend for the sky-radar tint layer, shown in the
+ * bottom-left HUD stack under the mission counter card. One row per
+ * tinted pattern (colors from the shared `RADAR_COLOR_HEX` palette)
+ * plus a note that untinted markers are SPARSE / UNCERTAIN /
+ * not-yet-classified by design. Hidden while no patterns are loaded
+ * (radar has nothing to explain) and at wide FOV where the tint layer
+ * itself isn't rendered.
+ * @param patterns The store's classified-patterns map (size gates visibility).
+ * @param fov Current camera FOV in degrees.
+ * @returns Legend card, or null when the radar layer isn't visible.
+ */
+function RadarLegend({ patterns, fov }: { patterns: Map<string, CurvePattern>; fov: number }) {
+  if (patterns.size === 0 || fov >= RADAR_LEGEND_FOV_CUTOFF) return null
+  const rows: Array<{ color: string; label: string; note: string }> = [
+    { color: RADAR_COLOR_HEX.IRREGULAR!, label: 'IRREGULAR', note: 'worth a closer look' },
+    { color: RADAR_COLOR_HEX.HIGH_VARIABILITY!, label: 'HIGH VARIABILITY', note: 'noisy baseline' },
+    { color: RADAR_COLOR_HEX.PERIODIC_UNIFORM!, label: 'PERIODIC', note: 'regular repeating dips' },
+  ]
+  return (
+    <div
+      style={{
+        background: 'rgba(0,0,0,0.7)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        borderRadius: 8,
+        padding: '8px 12px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+      }}
+    >
+      <div style={{ fontSize: 8, letterSpacing: 2, color: 'rgba(255,255,255,0.35)' }}>
+        SKY RADAR
+      </div>
+      {rows.map(r => (
+        <div key={r.label} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: '50%',
+              background: r.color,
+              boxShadow: `0 0 4px ${r.color}`,
+              flexShrink: 0,
+            }}
+          />
+          <span style={{ fontSize: 9, color: 'white', letterSpacing: 1 }}>{r.label}</span>
+          <span style={{ fontSize: 8, color: 'rgba(255,255,255,0.4)' }}>{r.note}</span>
+        </div>
+      ))}
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.3)', letterSpacing: 0.5 }}>
+        NO TINT = SPARSE / UNCERTAIN / UNCLASSIFIED
+      </div>
     </div>
   )
 }

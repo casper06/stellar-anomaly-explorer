@@ -3,12 +3,16 @@ import { classifyCurve } from './curveClassifier'
 import { setEntry, getCachedIds } from './patternCache'
 
 /**
- * @description Number of concurrent lightcurve fetches. MAST tolerates
- * modest parallelism; we cap at 5 to stay well under rate-limit
- * thresholds while making meaningful progress. Higher values may work
- * but risk 429s during long runs.
+ * @description Number of concurrent lightcurve fetches (stars in flight).
+ * Lowered from 5 to 3 (2026-07-06): each star's fetch now opens its own
+ * bounded pool of up to SEGMENT_DOWNLOAD_CONCURRENCY (4) simultaneous
+ * segment downloads to archive.stsci.edu, so total peak connections =
+ * stars × pool. At 3 stars × 4 = 12 peak this stays in the safe zone
+ * that reliably recovers all segments (the drops that produced partial
+ * curves appeared well above this). 5 × 4 = 20 would re-risk the
+ * concurrency drops the pool exists to prevent.
  */
-const MAX_CONCURRENCY = 5
+const MAX_CONCURRENCY = 3
 
 /**
  * @description Millisecond pause between batches of `MAX_CONCURRENCY`
@@ -124,8 +128,24 @@ async function classifyOne(
       times: number[]
       flux: number[]
       source: 'real' | 'unavailable' | 'synthetic'
+      partial?: boolean
     }
-    if (data.source === 'unavailable' || !data.times || data.times.length === 0) return 'no-data'
+    // Only REAL data may produce a shared pattern-cache entry. In dev the
+    // lightcurve route substitutes a synthetic curve when the MAST fetch
+    // fails for a catalog star — classifying that would write a fake
+    // pattern into the cache the sky radar renders as truth. Treat
+    // anything non-real (synthetic included) as no-data; the next run
+    // retries those stars against MAST.
+    if (data.source !== 'real' || !data.times || data.times.length === 0) return 'no-data'
+    // PARTIAL curves must NOT populate the pattern cache: a classification
+    // from a truncated curve (e.g. SPARSE from 2 of 17 quarters when the
+    // full curve is PERIODIC_UNIFORM — the K00931.01 case) would freeze a
+    // wrong label into the sky radar. Skip it like no-data; the next batch
+    // retries the star, and by then the bounded-pool + retry download is
+    // likely to have completed it. This also re-heals the ~9k batch cache:
+    // its truncated v1 entries were invalidated by the cache-schema bump,
+    // so they refetch, and only complete curves get re-cached.
+    if (data.partial) return 'no-data'
     const dips = detectDips(data.flux, data.times)
     const profile = classifyCurve(data.times, data.flux, dips)
     await setEntry(spec.id, profile.pattern)

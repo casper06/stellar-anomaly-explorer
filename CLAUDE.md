@@ -56,6 +56,11 @@ src/
     patternCache.ts       # Server-side pattern cache read/write (pattern-cache.json)
     batchClassifier.ts    # Shared runtime state + worker for the batch classify job
     selectStar.ts         # Shared "select + fly + fetch curve" flow used by clicks and search
+    externalEndpoints.ts  # Single source of truth for all external URLs (routes + health check import it)
+scripts/
+    external-health.mjs   # npm run test:external-health — live probe of the 5 external services
+docs/
+    KNOWLEDGE_BASE.md     # Permanent record of confirmed findings + design decisions
 ```
 
 ## UI language
@@ -98,7 +103,15 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 ## Current project state
 
 ### What works ✅
-- Navigable 3D sky with ~8000 stars rendered as `Points` (WebGL)
+- Navigable 3D sky with the FULL ~118,000-star Hipparcos main catalog
+  (all-sky, no magnitude ceiling) rendered as a single `THREE.Points`
+  (WebGL). Served through `/api/stars` with a 30-day disk cache (the
+  Hipparcos dataset is fixed, ESA 1997) so the ~16 MB parse happens
+  once. A custom `ShaderMaterial` honors per-vertex, magnitude-driven
+  **size AND alpha** (bright stars big + opaque; the faint mag-8–13
+  tail recedes into a dim backdrop) — the earlier default
+  `PointsMaterial` ignored the per-vertex size buffer and drew every
+  star the same size. `uDepthScale` uniform carries the FOV depth-feel.
 - Real star colors based on B-V index (blue=hot, red=cool)
 - 11 hardcoded known anomalies as seeds (Tabby's Star, KIC 6543674, KIC 4150804, KIC 11610797, EPIC 201637175, KIC 11852982, KIC 3542116, KIC 8548587, KIC 5955033, KIC 12557548 disintegrating-planet candidate, KIC 10195478) + ~6,000 unique KOI stars loaded from the NASA Exoplanet Archive
 - Hover-proximity labels over anomalies (one at a time, closest to cursor)
@@ -122,6 +135,40 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 
 ### Next features 🚀
 - More Kepler/K2/TESS anomaly seeds beyond the current 11
+- **Celestial orientation / "where am I looking"**: users navigating
+  the 3D explorer have no reference for what part of the real sky a
+  given region corresponds to. Proposed: when navigating to a region,
+  show which constellation it falls in (e.g. "this is in Cygnus"), a
+  context mini-map showing that region relative to the whole sky, and
+  hemisphere visibility info (visible from the northern hemisphere at
+  X, southern at Y, or not visible at all from one of them). Likely
+  requires cross-referencing existing RA/Dec data against an IAU
+  constellation-boundaries catalog, plus visibility-by-latitude
+  logic. Future idea — not being implemented now.
+- **In-app interactive tutorial**: a button (HUD, near the search
+  bar) that launches a slide-based or similarly didactic walkthrough
+  of how to use the app itself — navigation, what the markers mean,
+  how to read the lightcurve viewer, what the REAL DATA vs
+  DEV/SYNTHETIC badges mean, and how citizen-science reporting works.
+  This is product onboarding (deeper than the current first-run
+  overlay), separate from the astronomy-content feature above. Future
+  idea — not being implemented now.
+- **Target Pixel File (TPF) centroid analysis** (opt-in, per-star,
+  on-demand ONLY): for a selected star, fetch its Kepler/TESS Target
+  Pixel File from MAST and compute the flux-weighted centroid of the
+  aperture over time. A transit on the TARGET star keeps the centroid
+  fixed; an apparent "transit" that actually comes from a background
+  eclipsing binary blended into the aperture pulls the centroid toward
+  the contaminating source during the dip. Surfacing an in-transit vs
+  out-of-transit centroid shift is the standard first-order false-
+  positive vetting test citizen scientists and the Kepler/TESS teams
+  use. Must stay OPT-IN and on-demand: TPFs are large (per-cadence
+  postage-stamp images, MB–tens of MB per quarter/sector) and computing
+  centroids is far heavier than the light-curve path, so it can't run
+  in the batch or on every selection — only when a user explicitly asks
+  for it on one star. Descriptive framing per the classifier rule (show
+  the measured centroid shift; don't assert "this is a false positive").
+  Future idea — not being implemented now.
 
 ## Real-data integration
 
@@ -129,12 +176,73 @@ Both the star catalog and per-star light curves go through Next.js API routes
 so the browser never talks to external archives directly (CORS).
 
 ### `/api/stars`
-- Proxies `https://vizier.cds.unistra.fr/.../I/239/hip_main` (Hipparcos main catalog)
-- Parses TSV, prepends `KNOWN_ANOMALIES`, caches the parsed catalog in-process
+- Proxies the Hipparcos main catalog (I/239/hip_main) from VizieR via
+  **`/viz-bin/asu-tsv`** — the older `/viz-bin/TSV` path 404s as of
+  2026-07 (VizieR moved it), which silently pushed the app onto the
+  synthetic fallback for an unknown period before the 2026-07-04 audit
+  caught it.
+- Selection: **the FULL catalog, no `Vmag` ceiling (~118,000 rows),
+  all-sky** (`-out.max=130000`). Replaced the earlier `Vmag < 6.5`
+  naked-eye filter (~8,785 rows) — the app now renders the whole
+  Hipparcos main catalog. The URL constant lives in
+  `src/lib/externalEndpoints.ts` (`VIZIER_HIP_URL`), shared with the
+  external-health check so probe and production URLs can't drift.
+- Position columns are the catalog-native **`RAICRS` / `DEICRS`**
+  (degrees). The previously-requested `RArad`/`DErad` names are no
+  longer honored; VizieR silently DROPS unknown requested columns, so
+  the parser now locates columns BY NAME from the header row and
+  throws if a required column is missing (contract-change detection
+  instead of garbage coordinates). The parser also detects VizieR's
+  error-envelope (`#INFO QUERY_STATUS=ERROR`, seen during a 2026-07-05
+  backend DB outage) and the HTTP-header-echo lines it prepends to the
+  body, so neither is mistaken for data.
+- **Disk cache** at `<os.tmpdir()>/stellar-cache/hipparcos-catalog.json`,
+  schema-versioned, **30-day TTL** (the Hipparcos dataset is a fixed
+  historical catalog, so the TTL is just a bound on local staleness /
+  a periodic re-fetch to recover from a cache written during a VizieR
+  outage). Atomic temp+rename; rejects entries with < 10,000 rows
+  (a cache written during a partial fetch).
+- **`KNOWN_ANOMALIES` seeds are guaranteed on EVERY served path** via
+  `withKnownAnomalies(parsed)` — prepended (deduped by id, seed wins)
+  on the live-fetch path AND re-injected on the disk-cache read path,
+  not just baked into the stored array. The 11 seeds (Tabby's Star et
+  al.) carry real Kepler light-curve data and must stay searchable /
+  flaggable / visible regardless of the Hipparcos path. Regression
+  guarded: they were baked into the stored array at write time only,
+  so a disk cache written WITHOUT them (injected synthetic-scale test
+  data during the 2026-07-05 VizieR outage) silently dropped Tabby's
+  Star from search and the flagged list. The store/persistence was
+  never at fault — `flaggedIds` still held the id; the catalog just no
+  longer contained the star for the FlaggedPanel/StarSearch to resolve.
 - Response shape: `{ stars: CatalogStar[], source: 'real' | 'fallback' }`
-- On any failure returns just `KNOWN_ANOMALIES` with `source: 'fallback'`; the
-  client (`fetchHipparcosCatalog`) then pads with synthetic stars so the sky
-  isn't sparse
+- On any failure returns just `KNOWN_ANOMALIES` with `source: 'fallback'`
+  — and logs the reason LOUDLY (`[stars] VizieR fetch FAILED`); the
+  client (`fetchHipparcosCatalog`) then pads with synthetic stars so
+  the sky isn't sparse. Silent fallback is how the endpoint breakage
+  went undetected.
+
+### External endpoint constants (`src/lib/externalEndpoints.ts`)
+Single source of truth for every EXTERNAL data URL the app hits
+(VizieR, NASA KOI/TOI TAP, MAST VO-TAP, MAST FITS download). Both the
+API routes AND the external-health check import from here, so a probe
+can never test a different URL than production sends. Dependency-free
+(no `next/*`) so the plain-Node health harness can import it. The
+lightcurve route's `mastTapQueryUrl` / `mastConeSearchUrl` /
+`resolveSegmentDownloadUrl` moved here; the KOI/TOI/stars routes import
+their TAP/VizieR URLs from here.
+
+### External-dependency health check (`npm run test:external-health`)
+Live-network probe of the 5 external services, using the exact
+`externalEndpoints.ts` constants. NOT part of `npm test` (which stays
+offline/fast). Each check verifies the CONTRACT, not just reachability:
+Hipparcos required columns present; KOI schema; TOI `tid` column
+present (the historical `tic_id` mistake); MAST TAP returns
+`access_url` rows; a MAST segment actually downloads as valid FITS
+(`SIMPLE  =` magic). Exit 0 = all healthy, 1 = any failure. Designed
+to catch the class of silent contract change (VizieR column rename,
+endpoint move) that degraded the app to a fallback undetected. It
+distinguishes a VizieR upstream outage ("service degraded") from a
+real column-contract change so the report is actionable.
 
 ### `/api/koi`
 - Proxies the NASA Exoplanet Archive's KOI cumulative table via TAP
@@ -450,9 +558,15 @@ without opening each light curve.
 
 **Persistence** (`lib/patternCache.ts`, server-side): single JSON
 file at `<os.tmpdir()>/stellar-cache/pattern-cache.json`, shape
-`{ entries: { [starId]: { pattern, computedAt } } }`. No TTL — a
-star's PDC data doesn't change over time, so cached patterns live
-until manually deleted. Full ~9k-star population is ~500 KB; we
+`{ entries: { [starId]: { pattern, computedAt, classifierVersion } } }`.
+No TTL — a star's PDC data doesn't change over time — but the
+ALGORITHM does: entries record the `CLASSIFIER_VERSION` that computed
+them, `getCachedIds()` (the batch resume skip-list) only counts
+current-version entries, and `onlyIfMissing` writes overwrite
+old-version entries. Bumping the version therefore makes the next
+batch run re-classify the whole catalog instead of serving
+mixed-provenance labels. The GET endpoint still serves old-version
+entries to the radar until the re-batch replaces them. Full ~9k-star population is ~500 KB; we
 rewrite the whole file on every mutation (atomic temp+rename, same
 pattern as the lightcurve cache). Concurrent writers serialize
 through a `writeChain` promise so batch + organic fill can't race.
@@ -1025,23 +1139,52 @@ a conclusion.
   any `[dip.startIdx, dip.endIdx]`. Returned as a fraction, so
   0.002 = 0.2% noise.
 
-**Pattern label priority:**
-1. `HIGH_VARIABILITY` if `baselineRMS ≥ 0.01` (1% noise floor).
-   Takes precedence — a noisy backdrop makes any pattern call
-   unreliable, so we surface the noise first.
-2. `PERIODIC_UNIFORM` if `periodicity ≥ 0.5` AND
-   `depthConsistency ≥ 0.5`. Both conditions required.
-3. `SPARSE` if dip count < `MIN_DIPS_FOR_PATTERN = 3`.
-4. `IRREGULAR` otherwise.
+**BLS period search (classifier v2, 2026-07-04)**: `lib/bls.ts` is a
+budgeted plain-TS Box Least Squares search (no deps): upper-only MAD
+clip → 3 h time-binning → log-spaced coarse frequency grid capped by
+an ops budget (P 0.5–120 d, 200 phase bins, 6 box durations) → SDE
+statistic over the SR spectrum → 15× refinement around the peak.
+~1–2 s per full-mission curve; `BLS_SDE_THRESHOLD = 7.5` is the
+confidence bar. Documented approximations: sensitivity degrades for
+durations ≲ 3 h and periods ≲ 1 d unless the signal is deep; red
+noise suppresses SDE (sub-threshold = "no confident detection",
+never "no signal"). `CurveProfile.bls` carries the raw result
+(period/epoch/depth/duration/SDE) REGARDLESS of pattern label — the
+readout shows it as its own "Statistical periodic signal detected
+(BLS)" line. A SPARSE star with a confident BLS line is the
+NASA-score-vs-local-detector desync case made self-explanatory
+(e.g. K02357.02: 1 visible dip, but BLS finds the sibling planet
+K02357.01 at P=2.4210 d / 157 ppm, matching NASA to 5e-5).
 
-`bestFitPeriodDays` is only surfaced when the pattern label is
-`PERIODIC_UNIFORM` — outside that branch the candidate period is
-meaningless and displaying it contradicts the label. (The earlier
-gate was `periodicity ≥ 0.5` + not-UNCERTAIN, which leaked the
-contradiction on Tabby's Star: periodicity 0.601 with
-depthConsistency 0 → IRREGULAR, yet a bogus 0.307 d period rendered
-next to the IRREGULAR badge. Fixed 2026-07-03; pinned by the
-KIC8462852 fixture in the data regression test.)
+**Pattern label priority (v2):**
+1. `HIGH_VARIABILITY` if `baselineRMS ≥ 0.01` (1% noise floor).
+   Takes precedence — even over a confident BLS hit (the BLS line
+   still shows separately).
+2. `SPARSE` if dip count < `MIN_DIPS_FOR_PATTERN = 3`. This gate is
+   deliberate: PERIODIC_UNIFORM's copy describes the VISIBLE dip
+   pattern, so a confident BLS signal with 0–2 visible dips must NOT
+   promote — that would make the label describe something the user
+   can't verify by looking at the curve (describe-don't-diagnose).
+3. `PERIODIC_UNIFORM` if the BLS search found a confident signal
+   (SDE ≥ 7.5, period ≥ MIN_PLAUSIBLE_PERIOD_DAYS). Replaced the old
+   interval-folding gate + implausible-period/dip-density guards — a
+   real phase-folding search inherently rejects cadence lock-on.
+4. `UNCERTAIN` if the raw scalars look periodic (periodicity ≥ 0.5
+   AND depthConsistency ≥ 0.5) but BLS found nothing confident — the
+   signature of the dip detector locking onto flicker.
+5. `IRREGULAR` otherwise.
+
+`bestFitPeriodDays` is sourced from BLS and surfaced only when the
+label is `PERIODIC_UNIFORM` (anywhere else a period would contradict
+the label). `CLASSIFIER_VERSION` (currently 2) must be bumped on any
+change that can alter labels — pattern-cache entries record it, and
+the batch treats old-version entries as missing (re-classifies).
+
+**Client thread**: classification (dominated by BLS) runs in a Web
+Worker via `lib/classifyAsync.ts` → `workers/classify.worker.ts`;
+Node paths (batch, unit tests) and any worker failure fall back to a
+direct call. `selectStar` re-checks its selection generation after
+the await, same rule as after the fetch.
 
 **Flow:** `selectStar` in `StarField.tsx` calls `classifyCurve`
 after `detectDips`, stuffs the result into `lightcurve.profile`,
@@ -1062,12 +1205,10 @@ expected values (dip count, pattern label, top-dip label / peak
 time / depth, best-fit period). Fails loudly (per-field diff +
 exit 1) on any drift.
 
-**Run it BEFORE and AFTER any change to** `anomalyDetector.ts`,
-`curveClassifier.ts`, `fitsReader.ts`, or the `/api/lightcurve`
-fetch/normalization layer. Plain Node ≥ 22.6 executes the TS via
-native type stripping — no test framework, no extra deps
-(`allowImportingTsExtensions` was added to tsconfig for the `.ts`
-imports; the two libs under test import nothing but types).
+Plain Node ≥ 22.6 executes the TS via native type stripping — no
+test framework, no extra deps (`allowImportingTsExtensions` was
+added to tsconfig for the `.ts` imports). When to run it: see the
+**pre-change checklist** in the Testing section below.
 
 After an INTENTIONAL algorithm change: `npm run test:data -- --print`
 dumps the newly-measured values; re-verify them by hand, then update
@@ -1081,15 +1222,71 @@ baseline; hand-verified via transit-count agreement), K01725.01
 implausible-period guard; its real 0.15% transits are below the 1%
 dip threshold).
 
-One KNOWN classifier quirk is deliberately frozen by the
-expectations (changing it should trip the test so it's a conscious
-decision): K00931.01, a textbook periodic transiter, computes
-periodicity ≈ 0.4996 — a hair under the 0.5 cutoff — and
-therefore labels IRREGULAR with no period. (A second quirk —
-Tabby's IRREGULAR profile surfacing a meaningless 0.307 d best-fit
-period — was FIXED on 2026-07-03: the classifier now returns a
-period only for PERIODIC_UNIFORM, and the KIC8462852 fixture
-asserts `bestFitPeriodDays: null` so it can't regress.)
+Expectations were re-frozen 2026-07-04 for classifier v2 (BLS): the
+old K00931.01 quirk (periodicity 0.4996, a hair under the cutoff →
+IRREGULAR) is RESOLVED — BLS promotes it to PERIODIC_UNIFORM at
+P ≈ 3.85563 d (NASA: 3.855603916, 6e-6 relative agreement). The
+fixtures now also pin BLS behavior: Tabby must NOT fold confidently
+(aperiodic), K02357.02 must find the sibling planet's 2.4210 d
+signal while staying SPARSE (promotion gate), and K01725.01's
+variability-driven raw periodicity must stay UNCERTAIN because BLS
+finds no confident signal in its red noise.
+
+### Testing — layers & pre-change checklist
+Three test layers, one lookup table. **Run the matching commands
+BEFORE and AFTER touching the listed area:**
+
+| Touching | Run |
+|---|---|
+| `anomalyDetector` / `curveClassifier` / `fitsReader` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
+| `selectStar` / `store` / `persistence` | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
+| `StarField` selection paths / CameraSync / disambiguation popover / HUD panels | `npm run test:e2e` |
+| anything else | `npx tsc --noEmit` + verify in the browser, as always |
+
+`npm test` = `test:unit && test:data` — the fast no-browser gate
+(~5 s total), safe to run reflexively.
+
+**Layer 1 — unit (`npm run test:unit`)**: `node --test` over
+`src/lib/__tests__/*.unit.test.ts`. Zero dependencies — plain Node
+≥ 22.6 native type stripping plus `scripts/register-ts-resolver.mjs`,
+a module hook that retries the app's bundler-style extensionless
+relative imports with `.ts` (Node's ESM loader alone rejects them;
+`test:data` uses the same hook since the classifier now imports
+`./bls` at runtime). Covers: `fitsReader` (synthetic FITS buffers
+built to spec — HDU walking, TTYPE lookup, TFORM D/E/J/I,
+repeat-count offsets, NaN→null, multi-block headers, both error
+paths), the BLS engine (`bls.unit.test.ts`: deterministic synthetic
+transit injections — deep/short-period and shallow 500 ppm at
+full-mission scale with a 3 s wall-clock budget — plus pure-noise
+and aperiodic-dips null tests), the `selectStar`
+selection-generation guard (stubbed `globalThis.fetch` with
+manually-ordered deferred responses — both stale orderings,
+loading-flag ownership, pattern-cache POST suppression), and store
+contracts (new Set/Map references on mutation, idempotence
+short-circuits, cursor reset, flyTo command ids, localStorage
+persistence + private-mode swallow via a shim).
+
+**Layer 2 — data regression (`npm run test:data`)**: see the
+section above.
+
+**Layer 3 — E2E (`npm run test:e2e`)**: Playwright (`@playwright/
+test` devDependency; one-time `npx playwright install chromium`).
+Config in `playwright.config.ts`: boots `npm run dev` itself, or
+reuses a server already on :3000 (`reuseExistingServer`); 1 worker
+(specs share server caches); SwiftShader flag for headless WebGL.
+Specs in `e2e/` formalize scenarios previously only verified by
+hand:
+- `auto-select-transition.spec.ts` — transition-on-center fires,
+  search picks survive the suppression window, drags re-fire.
+- `popover-disambiguation.spec.ts` — dense-field candidate counts
+  stay single-digit (the screen-distance fix) and an off-center
+  pick sticks.
+- `selection-race.spec.ts` — the stale-response race made
+  deterministic: `page.route()` serves the repo's gzipped fixtures
+  and holds the stale star's response until after the newer pick
+  resolves. No cold MAST, fully offline-reproducible.
+Full E2E run ≈ 3–5 min warm; first-ever run adds the chromium
+download and cold catalog fetches.
 
 ### Interactive LightCurve mode
 `<LightCurve interactive />` (used in the fullscreen overlay) adds:
@@ -1370,18 +1567,25 @@ Point sizes scale with FOV to fake "getting closer to the stars" — at
 FOV 75° points render at their base size, at FOV 20° they're scaled up
 linearly. Implemented via `depthScale(fov, maxScale)` helper, applied
 each frame in `useFrame`:
-- Catalog star points: base 3 px, max scale **2.5×**.
+- Catalog star points: per-vertex magnitude-driven base size, max scale
+  **2.5×** applied via the `uDepthScale` shader uniform.
 - Anomaly rings (outer/mid/core): max scale **3.0×**, multiplied INTO
   the existing pulse animation so the pulse stays visible but at a
   larger amplitude when zoomed in.
 
-This is per-frame scalar mutation of `pointsMaterial.size`, not a
-per-vertex buffer rebuild, so it costs ~nothing. Note: the default
-`pointsMaterial` shader ignores the per-vertex `attributes-size` buffer
-in `StarPoints` — that buffer is dead code; only `material.size`
-controls rendered size. A future improvement would be a custom shader
-that honors the per-vertex sizes so brighter stars actually render
-bigger; until then, all catalog stars render at the same scaled size.
+`StarPoints` now uses a custom `ShaderMaterial` (`STAR_VERTEX_SHADER` /
+`STAR_FRAGMENT_SHADER`) that DOES honor the per-vertex `size` and
+`alpha` buffers — brighter (lower-magnitude) stars render bigger AND
+more opaque; the faint mag-8–13 tail recedes into a dim backdrop.
+`gl_PointSize = size * uDepthScale * uPixelRatio` (no size attenuation
+— all catalog stars sit on the same sphere, so screen size tracks
+magnitude, not distance). The depth-feel is now a single per-frame
+uniform write (`uDepthScale`), NOT a per-vertex buffer rebuild, so it
+still costs ~nothing — and it scales all 118k per-vertex sizes
+uniformly. The anomaly/radar/selection overlay layers still use plain
+`pointsMaterial` (their point counts are small and they animate their
+own size scalars). The old note that the per-vertex size buffer was
+"dead code" is obsolete — the custom shader consumes it.
 
 ### Real B-V colors
 ```

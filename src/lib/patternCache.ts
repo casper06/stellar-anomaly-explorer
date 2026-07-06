@@ -1,18 +1,21 @@
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import type { CurvePattern } from './curveClassifier'
+import { CLASSIFIER_VERSION, type CurvePattern } from './curveClassifier'
 
 /**
  * @description One classified star entry in the pattern cache. `pattern` is
  * the label from `classifyCurve`; `computedAt` is when it landed in the
- * cache (ms since epoch). Patterns are stable — a real star's data
- * doesn't change — so there's no TTL: entries live until manually
- * cleared or the file is deleted.
+ * cache (ms since epoch); `classifierVersion` records which algorithm
+ * version computed it (see CLASSIFIER_VERSION — pre-versioning entries
+ * have the field undefined). A star's data is stable so there's no TTL,
+ * but the ALGORITHM isn't: the batch classifier treats entries from a
+ * different classifier version as missing and re-classifies them.
  */
 export interface PatternCacheEntry {
   pattern: CurvePattern
   computedAt: number
+  classifierVersion?: number
 }
 
 /**
@@ -103,20 +106,31 @@ export async function setEntry(
   opts: { onlyIfMissing?: boolean } = {},
 ): Promise<void> {
   const cache = await getCache()
-  if (opts.onlyIfMissing && cache.entries[starId]) return
-  cache.entries[starId] = { pattern, computedAt: Date.now() }
+  // An entry from an OLDER classifier version never blocks a write —
+  // current-version output always wins over stale-algorithm output.
+  const existing = cache.entries[starId]
+  if (opts.onlyIfMissing && existing && existing.classifierVersion === CLASSIFIER_VERSION) return
+  cache.entries[starId] = { pattern, computedAt: Date.now(), classifierVersion: CLASSIFIER_VERSION }
   writeChain = writeChain.then(persist).catch(() => { /* logged in persist */ })
   await writeChain
 }
 
 /**
- * @description Returns the set of ids currently in the cache. Used by
- * the batch job to skip already-classified stars when resuming.
- * @returns Set of cached star ids.
+ * @description Returns the set of ids whose cached entry was computed by
+ * the CURRENT classifier version. Used by the batch job to skip
+ * already-classified stars when resuming — entries from older versions
+ * are deliberately excluded so a version bump makes the next batch run
+ * re-classify the whole catalog instead of serving mixed-provenance
+ * labels.
+ * @returns Set of current-version cached star ids.
  */
 export async function getCachedIds(): Promise<Set<string>> {
   const cache = await getCache()
-  return new Set(Object.keys(cache.entries))
+  return new Set(
+    Object.keys(cache.entries).filter(
+      id => cache.entries[id].classifierVersion === CLASSIFIER_VERSION,
+    ),
+  )
 }
 
 /**

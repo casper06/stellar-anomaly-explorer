@@ -1,6 +1,6 @@
 import { useStore, type Star } from './store'
 import { fetchLightcurve, detectDips } from './anomalyDetector'
-import { classifyCurve } from './curveClassifier'
+import { classifyCurveAsync } from './classifyAsync'
 
 /**
  * @description Monotonic generation counter for selection requests. Each
@@ -66,7 +66,7 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
     // AND set onDemand=1 so a MAST miss returns 'unavailable' rather
     // than fake data.
     const isCatalogStar = /^(KIC|TIC|EPIC)\d+$/.test(star.id)
-    const { times, flux, source, provenance, mission, gapDays } =
+    const { times, flux, source, provenance, mission, gapDays, partial, segments } =
       await fetchLightcurve(star.id, {
         ra: star.ra,
         dec: star.dec,
@@ -86,10 +86,16 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
       peakTime: d.peakTime,
       label: d.label,
     }))
+    // Classification includes the ~1–2 s BLS search; in the browser it
+    // runs in a Web Worker (classifyCurveAsync) so the sky stays
+    // responsive. Because it awaits, a NEWER selection can supersede
+    // this one mid-classify — re-check the generation afterwards, same
+    // rule as the fetch above.
     const profile =
       source === 'unavailable' || times.length === 0
         ? null
-        : classifyCurve(times, flux, dips)
+        : await classifyCurveAsync(times, flux, dips)
+    if (generation !== selectionGeneration) return
     setLightcurve({
       times,
       flux,
@@ -99,6 +105,8 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
       profile,
       mission: mission ?? null,
       gapDays: gapDays ?? 5,
+      partial: partial ?? false,
+      segments,
     })
     setAnomalies(anomalyDips.filter(d => d.label !== 'NORMAL'))
     // Lazy fill-in for the sky-radar pattern cache. Mirrors the sky-click
