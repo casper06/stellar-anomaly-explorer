@@ -56,6 +56,11 @@ src/
     patternCache.ts       # Server-side pattern cache read/write (pattern-cache.json)
     batchClassifier.ts    # Shared runtime state + worker for the batch classify job
     selectStar.ts         # Shared "select + fly + fetch curve" flow used by clicks and search
+    externalEndpoints.ts  # Single source of truth for all external URLs (routes + health check import it)
+scripts/
+    external-health.mjs   # npm run test:external-health — live probe of the 5 external services
+docs/
+    KNOWLEDGE_BASE.md     # Permanent record of confirmed findings + design decisions
 ```
 
 ## UI language
@@ -98,8 +103,15 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 ## Current project state
 
 ### What works ✅
-- Navigable 3D sky with ~8,800 real Hipparcos stars (Vmag < 6.5,
-  naked-eye, all-sky) rendered as `Points` (WebGL)
+- Navigable 3D sky with the FULL ~118,000-star Hipparcos main catalog
+  (all-sky, no magnitude ceiling) rendered as a single `THREE.Points`
+  (WebGL). Served through `/api/stars` with a 30-day disk cache (the
+  Hipparcos dataset is fixed, ESA 1997) so the ~16 MB parse happens
+  once. A custom `ShaderMaterial` honors per-vertex, magnitude-driven
+  **size AND alpha** (bright stars big + opaque; the faint mag-8–13
+  tail recedes into a dim backdrop) — the earlier default
+  `PointsMaterial` ignored the per-vertex size buffer and drew every
+  star the same size. `uDepthScale` uniform carries the FOV depth-feel.
 - Real star colors based on B-V index (blue=hot, red=cool)
 - 11 hardcoded known anomalies as seeds (Tabby's Star, KIC 6543674, KIC 4150804, KIC 11610797, EPIC 201637175, KIC 11852982, KIC 3542116, KIC 8548587, KIC 5955033, KIC 12557548 disintegrating-planet candidate, KIC 10195478) + ~6,000 unique KOI stars loaded from the NASA Exoplanet Archive
 - Hover-proximity labels over anomalies (one at a time, closest to cursor)
@@ -141,6 +153,22 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   This is product onboarding (deeper than the current first-run
   overlay), separate from the astronomy-content feature above. Future
   idea — not being implemented now.
+- **Target Pixel File (TPF) centroid analysis** (opt-in, per-star,
+  on-demand ONLY): for a selected star, fetch its Kepler/TESS Target
+  Pixel File from MAST and compute the flux-weighted centroid of the
+  aperture over time. A transit on the TARGET star keeps the centroid
+  fixed; an apparent "transit" that actually comes from a background
+  eclipsing binary blended into the aperture pulls the centroid toward
+  the contaminating source during the dip. Surfacing an in-transit vs
+  out-of-transit centroid shift is the standard first-order false-
+  positive vetting test citizen scientists and the Kepler/TESS teams
+  use. Must stay OPT-IN and on-demand: TPFs are large (per-cadence
+  postage-stamp images, MB–tens of MB per quarter/sector) and computing
+  centroids is far heavier than the light-curve path, so it can't run
+  in the batch or on every selection — only when a user explicitly asks
+  for it on one star. Descriptive framing per the classifier rule (show
+  the measured centroid shift; don't assert "this is a false positive").
+  Future idea — not being implemented now.
 
 ## Real-data integration
 
@@ -153,24 +181,68 @@ so the browser never talks to external archives directly (CORS).
   2026-07 (VizieR moved it), which silently pushed the app onto the
   synthetic fallback for an unknown period before the 2026-07-04 audit
   caught it.
-- Selection: **`Vmag < 6.5` (naked-eye stars, ~8,785 rows), all-sky**.
-  Replaces the old unfiltered `-out.max=5000`, which — because HIP ids
-  are assigned in RA order — accidentally returned a thin RA 0–16°
-  slice instead of a sky.
+- Selection: **the FULL catalog, no `Vmag` ceiling (~118,000 rows),
+  all-sky** (`-out.max=130000`). Replaced the earlier `Vmag < 6.5`
+  naked-eye filter (~8,785 rows) — the app now renders the whole
+  Hipparcos main catalog. The URL constant lives in
+  `src/lib/externalEndpoints.ts` (`VIZIER_HIP_URL`), shared with the
+  external-health check so probe and production URLs can't drift.
 - Position columns are the catalog-native **`RAICRS` / `DEICRS`**
   (degrees). The previously-requested `RArad`/`DErad` names are no
   longer honored; VizieR silently DROPS unknown requested columns, so
   the parser now locates columns BY NAME from the header row and
   throws if a required column is missing (contract-change detection
-  instead of garbage coordinates).
-- Parses TSV, prepends `KNOWN_ANOMALIES`, caches the parsed catalog
-  in-process; sanity-rejects responses with < 1,000 usable rows.
+  instead of garbage coordinates). The parser also detects VizieR's
+  error-envelope (`#INFO QUERY_STATUS=ERROR`, seen during a 2026-07-05
+  backend DB outage) and the HTTP-header-echo lines it prepends to the
+  body, so neither is mistaken for data.
+- **Disk cache** at `<os.tmpdir()>/stellar-cache/hipparcos-catalog.json`,
+  schema-versioned, **30-day TTL** (the Hipparcos dataset is a fixed
+  historical catalog, so the TTL is just a bound on local staleness /
+  a periodic re-fetch to recover from a cache written during a VizieR
+  outage). Atomic temp+rename; rejects entries with < 10,000 rows
+  (a cache written during a partial fetch).
+- **`KNOWN_ANOMALIES` seeds are guaranteed on EVERY served path** via
+  `withKnownAnomalies(parsed)` — prepended (deduped by id, seed wins)
+  on the live-fetch path AND re-injected on the disk-cache read path,
+  not just baked into the stored array. The 11 seeds (Tabby's Star et
+  al.) carry real Kepler light-curve data and must stay searchable /
+  flaggable / visible regardless of the Hipparcos path. Regression
+  guarded: they were baked into the stored array at write time only,
+  so a disk cache written WITHOUT them (injected synthetic-scale test
+  data during the 2026-07-05 VizieR outage) silently dropped Tabby's
+  Star from search and the flagged list. The store/persistence was
+  never at fault — `flaggedIds` still held the id; the catalog just no
+  longer contained the star for the FlaggedPanel/StarSearch to resolve.
 - Response shape: `{ stars: CatalogStar[], source: 'real' | 'fallback' }`
 - On any failure returns just `KNOWN_ANOMALIES` with `source: 'fallback'`
   — and logs the reason LOUDLY (`[stars] VizieR fetch FAILED`); the
   client (`fetchHipparcosCatalog`) then pads with synthetic stars so
   the sky isn't sparse. Silent fallback is how the endpoint breakage
   went undetected.
+
+### External endpoint constants (`src/lib/externalEndpoints.ts`)
+Single source of truth for every EXTERNAL data URL the app hits
+(VizieR, NASA KOI/TOI TAP, MAST VO-TAP, MAST FITS download). Both the
+API routes AND the external-health check import from here, so a probe
+can never test a different URL than production sends. Dependency-free
+(no `next/*`) so the plain-Node health harness can import it. The
+lightcurve route's `mastTapQueryUrl` / `mastConeSearchUrl` /
+`resolveSegmentDownloadUrl` moved here; the KOI/TOI/stars routes import
+their TAP/VizieR URLs from here.
+
+### External-dependency health check (`npm run test:external-health`)
+Live-network probe of the 5 external services, using the exact
+`externalEndpoints.ts` constants. NOT part of `npm test` (which stays
+offline/fast). Each check verifies the CONTRACT, not just reachability:
+Hipparcos required columns present; KOI schema; TOI `tid` column
+present (the historical `tic_id` mistake); MAST TAP returns
+`access_url` rows; a MAST segment actually downloads as valid FITS
+(`SIMPLE  =` magic). Exit 0 = all healthy, 1 = any failure. Designed
+to catch the class of silent contract change (VizieR column rename,
+endpoint move) that degraded the app to a fallback undetected. It
+distinguishes a VizieR upstream outage ("service degraded") from a
+real column-contract change so the report is actionable.
 
 ### `/api/koi`
 - Proxies the NASA Exoplanet Archive's KOI cumulative table via TAP
@@ -1495,18 +1567,25 @@ Point sizes scale with FOV to fake "getting closer to the stars" — at
 FOV 75° points render at their base size, at FOV 20° they're scaled up
 linearly. Implemented via `depthScale(fov, maxScale)` helper, applied
 each frame in `useFrame`:
-- Catalog star points: base 3 px, max scale **2.5×**.
+- Catalog star points: per-vertex magnitude-driven base size, max scale
+  **2.5×** applied via the `uDepthScale` shader uniform.
 - Anomaly rings (outer/mid/core): max scale **3.0×**, multiplied INTO
   the existing pulse animation so the pulse stays visible but at a
   larger amplitude when zoomed in.
 
-This is per-frame scalar mutation of `pointsMaterial.size`, not a
-per-vertex buffer rebuild, so it costs ~nothing. Note: the default
-`pointsMaterial` shader ignores the per-vertex `attributes-size` buffer
-in `StarPoints` — that buffer is dead code; only `material.size`
-controls rendered size. A future improvement would be a custom shader
-that honors the per-vertex sizes so brighter stars actually render
-bigger; until then, all catalog stars render at the same scaled size.
+`StarPoints` now uses a custom `ShaderMaterial` (`STAR_VERTEX_SHADER` /
+`STAR_FRAGMENT_SHADER`) that DOES honor the per-vertex `size` and
+`alpha` buffers — brighter (lower-magnitude) stars render bigger AND
+more opaque; the faint mag-8–13 tail recedes into a dim backdrop.
+`gl_PointSize = size * uDepthScale * uPixelRatio` (no size attenuation
+— all catalog stars sit on the same sphere, so screen size tracks
+magnitude, not distance). The depth-feel is now a single per-frame
+uniform write (`uDepthScale`), NOT a per-vertex buffer rebuild, so it
+still costs ~nothing — and it scales all 118k per-vertex sizes
+uniformly. The anomaly/radar/selection overlay layers still use plain
+`pointsMaterial` (their point counts are small and they animate their
+own size scalars). The old note that the per-vertex size buffer was
+"dead code" is obsolete — the custom shader consumes it.
 
 ### Real B-V colors
 ```
