@@ -66,7 +66,7 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
     // AND set onDemand=1 so a MAST miss returns 'unavailable' rather
     // than fake data.
     const isCatalogStar = /^(KIC|TIC|EPIC)\d+$/.test(star.id)
-    const { times, flux, source, provenance, mission, gapDays } =
+    const { times, flux, source, provenance, mission, gapDays, partial, segments } =
       await fetchLightcurve(star.id, {
         ra: star.ra,
         dec: star.dec,
@@ -105,6 +105,8 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
       profile,
       mission: mission ?? null,
       gapDays: gapDays ?? 5,
+      partial: partial ?? false,
+      segments,
     })
     setAnomalies(anomalyDips.filter(d => d.label !== 'NORMAL'))
     // Lazy fill-in for the sky-radar pattern cache. Mirrors the sky-click

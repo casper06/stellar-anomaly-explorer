@@ -15,6 +15,11 @@ import {
   mastConeSearchUrl,
   resolveSegmentDownloadUrl,
 } from '@/lib/externalEndpoints'
+import {
+  downloadSegmentsBounded as poolDownloadSegments,
+  type SegmentResult,
+  type SegmentPoolConfig,
+} from '@/lib/segmentDownloadPool'
 
 /**
  * @description Recommended canvas-line gap-break threshold (in days) per
@@ -31,7 +36,22 @@ const GAP_DAYS_TESS = 2
  * process. L1 cache — instant, but lost on restart. The L2 disk cache
  * below survives restarts.
  */
-const cache = new Map<string, { times: number[]; flux: number[] }>()
+const cache = new Map<string, CachedCurve>()
+
+/**
+ * @description In-memory / on-disk light-curve payload plus segment
+ * coverage. `expectedSegments` is how many PDC segments MAST's TAP
+ * listing said exist for the target; `segmentFiles.length` is how many
+ * we actually downloaded + parsed. When they differ the curve is PARTIAL
+ * (some quarters/sectors dropped) and must be flagged all the way to the
+ * UI — never treated as authoritative or frozen in cache as complete.
+ */
+interface CachedCurve {
+  times: number[]
+  flux: number[]
+  segmentFiles: string[]
+  expectedSegments: number
+}
 
 /**
  * @description Two-week TTL for the disk cache. Kepler PDC files are static
@@ -55,8 +75,52 @@ const DISK_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
  * write-time code). Quarter availability was quantitatively ruled out
  * (leave-one-quarter-out moves depth ≤0.0001 pp); mixed-provenance cache
  * data was the remaining cause. Versioning eliminates the class.
+ *
+ * v1 → v2 (2026-07-06): the segment-download stage changed from an
+ * unbounded `Promise.all` (which let archive.stsci.edu drop a random
+ * subset of connections and silently cache a partial curve) to a
+ * bounded pool + per-segment retry, and entries now carry
+ * `expectedSegments`. Bumping to 2 invalidates every v1 entry —
+ * including the ~9k-star batch cache — so potentially-truncated curves
+ * are refetched with the reliable pipeline instead of served as
+ * complete.
  */
-const CACHE_SCHEMA_VERSION = 1
+const CACHE_SCHEMA_VERSION = 2
+
+/**
+ * @description Max simultaneous segment (quarter/sector) downloads per
+ * target. archive.stsci.edu / the undici connection pool drops a random
+ * subset of connections under a large simultaneous burst (measured: full
+ * 17-way parallel recovered only 2–5/17; a bounded pool of 3–4 recovered
+ * 17/17). 4 is the sweet spot — fast, and comfortably below the drop
+ * threshold so retries almost never fire.
+ */
+const SEGMENT_DOWNLOAD_CONCURRENCY = 4
+
+/**
+ * @description Max download attempts per segment before giving up on it.
+ * Retries fire ONLY on transient failures (connection-level `fetch
+ * failed`, timeout, 5xx) — never on a clean 404 or a FITS-parse error,
+ * which won't fix themselves.
+ */
+const SEGMENT_MAX_ATTEMPTS = 3
+
+/**
+ * @description Base backoff between segment retry attempts (linear:
+ * attempt N waits N × this). Retries rarely fire at concurrency 4, so a
+ * short linear backoff is sufficient.
+ */
+const SEGMENT_RETRY_BACKOFF_MS = 300
+
+/**
+ * @description Minimum fraction of MAST-listed segments we must recover
+ * to SERVE a curve at all. Above this (but below 100%) the curve is
+ * served, flagged PARTIAL, and refetched on later requests to try to
+ * complete it. At or below this we return null (→ unavailable/synthetic
+ * fallback) rather than serve a badly-truncated curve. 0.5 = at least
+ * half the quarters.
+ */
+const MIN_SEGMENT_COVERAGE_TO_SERVE = 0.5
 
 /**
  * @description Shape of a disk-cache entry. Metadata fields sit
@@ -72,6 +136,14 @@ interface DiskCacheEntry {
   sampleCount: number
   /** Archive filenames of the segments that parsed successfully. */
   segmentFiles: string[]
+  /**
+   * @description How many PDC segments MAST's TAP listing said exist for
+   * this target. When `segmentFiles.length < expectedSegments` the entry
+   * is PARTIAL — it is served (flagged) but NOT frozen: a later request
+   * refetches to try to complete it, so a bad parallel-download roll
+   * never gets stuck in cache for the full TTL.
+   */
+  expectedSegments: number
   times: number[]
   flux: number[]
 }
@@ -99,7 +171,7 @@ function diskCachePath(id: string): string {
 async function readDiskCache(
   id: string,
   tag: string,
-): Promise<{ times: number[]; flux: number[] } | null> {
+): Promise<CachedCurve | null> {
   const file = diskCachePath(id)
   try {
     const stat = await fs.stat(file)
@@ -117,18 +189,36 @@ async function readDiskCache(
     // Provenance guard: an entry written under a different (or missing —
     // pre-v1) schema version may have been produced by a different fetch/
     // normalization pipeline. Serving it would mix data provenances across
-    // code changes, so treat it as a miss and refetch.
+    // code changes, so treat it as a miss and refetch. The v1→v2 bump
+    // (bounded-pool download + expectedSegments) invalidates every
+    // pre-2026-07-06 entry this way, so potentially-truncated curves are
+    // refetched rather than served as complete.
     if (parsed.schemaVersion !== CACHE_SCHEMA_VERSION) {
       console.error(
         `${tag} disk cache for ${id} has schema v${parsed.schemaVersion ?? '<none>'} ≠ current v${CACHE_SCHEMA_VERSION}; ignoring (will refetch)`,
       )
       return null
     }
+    const segmentFiles = parsed.segmentFiles ?? []
+    // `expectedSegments` is required from v2 on; a v2 entry without it is
+    // malformed. Fall back to segmentFiles.length (treats as complete) only
+    // defensively — real v2 writes always set it.
+    const expectedSegments = parsed.expectedSegments ?? segmentFiles.length
+    // Partial-entry policy: a PARTIAL cached curve (fewer segments than MAST
+    // listed) is NOT served from cache — we treat it as a miss so the
+    // request refetches and tries to complete it. This is what keeps a bad
+    // parallel-download roll from being frozen in cache for the full TTL.
+    if (segmentFiles.length < expectedSegments) {
+      console.error(
+        `${tag} disk cache for ${id} is PARTIAL (${segmentFiles.length}/${expectedSegments} segments); ignoring to retry completion`,
+      )
+      return null
+    }
     console.error(
       `${tag} disk cache HIT for ${id} (schema v${parsed.schemaVersion}, ${parsed.times.length} samples, ` +
-        `fetchedAt ${parsed.fetchedAt ?? 'unknown'}, age ${Math.round(ageMs / 3600000)}h)`,
+        `${segmentFiles.length}/${expectedSegments} segments, fetchedAt ${parsed.fetchedAt ?? 'unknown'}, age ${Math.round(ageMs / 3600000)}h)`,
     )
-    return { times: parsed.times, flux: parsed.flux }
+    return { times: parsed.times, flux: parsed.flux, segmentFiles, expectedSegments }
   } catch (e) {
     // ENOENT is the common case — file doesn't exist yet. Don't spam logs.
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -152,7 +242,7 @@ async function readDiskCache(
  */
 async function writeDiskCache(
   id: string,
-  data: { times: number[]; flux: number[]; segmentFiles?: string[] },
+  data: CachedCurve,
   tag: string,
 ): Promise<void> {
   const file = diskCachePath(id)
@@ -161,17 +251,19 @@ async function writeDiskCache(
     schemaVersion: CACHE_SCHEMA_VERSION,
     fetchedAt: new Date().toISOString(),
     sampleCount: data.times.length,
-    segmentFiles: data.segmentFiles ?? [],
+    segmentFiles: data.segmentFiles,
+    expectedSegments: data.expectedSegments,
     times: data.times,
     flux: data.flux,
   }
+  const partial = data.segmentFiles.length < data.expectedSegments
   try {
     await fs.mkdir(DISK_CACHE_DIR, { recursive: true })
     await fs.writeFile(tmp, JSON.stringify(entry), 'utf8')
     await fs.rename(tmp, file)
     console.error(
       `${tag} disk cache WROTE ${id} (schema v${entry.schemaVersion}, ${entry.sampleCount} samples, ` +
-        `${entry.segmentFiles.length} segment files) → ${file}`,
+        `${entry.segmentFiles.length}/${entry.expectedSegments} segments${partial ? ' PARTIAL' : ''}) → ${file}`,
     )
   } catch (e) {
     console.error(`${tag} disk cache write error for ${id}:`, e)
@@ -228,6 +320,12 @@ interface TapResponse {
   data?: Array<Array<string | number | null>>
 }
 
+// `SegmentResult` / `SegmentFailureReason` and the bounded-pool +
+// retry orchestration (`downloadSegmentsBounded`, `fetchSegmentWithRetry`)
+// live in `@/lib/segmentDownloadPool` — a next-free module so they can be
+// unit-tested with an injected segment fetcher. This route supplies the
+// real fetcher (`fetchAndParseSegment`) below.
+
 /**
  * @description Downloads and parses one MAST PDC FITS segment (a Kepler
  * quarter OR a TESS sector — both have the same BINTABLE structure and
@@ -235,14 +333,18 @@ interface TapResponse {
  * flux as parallel arrays. Each segment is normalized independently
  * because both missions' instrument throughputs drift across segment
  * boundaries — joining unnormalized segments produces stepwise jumps at
- * the seams. Returns null on any failure.
+ * the seams.
+ *
+ * Returns a discriminated result rather than null: `{ ok: false, reason }`
+ * distinguishes a `transient` failure (connection drop / timeout / 5xx —
+ * the archive.stsci.edu-under-concurrency failure class) from a
+ * `permanent` one (4xx / FITS parse / too-few-rows). Only transient
+ * failures are retried by the caller.
  * @param accessUrl The TAP-provided `access_url` (we extract the embedded
  * `uri=` since the portal Download proxy returns 400 as of 2026).
- * @returns Parallel `times`/`flux` arrays for the segment, or null.
+ * @returns A `SegmentResult`.
  */
-async function fetchAndParseSegment(
-  accessUrl: string,
-): Promise<{ times: number[]; flux: number[] } | null> {
+async function fetchAndParseSegment(accessUrl: string): Promise<SegmentResult> {
   const tag = '[lightcurve]'
   // The TAP `access_url` points at the MAST portal's Download/file proxy,
   // which returns 400 as of 2026 — the embedded `uri=` param is the real,
@@ -260,8 +362,11 @@ async function fetchAndParseSegment(
   try {
     const fitsRes = await fetch(downloadUrl, { signal: AbortSignal.timeout(60000) })
     if (!fitsRes.ok) {
-      console.error(`${tag} segment ${fname} → HTTP ${fitsRes.status} ${fitsRes.statusText}`)
-      return null
+      // 5xx (and 429) are transient server-side conditions worth a retry;
+      // 4xx (bad/missing product) is permanent.
+      const transient = fitsRes.status >= 500 || fitsRes.status === 429
+      console.error(`${tag} segment ${fname} → HTTP ${fitsRes.status} ${fitsRes.statusText}${transient ? ' (transient)' : ''}`)
+      return { ok: false, reason: transient ? 'transient' : 'permanent', detail: `HTTP ${fitsRes.status}` }
     }
     const fitsBuf = Buffer.from(await fitsRes.arrayBuffer())
 
@@ -272,8 +377,10 @@ async function fetchAndParseSegment(
       rawTimes = cols.col1
       rawFlux = cols.col2
     } catch (e) {
+      // A parse error means the bytes we got aren't valid FITS — retrying
+      // the same URL won't help. Permanent.
       console.error(`${tag} segment ${fname} → FITS parse error:`, e)
-      return null
+      return { ok: false, reason: 'permanent', detail: 'FITS parse error' }
     }
 
     // Drop NaN rows
@@ -286,24 +393,55 @@ async function fetchAndParseSegment(
       }
     }
     if (pairs.length < 50) {
-      // Used to silently return null here. Make the drop visible so a
-      // missing segment shows up in the log instead of just shrinking
-      // the success count.
       console.error(`${tag} segment ${fname} → only ${pairs.length} valid rows (need 50); dropping`)
-      return null
+      return { ok: false, reason: 'permanent', detail: `only ${pairs.length} valid rows` }
     }
 
     // Per-segment median normalization so concatenated segments join smoothly
     const sortedFlux = pairs.map(p => p[1]).sort((a, b) => a - b)
     const median = sortedFlux[Math.floor(sortedFlux.length / 2)] || 1
     return {
+      ok: true,
       times: pairs.map(p => p[0]),
       flux: pairs.map(p => p[1] / median),
     }
   } catch (e) {
-    console.error(`${tag} segment ${fname} → caught:`, e)
-    return null
+    // The outer catch is the connection-level failure path — this is the
+    // `TypeError: fetch failed` / AbortError (timeout) that archive.stsci.edu
+    // throws when it drops a connection under concurrency. Transient →
+    // retriable.
+    console.error(`${tag} segment ${fname} → caught (transient):`, e instanceof Error ? e.message : e)
+    return { ok: false, reason: 'transient', detail: e instanceof Error ? e.message : String(e) }
   }
+}
+
+/**
+ * @description Downloads a target's segments through the shared bounded
+ * pool (`@/lib/segmentDownloadPool`), wiring in this route's real
+ * per-segment fetcher (`fetchAndParseSegment`) and the tuned constants.
+ * Thin adapter — all orchestration/retry logic lives in the tested module.
+ * @param lcUrls Segment access_urls to download.
+ * @param lcFilenames Parallel array of short filenames (for logs).
+ * @param tag Log prefix.
+ * @returns Parsed segments (in input order, nulls for failures).
+ */
+function downloadSegmentsBounded(
+  lcUrls: string[],
+  lcFilenames: string[],
+  tag: string,
+) {
+  const cfg: SegmentPoolConfig = {
+    concurrency: SEGMENT_DOWNLOAD_CONCURRENCY,
+    maxAttempts: SEGMENT_MAX_ATTEMPTS,
+    backoffMs: SEGMENT_RETRY_BACKOFF_MS,
+    log: line => console.error(`${tag} ${line}`),
+  }
+  return poolDownloadSegments(
+    lcUrls.length,
+    lcFilenames,
+    (i): Promise<SegmentResult> => fetchAndParseSegment(lcUrls[i]),
+    cfg,
+  )
 }
 
 /**
@@ -333,21 +471,29 @@ function isPdcLightcurveUrl(url: string, mission: 'Kepler' | 'TESS'): boolean {
  * @description Tries to fetch and parse a real PDC light curve from MAST
  * via the VO-TAP service for either Kepler or TESS. One TAP query
  * returns one row per mission-segment (Kepler quarter / TESS sector)
- * for the target; we download all the PDC `_lc.fits` / `_llc.fits`
- * files in parallel, normalize each by its own median (so the seams
- * don't jump), then concatenate and sort by time. This is what makes
- * the famous Tabby's Star dips (Q8, Q16) visible — the first quarter
- * alone is just commissioning data with no anomalies.
+ * for the target; we download the PDC `_lc.fits` / `_llc.fits` files
+ * through a BOUNDED worker pool with per-segment retry (not an unbounded
+ * `Promise.all` — that let archive.stsci.edu drop a random subset of the
+ * connections and silently produce a partial curve), normalize each by
+ * its own median (so the seams don't jump), then concatenate and sort by
+ * time. This is what makes the famous Tabby's Star dips (Q8, Q16)
+ * visible — the first quarter alone is just commissioning data.
+ *
+ * The returned `expectedSegments` is how many PDC segments TAP LISTED
+ * for the target; `segmentFiles.length` is how many actually downloaded.
+ * When they differ the curve is PARTIAL and the caller flags it. Below
+ * `MIN_SEGMENT_COVERAGE_TO_SERVE` coverage we return null instead of a
+ * badly-truncated curve.
  * @param mission The mission whose collection to query.
  * @param targetName Archive target name (mission-specific format).
- * @returns Concatenated multi-segment light curve plus the archive
- * filenames of the segments that parsed successfully (cache provenance
- * metadata), or null on failure.
+ * @returns Concatenated multi-segment light curve, the archive filenames
+ * of the segments that parsed, and the expected segment count — or null
+ * on failure / below-floor coverage.
  */
 async function tryFetchRealLightcurve(
   mission: 'Kepler' | 'TESS',
   targetName: string,
-): Promise<{ times: number[]; flux: number[]; segmentFiles: string[] } | null> {
+): Promise<CachedCurve | null> {
   const tag = '[lightcurve]'
   try {
     const tapUrl = mastTapQueryUrl(mission, targetName)
@@ -393,15 +539,18 @@ async function tryFetchRealLightcurve(
       return inner.split('/').pop() ?? inner
     })
     const segmentLabel = mission === 'Kepler' ? '_llc.fits quarters' : '_lc.fits sectors'
+    // `expectedSegments` is MAST's own count of PDC segments for this
+    // target — the ground-truth baseline for detecting a partial download.
+    const expectedSegments = lcUrls.length
     console.error(
-      `${tag} ${lcUrls.length} ${segmentLabel} to download in parallel: ${lcFilenames.join(', ')}`,
+      `${tag} ${expectedSegments} ${segmentLabel} to download (pool of ${SEGMENT_DOWNLOAD_CONCURRENCY}): ${lcFilenames.join(', ')}`,
     )
-    if (lcUrls.length === 0) return null
+    if (expectedSegments === 0) return null
 
-    // Download + parse all segments in parallel. Keep each segment paired
-    // with its archive filename — the successful list is written into the
-    // disk-cache entry as provenance metadata.
-    const segments = await Promise.all(lcUrls.map(fetchAndParseSegment))
+    // Download + parse through the bounded pool with per-segment retry.
+    // Pair each success with its archive filename — the successful list is
+    // written into the disk-cache entry as provenance metadata.
+    const segments = await downloadSegmentsBounded(lcUrls, lcFilenames, tag)
     const ok: Array<{ times: number[]; flux: number[]; file: string }> = []
     const failed: string[] = []
     segments.forEach((q, i) => {
@@ -410,12 +559,25 @@ async function tryFetchRealLightcurve(
     })
     if (failed.length > 0) {
       console.error(
-        `${tag} ${ok.length}/${segments.length} segments parsed successfully; failed: ${failed.join(', ')}`,
+        `${tag} ${ok.length}/${expectedSegments} segments parsed successfully; failed: ${failed.join(', ')}`,
       )
     } else {
-      console.error(`${tag} ${ok.length}/${segments.length} segments parsed successfully`)
+      console.error(`${tag} ${ok.length}/${expectedSegments} segments parsed successfully`)
     }
     if (ok.length === 0) return null
+
+    // Coverage gate: if we recovered too small a fraction of the listed
+    // segments, don't serve a badly-truncated curve — return null so the
+    // caller falls through to unavailable/synthetic. Above the floor we
+    // serve it and let the caller flag PARTIAL.
+    const coverage = ok.length / expectedSegments
+    if (coverage < MIN_SEGMENT_COVERAGE_TO_SERVE) {
+      console.error(
+        `${tag} ${mission} coverage ${ok.length}/${expectedSegments} (${(coverage * 100).toFixed(0)}%) below floor ` +
+          `${(MIN_SEGMENT_COVERAGE_TO_SERVE * 100).toFixed(0)}%; treating as fetch failure`,
+      )
+      return null
+    }
 
     // Sort segments by first timestamp, then flatten. Within each segment
     // the FITS rows are already chronological.
@@ -431,11 +593,12 @@ async function tryFetchRealLightcurve(
     // BKJD for Kepler, TJD for TESS — both are just labels for the raw
     // time offset reported by the FITS TIME column.
     const tUnit = mission === 'Kepler' ? 'BKJD' : 'TJD'
+    const partial = segmentFiles.length < expectedSegments
     console.error(
-      `${tag} ${mission} success: ${ok.length} segments concatenated → ${times.length} samples, ` +
-        `time range ${tUnit} ${times[0].toFixed(1)} → ${times[times.length - 1].toFixed(1)}`,
+      `${tag} ${mission} success: ${segmentFiles.length}/${expectedSegments} segments concatenated → ${times.length} samples, ` +
+        `time range ${tUnit} ${times[0].toFixed(1)} → ${times[times.length - 1].toFixed(1)}${partial ? ' [PARTIAL]' : ''}`,
     )
-    return { times, flux, segmentFiles }
+    return { times, flux, segmentFiles, expectedSegments }
   } catch (e) {
     console.error(`${tag} caught error in tryFetchRealLightcurve:`, e)
     return null
@@ -510,19 +673,28 @@ function missionMeta(mission: 'Kepler' | 'TESS') {
 }
 
 /**
- * @description Successful real-data response shape.
+ * @description Successful real-data response shape. Emits `partial` and
+ * `segments: { recovered, expected }` so the UI can surface a
+ * "PARTIAL N/M QUARTERS" state when MAST served fewer segments than its
+ * TAP listing said exist — loud partial-data signalling, per the
+ * data-integrity principle (never a silent partial result).
+ * @param data Cached/fetched curve including segment coverage.
+ * @param mission Mission that served the data.
+ * @returns JSON response with `source: 'real'` plus the partial flags.
  */
-function realResponse(
-  data: { times: number[]; flux: number[] },
-  mission: 'Kepler' | 'TESS',
-) {
+function realResponse(data: CachedCurve, mission: 'Kepler' | 'TESS') {
   const m = missionMeta(mission)
+  const recovered = data.segmentFiles.length
+  const expected = data.expectedSegments
   return NextResponse.json({
-    ...data,
+    times: data.times,
+    flux: data.flux,
     source: 'real' as const,
     provenance: m.provenance,
     mission,
     gapDays: m.gapDays,
+    partial: recovered < expected,
+    segments: { recovered, expected },
   })
 }
 

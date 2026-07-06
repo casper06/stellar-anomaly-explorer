@@ -162,6 +162,14 @@ export interface LightcurveResult {
   provenance: LightcurveProvenance
   mission?: 'Kepler' | 'TESS' | null
   gapDays?: number
+  /**
+   * @description True when MAST served fewer segments than its TAP listing
+   * said exist (an incomplete curve). Threaded through to the UI's PARTIAL
+   * badge. Undefined/false = complete or not-real data.
+   */
+  partial?: boolean
+  /** @description Segment coverage `{ recovered, expected }`; drives the "N/M" in the PARTIAL badge. */
+  segments?: { recovered: number; expected: number }
 }
 
 /**

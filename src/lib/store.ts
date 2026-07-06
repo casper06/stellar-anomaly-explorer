@@ -96,6 +96,20 @@ export interface LightcurveData {
    * back to 5 when missing so existing behavior is preserved.
    */
   gapDays?: number
+  /**
+   * @description True when MAST served FEWER segments (quarters/sectors)
+   * than its TAP listing said exist for the target — the curve is
+   * incomplete. The UI must flag this loudly (a "PARTIAL N/M QUARTERS"
+   * badge) so a label like SPARSE isn't read as a confident verdict on a
+   * truncated curve. Undefined/false = complete.
+   */
+  partial?: boolean
+  /**
+   * @description Segment coverage: `recovered` of `expected` PDC segments
+   * were successfully downloaded. Drives the "N/M" in the PARTIAL badge.
+   * Undefined when not real MAST data.
+   */
+  segments?: { recovered: number; expected: number }
 }
 
 /**
