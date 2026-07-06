@@ -2,24 +2,13 @@ import { NextResponse } from 'next/server'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { KOI_TAP_URL } from '@/lib/externalEndpoints'
 
-/**
- * @description NASA Exoplanet Archive TAP endpoint for the KOI cumulative
- * table. Selects only the columns we render or score against, filters to
- * dispositions a user would care about (CONFIRMED planets and pending
- * CANDIDATEs). Returns ~9,500 rows as of 2026, one per Kepler Object of
- * Interest (a single star can have multiple KOIs — see dedupe in the
- * starCatalog client).
- */
-const KOI_TAP_URL =
-  'https://exoplanetarchive.ipac.caltech.edu/TAP/sync?' +
-  'query=' +
-  encodeURIComponent(
-    "select kepid,kepoi_name,koi_disposition,koi_period,koi_depth,koi_duration,koi_score,ra,dec " +
-      "from cumulative " +
-      "where koi_disposition in ('CONFIRMED','CANDIDATE')",
-  ) +
-  '&format=json'
+// NASA Exoplanet Archive TAP endpoint for the KOI cumulative table lives in
+// `@/lib/externalEndpoints` (single source of truth shared with the
+// external-health check so the two can never drift). Selects only the
+// columns we render or score against, filtered to CONFIRMED + CANDIDATE
+// dispositions. ~9,500 rows as of 2026, one per Kepler Object of Interest.
 
 /**
  * @description Disk cache TTL. KOI catalog changes infrequently (new

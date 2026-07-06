@@ -10,6 +10,11 @@ import {
   UNAVAILABLE_PROVENANCE,
 } from '@/lib/anomalyDetector'
 import { readMastLightcurveColumns } from '@/lib/fitsReader'
+import {
+  mastTapQueryUrl,
+  mastConeSearchUrl,
+  resolveSegmentDownloadUrl,
+} from '@/lib/externalEndpoints'
 
 /**
  * @description Recommended canvas-line gap-break threshold (in days) per
@@ -208,57 +213,9 @@ function identifyMastTarget(
   return null
 }
 
-/**
- * @description Builds the MAST VO-TAP synchronous query URL for the
- * `ivoa.obscore` view, scoped to one mission's timeseries products for a
- * single target. Each row carries an `access_url` that downloads the
- * FITS directly, so no second hop is needed.
- * @param mission Which mission's collection to query.
- * @param targetName Archive target name (mission-specific format).
- * @returns Fully-formed GET URL.
- */
-function mastTapQueryUrl(mission: 'Kepler' | 'TESS', targetName: string): string {
-  // Cap at 100 to be safe — Kepler had 17 quarters, TESS publishes ~50+
-  // sectors for stars in continuous-viewing zones. The TOP cap protects
-  // against an accidentally over-broad target_name match.
-  const adql = `SELECT TOP 100 obs_id, access_url, access_format FROM ivoa.obscore WHERE obs_collection='${mission}' AND dataproduct_type='timeseries' AND target_name='${targetName}'`
-  const params = new URLSearchParams({
-    LANG: 'ADQL',
-    FORMAT: 'json',
-    REQUEST: 'doQuery',
-    QUERY: adql,
-  })
-  return `https://mast.stsci.edu/vo-tap/api/v0.1/caom/sync?${params.toString()}`
-}
-
-/**
- * @description Cone-search VO-TAP URL for finding ANY Kepler or TESS
- * timeseries product near a celestial position. Used by the on-demand
- * path when a clicked star has no KIC/TIC cross-reference — if MAST has
- * observed within `radiusDeg` of (ra, dec), we'll find a row and can
- * proxy through to the existing fetch path. We query Kepler and TESS in
- * one shot via `obs_collection IN ('Kepler','TESS')` and let the caller
- * pick mission preference.
- * @param ra Right ascension in degrees.
- * @param dec Declination in degrees.
- * @param radiusDeg Search radius in degrees (default 0.001° ≈ 3.6 arcsec).
- * @returns Fully-formed GET URL.
- */
-function mastConeSearchUrl(ra: number, dec: number, radiusDeg = 0.001): string {
-  const adql =
-    `SELECT TOP 20 obs_id, obs_collection, target_name, access_url, access_format ` +
-    `FROM ivoa.obscore ` +
-    `WHERE obs_collection IN ('Kepler','TESS') ` +
-    `AND dataproduct_type='timeseries' ` +
-    `AND CONTAINS(POINT('ICRS', s_ra, s_dec), CIRCLE('ICRS', ${ra}, ${dec}, ${radiusDeg}))=1`
-  const params = new URLSearchParams({
-    LANG: 'ADQL',
-    FORMAT: 'json',
-    REQUEST: 'doQuery',
-    QUERY: adql,
-  })
-  return `https://mast.stsci.edu/vo-tap/api/v0.1/caom/sync?${params.toString()}`
-}
+// `mastTapQueryUrl` and `mastConeSearchUrl` are imported from
+// `@/lib/externalEndpoints` — the single source of truth shared with the
+// external-health check so probe URLs can't drift from production URLs.
 
 /**
  * @description One row of the VO-TAP JSON response. The TAP server returns
@@ -287,31 +244,12 @@ async function fetchAndParseSegment(
   accessUrl: string,
 ): Promise<{ times: number[]; flux: number[] } | null> {
   const tag = '[lightcurve]'
-  // The TAP `access_url` points at the MAST portal's Download/file proxy
-  // (`https://mast.stsci.edu/portal/Download/file?uri=http://archive...`).
-  // That proxy returns 400 Bad Request as of 2026 — but the embedded
-  // `uri=` param IS the real, public archive URL and serves the FITS
-  // directly. Pull it out and upgrade to HTTPS.
-  //
-  // TESS access_urls use a `mast:TESS/product/...` URI scheme instead of
-  // `http://archive...`. We rewrite that to the public archive HTTPS URL
-  // (`https://archive.stsci.edu/missions/tess/tid/...`) the same way.
-  let downloadUrl = accessUrl
-  const uriMatch = accessUrl.match(/[?&]uri=([^&]+)/)
-  if (uriMatch) {
-    const inner = decodeURIComponent(uriMatch[1])
-    if (inner.startsWith('mast:TESS/')) {
-      // mast:TESS/product/tess2020186164531-s0027-0000000261136679-0189-s_lc.fits
-      // → https://mast.stsci.edu/api/v0.1/Download/file?uri=mast:TESS/product/...
-      // The MAST API Download endpoint accepts the original mast: URI and
-      // serves the file directly — works reliably for TESS where the
-      // legacy `archive.stsci.edu` path requires deeply nested directory
-      // structure that's painful to reconstruct from the filename alone.
-      downloadUrl = `https://mast.stsci.edu/api/v0.1/Download/file?uri=${encodeURIComponent(inner)}`
-    } else {
-      downloadUrl = inner.replace(/^http:\/\//, 'https://')
-    }
-  }
+  // The TAP `access_url` points at the MAST portal's Download/file proxy,
+  // which returns 400 as of 2026 — the embedded `uri=` param is the real,
+  // public archive URL. `resolveSegmentDownloadUrl` (shared with the health
+  // check) extracts it, routing TESS `mast:TESS/...` URIs through the MAST
+  // Download API and upgrading Kepler `http://archive...` URLs to HTTPS.
+  const downloadUrl = resolveSegmentDownloadUrl(accessUrl)
 
   // Short-name label for per-segment logs so a long URL doesn't dominate
   // the line. Kepler filenames look like

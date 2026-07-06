@@ -2,26 +2,13 @@ import { NextResponse } from 'next/server'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { TOI_TAP_URL } from '@/lib/externalEndpoints'
 
-/**
- * @description NASA Exoplanet Archive TAP endpoint for the TOI (TESS
- * Object of Interest) table. Selects only the columns we render or
- * score against. The disposition filter is applied client-side (in the
- * parse step) rather than in ADQL because the TFOPWG disposition set
- * has several "confirmed" variants (CP, KP) and we want to include
- * all of them — easier to manage in TypeScript.
- *
- * NOTE on column names: the spec called the TIC ID column `tic_id`
- * but the actual schema uses `tid`. Confirmed live against the API.
- */
-const TOI_TAP_URL =
-  'https://exoplanetarchive.ipac.caltech.edu/TAP/sync?' +
-  'query=' +
-  encodeURIComponent(
-    'select toi,tid,ra,dec,tfopwg_disp,pl_trandep,pl_trandurh,pl_orbper,st_tmag ' +
-      'from toi',
-  ) +
-  '&format=json'
+// NASA Exoplanet Archive TAP endpoint for the TOI (TESS Object of Interest)
+// table lives in `@/lib/externalEndpoints` (shared with the external-health
+// check). Disposition filtering is applied client-side in the parse step —
+// the TFOPWG set has several "confirmed" variants (CP, KP) we want to keep.
+// The TIC id column is `tid` (NOT `tic_id`, which is an invalid identifier).
 
 /**
  * @description Disk cache TTL. TOI catalog updates are weekly to monthly;
