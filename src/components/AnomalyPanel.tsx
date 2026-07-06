@@ -1021,7 +1021,10 @@ export default function AnomalyPanel() {
           <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.3)', letterSpacing: 2 }}>
             {selectedStar.hasAnomaly ? '⚠ KNOWN ANOMALY' : 'STAR'}
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+          {/* flexWrap: the PARTIAL badge can't fit next to name + ★ +
+              REAL DATA inside the 300px panel; it wraps to its own line
+              instead of clipping at the panel edge. */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4, flexWrap: 'wrap' }}>
             <div style={{ fontSize: 14, fontWeight: 700, color: 'white', lineHeight: 1.3 }}>
               {selectedStar.name}
             </div>
