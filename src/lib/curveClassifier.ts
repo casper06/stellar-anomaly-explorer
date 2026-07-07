@@ -1,6 +1,7 @@
 import type { Dip } from './anomalyDetector'
 import { runBls, BLS_SDE_THRESHOLD, type BlsResult } from './bls'
 import { measureOddEvenDepths, type OddEvenResult } from './oddEven'
+import { measureSecondaryEclipse, type SecondaryEclipseResult } from './secondaryEclipse'
 
 /**
  * @description Version of the classification algorithm. BUMP THIS on any
@@ -114,6 +115,14 @@ export interface CurveProfile {
    * which is why adding it did not bump CLASSIFIER_VERSION.
    */
   oddEven: OddEvenResult | null
+  /**
+   * Phase-0.5 dimming (secondary eclipse position) measurement — the
+   * companion vetting check to `oddEven`, on the same confident-BLS
+   * gate and with the same non-label-affecting status (no
+   * CLASSIFIER_VERSION bump). Null when BLS isn't confident or too few
+   * cycles have usable phase-0.5 coverage.
+   */
+  secondary: SecondaryEclipseResult | null
 }
 
 /**
@@ -212,9 +221,11 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
     bls.sde >= BLS_SDE_THRESHOLD &&
     bls.periodDays >= MIN_PLAUSIBLE_PERIOD_DAYS
 
-  // Odd/even runs on the same gate as the BLS readout line: any confident
-  // detection, regardless of what pattern label the curve ends up with.
+  // Odd/even and the phase-0.5 check run on the same gate as the BLS
+  // readout line: any confident detection, regardless of what pattern
+  // label the curve ends up with.
   const oddEven = blsConfident && bls ? measureOddEvenDepths(times, flux, bls) : null
+  const secondary = blsConfident && bls ? measureSecondaryEclipse(times, flux, bls) : null
 
   if (dipCount < MIN_DIPS_FOR_PATTERN) {
     return {
@@ -227,6 +238,7 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
       dipCount,
       bls,
       oddEven,
+      secondary,
     }
   }
 
@@ -261,6 +273,7 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
     dipCount,
     bls,
     oddEven,
+    secondary,
   }
 }
 

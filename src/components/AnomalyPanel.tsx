@@ -748,6 +748,29 @@ function ClassifierReadout({
             : `Odd/even transit depths consistent: Δ ${profile.oddEven.relDiffPct.toFixed(1)}% (${profile.oddEven.diffSigma.toFixed(1)}σ, ${profile.oddEven.oddCycles} odd / ${profile.oddEven.evenCycles} even)`}
         </div>
       )}
+      {/* Phase-0.5 dimming (secondary eclipse position) — companion vetting
+          measurement to odd/even. Descriptive only: reports the measured
+          depth, significance, and ratio to the primary; never says what a
+          detection (or its absence) means. A shallow detection with a tiny
+          ratio is a real phenomenon on some confirmed planets (occultation),
+          which is exactly why no cause is asserted. */}
+      {profile.secondary && (
+        <div
+          style={{
+            marginTop: 8,
+            paddingTop: 8,
+            borderTop: '1px solid rgba(255,255,255,0.08)',
+            fontSize: 9,
+            color: profile.secondary.verdict === 'DETECTED' ? '#f4a261' : 'rgba(255,255,255,0.6)',
+            letterSpacing: 0.5,
+            lineHeight: 1.4,
+          }}
+        >
+          {profile.secondary.verdict === 'DETECTED'
+            ? `Secondary dimming detected at phase 0.5: ≈ ${Math.round(profile.secondary.depthPpm).toLocaleString()}ppm (${profile.secondary.sigma.toFixed(1)}σ${profile.secondary.ratioToPrimaryPct !== null ? `, ~${profile.secondary.ratioToPrimaryPct.toFixed(1)}% of primary depth` : ''}, ${profile.secondary.cycles} cycles)`
+            : `No significant dimming at phase 0.5 (${Math.round(profile.secondary.depthPpm).toLocaleString()}ppm, ${profile.secondary.sigma.toFixed(1)}σ, ${profile.secondary.cycles} cycles)`}
+        </div>
+      )}
       <div
         style={{
           marginTop: 8,
