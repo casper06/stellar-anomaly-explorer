@@ -727,6 +727,27 @@ function ClassifierReadout({
           SDE {profile.bls.sde.toFixed(1)}
         </div>
       )}
+      {/* Odd/even transit depth comparison — the standard first-order
+          vetting measurement on a confident periodic signal. Reported as
+          measured numbers only (describe-don't-diagnose: no "binary", no
+          "planet" — the user interprets what a depth mismatch means). */}
+      {profile.oddEven && (
+        <div
+          style={{
+            marginTop: 8,
+            paddingTop: 8,
+            borderTop: '1px solid rgba(255,255,255,0.08)',
+            fontSize: 9,
+            color: profile.oddEven.verdict === 'MISMATCH' ? '#f4a261' : 'rgba(255,255,255,0.6)',
+            letterSpacing: 0.5,
+            lineHeight: 1.4,
+          }}
+        >
+          {profile.oddEven.verdict === 'MISMATCH'
+            ? `Odd/even transit depths differ: odd ≈ ${Math.round(profile.oddEven.oddDepthPpm).toLocaleString()}ppm vs even ≈ ${Math.round(profile.oddEven.evenDepthPpm).toLocaleString()}ppm (Δ ${profile.oddEven.relDiffPct.toFixed(1)}%, ${profile.oddEven.diffSigma.toFixed(1)}σ, ${profile.oddEven.oddCycles} odd / ${profile.oddEven.evenCycles} even)`
+            : `Odd/even transit depths consistent: Δ ${profile.oddEven.relDiffPct.toFixed(1)}% (${profile.oddEven.diffSigma.toFixed(1)}σ, ${profile.oddEven.oddCycles} odd / ${profile.oddEven.evenCycles} even)`}
+        </div>
+      )}
       <div
         style={{
           marginTop: 8,

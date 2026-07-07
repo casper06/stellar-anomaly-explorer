@@ -57,11 +57,19 @@ interface Expectation {
   blsPeriodDays?: number
   /** Independent NASA Exoplanet Archive orbital period (days) for context; not asserted. */
   nasaPeriodDays?: number
+  /**
+   * Expected odd/even depth-comparison verdict, or null when the check
+   * must not produce a result (no confident BLS, or too few cycles).
+   */
+  oddEvenVerdict: 'CONSISTENT' | 'MISMATCH' | null
+  /** Odd/even relative depth difference in percent (tolerance REL_DIFF_TOL); only when a verdict is expected. */
+  oddEvenRelDiffPct?: number
 }
 
 const TIME_TOL = 0.05 // days
 const DEPTH_TOL = 0.005 // absolute fraction (0.5 percentage points)
 const PERIOD_TOL = 0.05 // days
+const REL_DIFF_TOL = 1.5 // odd/even relative depth difference, percentage points
 
 /**
  * @description Hand-verified expected values, re-frozen 2026-07-04 for
@@ -87,6 +95,17 @@ const PERIOD_TOL = 0.05 // days
  *   but BLS finds no confident fold (SDE ≈ 5.3) → UNCERTAIN, no
  *   period. The real 1,473 ppm/9.88 d planet stays below detection in
  *   this noise — an honest non-claim.
+ * - KIC4275739 (K01317.01, added 2026-07-06 for the odd/even check):
+ *   FALSE POSITIVE KOI carrying the DR25 Robovetter's DEPTH_ODDEVEN
+ *   flag — the documented eclipsing-binary-at-half-period ground
+ *   truth. Our BLS locks the same half-period NASA's pipeline flagged
+ *   (P ≈ 2.1718 d, matching koi_period 2.171827838 to 4 decimals), and
+ *   the odd/even comparison must read MISMATCH. Curve captured
+ *   complete (11/11 quarters). Note KIC12506351 was evaluated and
+ *   rejected as a fixture: our BLS locks its TRUE period (2× the
+ *   flagged one), so odd/even compares primary-vs-primary and is
+ *   genuinely CONSISTENT at that fold — the half-period lock is a
+ *   precondition for the mismatch to be measurable, not a given.
  */
 const EXPECTED: Expectation[] = [
   {
@@ -99,6 +118,7 @@ const EXPECTED: Expectation[] = [
     topDipDepth: 0.2069,
     bestFitPeriodDays: null,
     blsConfident: false,
+    oddEvenVerdict: null,
   },
   {
     id: 'KIC7449554',
@@ -112,6 +132,8 @@ const EXPECTED: Expectation[] = [
     blsConfident: true,
     blsPeriodDays: 2.4209, // = sibling K02357.01; NASA 2.42088277 d
     nasaPeriodDays: 15.9042402,
+    oddEvenVerdict: 'CONSISTENT',
+    oddEvenRelDiffPct: 2.68, // 0.2σ — noise-level difference on a 157 ppm signal
   },
   {
     id: 'KIC9166862',
@@ -125,6 +147,8 @@ const EXPECTED: Expectation[] = [
     blsConfident: true,
     blsPeriodDays: 3.8556,
     nasaPeriodDays: 3.855603916,
+    oddEvenVerdict: 'CONSISTENT',
+    oddEvenRelDiffPct: 0.27, // 0.4σ — a CONFIRMED planet's transits agree by parity
   },
   {
     id: 'KIC10905746',
@@ -137,6 +161,22 @@ const EXPECTED: Expectation[] = [
     bestFitPeriodDays: null,
     blsConfident: false,
     nasaPeriodDays: 9.8786461,
+    oddEvenVerdict: null,
+  },
+  {
+    id: 'KIC4275739',
+    label: 'K01317.01',
+    dipCount: 461,
+    pattern: 'PERIODIC_UNIFORM',
+    topDipLabel: 'INTERESTING',
+    topDipPeakTime: 511.46,
+    topDipDepth: 0.0589,
+    bestFitPeriodDays: 2.1718,
+    blsConfident: true,
+    blsPeriodDays: 2.1718,
+    nasaPeriodDays: 2.171827838, // NASA's DETECTED period (half the true EB period)
+    oddEvenVerdict: 'MISMATCH',
+    oddEvenRelDiffPct: 9.54, // 15.4σ over 198 odd / 199 even cycles — the DEPTH_ODDEVEN ground truth
   },
 ]
 
@@ -195,6 +235,12 @@ for (const exp of EXPECTED) {
     } else {
       console.log('  bls: null')
     }
+    if (profile.oddEven) {
+      const o = profile.oddEven
+      console.log(`  oddEven: ${o.verdict} odd=${o.oddDepthPpm.toFixed(0)}ppm even=${o.evenDepthPpm.toFixed(0)}ppm relDiff=${o.relDiffPct.toFixed(2)}% sigma=${o.diffSigma.toFixed(1)} cycles=${o.oddCycles}/${o.evenCycles}`)
+    } else {
+      console.log('  oddEven: null')
+    }
     continue
   }
 
@@ -212,13 +258,20 @@ for (const exp of EXPECTED) {
     check(failures, 'topDip.peakTime', top?.peakTime ?? null, exp.topDipPeakTime ?? null, TIME_TOL)
     check(failures, 'topDip.depth', top?.depth ?? null, exp.topDipDepth ?? null, DEPTH_TOL)
   }
+  check(failures, 'oddEven.verdict', profile.oddEven?.verdict ?? null, exp.oddEvenVerdict)
+  if (exp.oddEvenVerdict !== null && exp.oddEvenRelDiffPct !== undefined) {
+    check(failures, 'oddEven.relDiffPct', profile.oddEven?.relDiffPct ?? null, exp.oddEvenRelDiffPct, REL_DIFF_TOL)
+  }
 
   if (failures.length === 0) {
     const period = profile.bestFitPeriodDays === null ? 'no period' : `P=${profile.bestFitPeriodDays.toFixed(3)}d`
     const blsNote = measuredBlsConfident && profile.bls
       ? `BLS P=${profile.bls.periodDays.toFixed(4)}d SDE ${profile.bls.sde.toFixed(1)}`
       : 'BLS: no confident signal'
-    console.log(`✅ ${exp.id} (${exp.label}): ${dips.length} dips · ${profile.pattern} · ${period} · ${blsNote}`)
+    const oeNote = profile.oddEven
+      ? `odd/even ${profile.oddEven.verdict} Δ${profile.oddEven.relDiffPct.toFixed(1)}%`
+      : 'odd/even n/a'
+    console.log(`✅ ${exp.id} (${exp.label}): ${dips.length} dips · ${profile.pattern} · ${period} · ${blsNote} · ${oeNote}`)
   } else {
     anyFailure = true
     console.error(`❌ ${exp.id} (${exp.label}) DRIFTED from hand-verified values:`)
