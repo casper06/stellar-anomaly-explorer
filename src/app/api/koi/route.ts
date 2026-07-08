@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server'
-import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { KOI_TAP_URL } from '@/lib/externalEndpoints'
+import { readCatalogCache, writeCatalogCache } from '@/lib/catalogCache'
 
 // NASA Exoplanet Archive TAP endpoint for the KOI cumulative table lives in
 // `@/lib/externalEndpoints` (single source of truth shared with the
@@ -11,13 +11,17 @@ import { KOI_TAP_URL } from '@/lib/externalEndpoints'
 // dispositions. ~9,500 rows as of 2026, one per Kepler Object of Interest.
 
 /**
- * @description Disk cache TTL. KOI catalog changes infrequently (new
- * dispositions are pushed in batches every few months) and a stale day-old
- * copy is fine for an interactive sky viewer.
+ * @description Freshness target for the KOI catalog: 7 days. Kepler
+ * stopped observing in 2013 and the cumulative table only sees
+ * occasional batch disposition revisions (a CONFIRMED can be demoted
+ * after a published refutation), so weekly is a comfortable cadence —
+ * deliberately looser than TOI's 24 h (TESS is still observing and its
+ * table grows continuously). Past this age the cache is still SERVED
+ * (stale-while-revalidate, see `lib/catalogCache.ts`) — the TTL decides
+ * when a background refresh fires, not whether data is available.
  */
-const DISK_CACHE_TTL_MS = 24 * 60 * 60 * 1000
-const DISK_CACHE_DIR = path.join(os.tmpdir(), 'stellar-cache')
-const DISK_CACHE_FILE = path.join(DISK_CACHE_DIR, 'koi-catalog.json')
+const DISK_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const DISK_CACHE_FILE = path.join(os.tmpdir(), 'stellar-cache', 'koi-catalog.json')
 
 /**
  * @description Shape of a parsed KOI row as returned to the client. Field
@@ -44,7 +48,19 @@ interface KoiRow {
 interface KoiResponse {
   source: 'real' | 'cached' | 'unavailable'
   rows: KoiRow[]
-  fetchedAt: number  // epoch ms (or 0 for unavailable)
+  /**
+   * Epoch ms of the upstream TAP fetch that produced `rows` (0 for
+   * unavailable). For `source: 'cached'` this is the REAL fetch time
+   * persisted in the cache file — previously the route reported
+   * `Date.now()` for cached data, making staleness invisible.
+   */
+  fetchedAt: number
+  /**
+   * True when `rows` are older than the freshness TTL and a background
+   * revalidation was triggered (stale-while-revalidate). Consumers can
+   * surface the age via `fetchedAt`.
+   */
+  stale?: boolean
   error?: string
 }
 
@@ -84,76 +100,13 @@ function parseTapRow(r: Record<string, unknown>): KoiRow | null {
 }
 
 /**
- * @description Reads a cached KOI catalog from disk. Returns null if the
- * file is missing, stale, or unparseable. Mirrors the lightcurve route's
- * disk-cache semantics so behavior is predictable across both routes.
+ * @description Fetches and parses the KOI cumulative table from the NASA
+ * TAP endpoint. Shared by the cold (blocking) path and the background
+ * revalidation, so both go through identical parsing and error taxonomy.
  * @param tag Log prefix.
+ * @returns Parsed rows, or a short error tag on any failure.
  */
-async function readDiskCache(tag: string): Promise<KoiRow[] | null> {
-  try {
-    const stat = await fs.stat(DISK_CACHE_FILE)
-    const ageMs = Date.now() - stat.mtimeMs
-    if (ageMs > DISK_CACHE_TTL_MS) {
-      console.error(`${tag} disk cache is stale (${Math.round(ageMs / 3600000)}h old); refetching`)
-      return null
-    }
-    const raw = await fs.readFile(DISK_CACHE_FILE, 'utf8')
-    const parsed = JSON.parse(raw) as { rows: KoiRow[] }
-    if (!Array.isArray(parsed.rows) || parsed.rows.length === 0) {
-      console.error(`${tag} disk cache malformed; ignoring`)
-      return null
-    }
-    console.error(`${tag} disk cache HIT (${parsed.rows.length} KOIs, age ${Math.round(ageMs / 3600000)}h)`)
-    return parsed.rows
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
-      console.error(`${tag} disk cache read error:`, e)
-    }
-    return null
-  }
-}
-
-/**
- * @description Atomically writes the catalog to disk via temp + rename so
- * a partial write can't surface as a corrupt cache file.
- * @param rows Parsed catalog.
- * @param tag Log prefix.
- */
-async function writeDiskCache(rows: KoiRow[], tag: string): Promise<void> {
-  const tmp = `${DISK_CACHE_FILE}.${process.pid}.tmp`
-  try {
-    await fs.mkdir(DISK_CACHE_DIR, { recursive: true })
-    await fs.writeFile(tmp, JSON.stringify({ rows }), 'utf8')
-    await fs.rename(tmp, DISK_CACHE_FILE)
-    console.error(`${tag} disk cache WROTE ${rows.length} KOIs → ${DISK_CACHE_FILE}`)
-  } catch (e) {
-    console.error(`${tag} disk cache write error:`, e)
-    try { await fs.unlink(tmp) } catch { /* ignore */ }
-  }
-}
-
-/**
- * @description GET /api/koi — returns the KOI cumulative catalog. Disk
- * cache first (24h TTL); on miss, hits the NASA Exoplanet Archive TAP
- * endpoint, parses the JSON response, writes to disk, returns. On
- * total failure returns `{ source: 'unavailable', rows: [], error }`
- * so the client can render a visible "catalog unavailable" state
- * instead of pretending the sky is empty.
- * @returns JSON `KoiResponse`.
- */
-export async function GET() {
-  const tag = '[koi]'
-  console.error(`${tag} GET /api/koi`)
-
-  const cached = await readDiskCache(tag)
-  if (cached) {
-    return NextResponse.json<KoiResponse>({
-      source: 'cached',
-      rows: cached,
-      fetchedAt: Date.now(),
-    })
-  }
-
+async function fetchFromTap(tag: string): Promise<{ rows: KoiRow[] } | { error: string }> {
   try {
     console.error(`${tag} fetching from NASA Exoplanet Archive…`)
     const res = await fetch(KOI_TAP_URL, { signal: AbortSignal.timeout(60000) })
@@ -161,12 +114,7 @@ export async function GET() {
     if (!res.ok) {
       const body = await res.text().catch(() => '<unreadable>')
       console.error(`${tag} TAP body (first 500): ${body.slice(0, 500)}`)
-      return NextResponse.json<KoiResponse>({
-        source: 'unavailable',
-        rows: [],
-        fetchedAt: 0,
-        error: `TAP returned HTTP ${res.status}`,
-      })
+      return { error: `TAP returned HTTP ${res.status}` }
     }
     const text = await res.text()
     let raw: unknown
@@ -175,21 +123,11 @@ export async function GET() {
     } catch (e) {
       console.error(`${tag} TAP JSON parse error:`, e)
       console.error(`${tag} TAP body (first 500): ${text.slice(0, 500)}`)
-      return NextResponse.json<KoiResponse>({
-        source: 'unavailable',
-        rows: [],
-        fetchedAt: 0,
-        error: 'TAP response was not valid JSON',
-      })
+      return { error: 'TAP response was not valid JSON' }
     }
     if (!Array.isArray(raw)) {
       console.error(`${tag} TAP response was not an array`)
-      return NextResponse.json<KoiResponse>({
-        source: 'unavailable',
-        rows: [],
-        fetchedAt: 0,
-        error: 'TAP response was not an array',
-      })
+      return { error: 'TAP response was not an array' }
     }
     const rows: KoiRow[] = []
     let dropped = 0
@@ -199,27 +137,87 @@ export async function GET() {
       else dropped++
     }
     console.error(`${tag} parsed ${rows.length} KOI rows (${dropped} dropped for missing required fields)`)
-    if (rows.length === 0) {
-      return NextResponse.json<KoiResponse>({
-        source: 'unavailable',
-        rows: [],
-        fetchedAt: 0,
-        error: 'TAP returned 0 usable rows',
-      })
-    }
-    void writeDiskCache(rows, tag)
-    return NextResponse.json<KoiResponse>({
-      source: 'real',
-      rows,
-      fetchedAt: Date.now(),
-    })
+    if (rows.length === 0) return { error: 'TAP returned 0 usable rows' }
+    return { rows }
   } catch (e) {
     console.error(`${tag} fetch failed:`, e)
+    return { error: (e as Error).message ?? 'unknown error' }
+  }
+}
+
+/**
+ * @description True while a background revalidation is in flight, so a
+ * burst of requests against a stale cache triggers exactly one TAP
+ * fetch. Module-scope; resets when the refresh settles.
+ */
+let revalidating = false
+
+/**
+ * @description Background refresh of the disk cache (stale-while-
+ * revalidate). Failures are logged and swallowed — the stale cache
+ * stays in place and the next stale read retries.
+ * @param tag Log prefix.
+ */
+async function revalidateInBackground(tag: string): Promise<void> {
+  if (revalidating) return
+  revalidating = true
+  try {
+    const result = await fetchFromTap(tag)
+    if ('rows' in result) {
+      await writeCatalogCache(DISK_CACHE_FILE, result.rows, tag)
+      console.error(`${tag} background revalidation complete (${result.rows.length} rows)`)
+    } else {
+      console.error(`${tag} background revalidation failed (${result.error}); stale cache stays`)
+    }
+  } finally {
+    revalidating = false
+  }
+}
+
+/**
+ * @description GET /api/koi — returns the KOI cumulative catalog with
+ * stale-while-revalidate freshness: any cached copy is served
+ * immediately with its TRUE `fetchedAt`; when older than the 7-day TTL
+ * it is additionally flagged `stale: true` and a background refresh is
+ * kicked off (deduped). Only a missing/legacy cache blocks on the TAP
+ * fetch. On total failure with no cache, returns
+ * `{ source: 'unavailable', rows: [], error }` so the client renders a
+ * visible "catalog unavailable" state instead of pretending the sky is
+ * empty.
+ * @returns JSON `KoiResponse`.
+ */
+export async function GET() {
+  const tag = '[koi]'
+  console.error(`${tag} GET /api/koi`)
+
+  const cached = await readCatalogCache<KoiRow>(DISK_CACHE_FILE, tag)
+  if (cached) {
+    const stale = cached.ageMs > DISK_CACHE_TTL_MS
+    console.error(
+      `${tag} disk cache HIT (${cached.rows.length} KOIs, age ${Math.round(cached.ageMs / 3600000)}h${stale ? ' — STALE, revalidating in background' : ''})`,
+    )
+    if (stale) void revalidateInBackground(tag)
+    return NextResponse.json<KoiResponse>({
+      source: 'cached',
+      rows: cached.rows,
+      fetchedAt: cached.fetchedAt,
+      ...(stale ? { stale: true } : {}),
+    })
+  }
+
+  const result = await fetchFromTap(tag)
+  if ('error' in result) {
     return NextResponse.json<KoiResponse>({
       source: 'unavailable',
       rows: [],
       fetchedAt: 0,
-      error: (e as Error).message ?? 'unknown error',
+      error: result.error,
     })
   }
+  const fetchedAt = await writeCatalogCache(DISK_CACHE_FILE, result.rows, tag)
+  return NextResponse.json<KoiResponse>({
+    source: 'real',
+    rows: result.rows,
+    fetchedAt,
+  })
 }

@@ -252,12 +252,27 @@ real column-contract change so the report is actionable.
   period, depth, duration, score, ra, dec). Returns ~9,500 rows as of
   2026 — one per Kepler Object of Interest (a single star can host
   many KOIs; Kepler-90 has 8).
-- Response shape: `{ source: 'real' | 'cached' | 'unavailable', rows: KoiRow[], fetchedAt: number, error?: string }`.
-- **Disk cache** at `<os.tmpdir()>/stellar-cache/koi-catalog.json` with
-  24h TTL (vs the lightcurve route's 7-day TTL — the KOI catalog
-  changes more often). Same atomic-write pattern (temp + rename).
-- On failure returns `{ source: 'unavailable', rows: [], error }`. The
-  client surfaces this in the HUD counter as "CATALOG UNAVAILABLE"
+- Response shape: `{ source: 'real' | 'cached' | 'unavailable', rows: KoiRow[], fetchedAt: number, stale?: boolean, error?: string }`.
+  `fetchedAt` is the REAL upstream fetch time persisted in the cache
+  file (pre-2026-07-08 the route reported `Date.now()` for cached data
+  — the age was invisible and the response misleading).
+- **Disk cache + freshness (stale-while-revalidate, 2026-07-08)**:
+  `<os.tmpdir()>/stellar-cache/koi-catalog.json` via the shared
+  `lib/catalogCache.ts` helper (persists `{fetchedAt, rows}`, atomic
+  temp+rename; legacy `{rows}`-only files read as a miss — one
+  migration refetch). **TTL = 7 days** (Kepler stopped observing in
+  2013; the cumulative table sees only occasional batch disposition
+  revisions). The TTL decides when a BACKGROUND refresh fires, not
+  whether data is available: any cached copy is served immediately
+  with its true `fetchedAt`; past-TTL copies additionally carry
+  `stale: true` and trigger a deduped background TAP refetch. This
+  also fixes the old failure mode where TTL-expiry + NASA outage =
+  "CATALOG UNAVAILABLE" despite a usable copy on disk. This is
+  catalog CONTENT freshness — deliberately a separate mechanism from
+  the lightcurve/pattern-cache SCHEMA versioning (which guards our
+  own pipeline changing, not NASA's data changing).
+- On failure with NO cache returns `{ source: 'unavailable', rows: [], error }`.
+  The client surfaces this in the HUD counter as "CATALOG UNAVAILABLE"
   rather than rendering a misleading 0.
 
 ### KOI catalog merge (`fetchKOICatalog` + `mergeKoiIntoHipparcos`)
@@ -313,9 +328,12 @@ bug.
 - **Heads-up on column names**: the user-supplied spec called the
   TIC ID column `tic_id`. The actual schema uses **`tid`**. Confirmed
   live; using `tic_id` returns `ORA-00904: invalid identifier`.
-- Same response shape and disk-cache pattern as `/api/koi`
-  (24h TTL, atomic temp+rename, separate file at
-  `<os.tmpdir()>/stellar-cache/toi-catalog.json`).
+- Same response shape and stale-while-revalidate disk-cache pattern
+  as `/api/koi` (shared `lib/catalogCache.ts`; separate file at
+  `<os.tmpdir()>/stellar-cache/toi-catalog.json`) but with **TTL =
+  24 hours** — deliberately tighter than KOI's 7 days because TESS is
+  still observing: new TOIs land continuously and TFOPWG dispositions
+  get revised (PC → CP/FP).
 
 ### TOI catalog merge (`fetchTOICatalog` + `mergeToiIntoCatalog`)
 Same algorithm as KOI: dedupe by TIC id (keeping the highest-scoring
