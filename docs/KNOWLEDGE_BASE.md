@@ -418,6 +418,25 @@ part is a faithful rendering of σ=1.6% data, per the diagnosis).
 high-noise stars' labels can change); the pattern cache needs a
 re-batch to refresh v2 entries. Original diagnosis kept below.
 
+**v3 re-batch completed 2026-07-08**: 10,931/10,931 processed, 0
+errors, 8,759 v3 entries (18 stragglers kept at old versions — their
+refetch returned no-data/partial; next batch retries). Distribution
+v2 → v3: SPARSE 4,331→5,785 (+1,454), UNCERTAIN 2,032→904 (−1,128),
+PERIODIC_UNIFORM 1,620→1,172 (−448), IRREGULAR 370→612 (+242),
+HIGH_VARIABILITY 416→286 (−130). Direction matches the fix: noise
+dips vanish, so flicker-driven UNCERTAIN collapses into SPARSE, and
+PERIODIC_UNIFORM promotions that rested on noise "visible dips" drop
+to SPARSE (their BLS line still shows). Caveat: the v2 batch ran on
+potentially-truncated pre-concurrency-fix curves while v3 ran on
+complete ones, so the shift conflates detector calibration with data
+completeness — not decomposable without a per-star diff, which the
+overwritten v2 labels no longer allow. Operational note: the batch
+run surfaced that Next dev auto-restarts on a memory threshold
+(~every 4k stars — the lightcurve L1 Map grows unboundedly under
+batch load); a 5-min watchdog that re-POSTs on worker death carried
+the run to completion across two auto-restarts. The unbounded L1 is
+a known open item.
+
 **Root-caused 2026-07-07**. The original CVZ
 hypothesis was WRONG: TIC 443616612 is an ordinary 5-sector TESS
 target near the ecliptic (Dec −3.98°), 78,198 samples at 2-min
