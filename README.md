@@ -5,7 +5,7 @@
 ![Next.js](https://img.shields.io/badge/Next.js-16-black?logo=next.js)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
 ![Three.js](https://img.shields.io/badge/Three.js-r185-000000?logo=three.js)
-![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
 Navigate freely through a WebGL sky built from real astronomical catalogs. The system highlights stars with documented anomalies, guides you toward them, and lets you inspect each star's actual light curve — fetched live from NASA's archives — to see the dips for yourself. Found something interesting? Report it to Zooniverse, the NASA Exoplanet Archive, or the SETI Institute.
 
@@ -68,4 +68,4 @@ Supporting both: every curve carries provenance (source, mission, data type) thr
 
 ## License
 
-[MIT](LICENSE)
+[GPL-3.0-or-later](LICENSE) — GNU General Public License v3.0 or any later version.

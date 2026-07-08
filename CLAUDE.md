@@ -1177,8 +1177,93 @@ K02357.01 at P=2.4210 d / 157 ppm, matching NASA to 5e-5).
 `bestFitPeriodDays` is sourced from BLS and surfaced only when the
 label is `PERIODIC_UNIFORM` (anywhere else a period would contradict
 the label). `CLASSIFIER_VERSION` (currently 2) must be bumped on any
-change that can alter labels — pattern-cache entries record it, and
+change that can alter LABELS — pattern-cache entries record it, and
 the batch treats old-version entries as missing (re-classifies).
+Purely additive `CurveProfile` fields that never feed `pickPattern`
+(e.g. `oddEven`) do NOT bump it: the cache stores only the label, so
+new fields can't go stale there.
+
+**Odd/even transit depth check (`lib/oddEven.ts`, 2026-07-06)**: the
+standard first-order vetting measurement on a confident periodic
+signal — `CurveProfile.oddEven`, computed on the same gate as the
+BLS readout line (SDE ≥ 7.5, plausible period; independent of the
+pattern label, so SPARSE K02357.02 still gets measured). Flux-fold
+method mirroring Kepler DV (NOT dip-detector-based — the 1% dip
+threshold would drop shallow transits): each sample gets a cycle
+index `n = round((t − t₀)/P)`; in-transit = inside the BLS box;
+per-cycle local baseline from the 0.5–2.5×duration flanking window
+(robust to slow variability); per-cycle depth = median(baseline) −
+median(in-transit), needing ≥3 in-transit + ≥5 baseline samples per
+cycle. Cycles split by parity of `n`; group means compared via a
+z-statistic from empirical standard errors. Verdict `MISMATCH`
+requires diffSigma ≥ 3 AND relDiff ≥ 5%; else `CONSISTENT`; null
+when either parity has < 3 usable cycles or the folded box isn't a
+dimming. The 5% relative floor is CALIBRATED against ground truth:
+KIC4275739 (K01317.01), a DR25 `DEPTH_ODDEVEN`-flagged FALSE
+POSITIVE, measures Δ9.5% at 15.4σ on our pipeline — an earlier 10%
+floor wrongly read it CONSISTENT. The ClassifierReadout renders the
+result as its own line ("Odd/even transit depths differ: …" /
+"… consistent: …") — numbers only, never "binary"/"planet".
+
+- **Partial curves**: odd/even RUNS on partial data, deliberately.
+  A missing quarter spans many periods, so it removes odd and even
+  cycles in near-equal numbers — no systematic parity bias, only
+  reduced N, which the standard errors widen for (partial data makes
+  the check MORE conservative, never more alarmist). The one
+  geometry that could bias parity (P ~ quarter length) can't reach 3
+  cycles per parity and nulls out via the ordinary gate. The
+  readout's ⚠ PARTIAL DATA caveat already marks everything
+  provisional. Unit-tested (simulated missing-quarter block must not
+  fake a mismatch).
+- **Half-period lock is a precondition** (learned building the
+  fixture): the mismatch is only measurable when OUR BLS locks the
+  same half-period NASA's pipeline flagged. KIC12506351 (also
+  DEPTH_ODDEVEN-flagged) was evaluated and REJECTED as a fixture —
+  our BLS finds its TRUE period (2× the flagged one), so odd/even
+  compares primary-vs-primary and is genuinely CONSISTENT at that
+  fold. Not a bug; a property of the fold geometry.
+- **No re-batch was needed** for this feature: labels unchanged,
+  version stays 2, cached patterns remain valid.
+
+**Secondary-eclipse check (`lib/secondaryEclipse.ts`, 2026-07-06)**:
+the companion vetting measurement to odd/even —
+`CurveProfile.secondary`, same confident-BLS gate, same
+non-label-affecting status (version stays 2, no re-batch). Same
+per-cycle machinery aimed at phase 0.5: per-cycle depth at
+`t₀ + P/2 ± duration/2` vs the 0.5–2.5×duration local flank, pooled
+across cycles into mean ± SE → z-statistic. `DETECTED` when depth > 0
+and σ ≥ 3; `NOT_DETECTED` otherwise; null under 3 usable cycles.
+Result carries depthPpm, sigma, cycles, and `ratioToPrimaryPct` so
+the "comparable depth" comparison is stated numerically, never
+labeled. LIMITATION (documented in-module): fixed phase-0.5 window —
+an eccentric system's displaced secondary is missed; the check
+answers "is there a dimming AT phase 0.5", not "anywhere in the
+fold".
+
+- **Complementarity with odd/even** (verified on ground truth, both
+  directions): which check fires depends on which period BLS locks.
+  Half-period lock → secondary folds ONTO phase 0 → odd/even fires,
+  phase 0.5 empty (K01317.01: odd/even Δ9.5%/15.4σ, phase 0.5 reads
+  −80 ppm/−2.9σ — the slight brightening is the binary's ellipsoidal
+  peak at quadrature). True-period lock → secondary sits at phase
+  0.5 → this check fires, odd/even consistent (K01130.01: 2,311 ppm
+  at 74σ, ratio 13.8%, odd/even 0.4σ; KIC12506351: ratio 99.6% —
+  near-equal binary — odd/even 1.1σ, measured but not frozen).
+- **Hot-Jupiter edge case is handled by being descriptive**: a real
+  planetary occultation is just a shallow detected dimming with a
+  tiny ratio. Ground truth HAT-P-7b (K00002.01, CONFIRMED, DR25
+  MOD_SEC + PLANET_OCCULT flags): DETECTED 59 ppm at 30.9σ, ratio
+  1.1% — matches the literature occultation. The check reports the
+  numbers; it never says "false positive".
+- **Partial curves**: same policy and reasoning as odd/even — the
+  phase-0.5 window recurs EVERY cycle, so a missing quarter removes
+  whole cycles (phase-0 and phase-0.5 slices alike), not the
+  secondary window preferentially; lost coverage only widens the SE.
+  The preferential-loss geometry (P ~ quarter length) can't reach 3
+  usable cycles and nulls out. Unit-tested (missing-quarter block
+  must not fake a detection).
+- No threshold calibration was needed (unlike odd/even's 5% floor):
+  3σ cleanly separates all seven fixtures' measured values.
 
 **Client thread**: classification (dominated by BLS) runs in a Web
 Worker via `lib/classifyAsync.ts` → `workers/classify.worker.ts`;
@@ -1198,12 +1283,13 @@ the readout returns null in that case.
 
 ### Data regression test (`npm run test:data`)
 `src/lib/__tests__/dataRegression.test.ts` runs `detectDips` +
-`classifyCurve` against four frozen real-data fixtures
+`classifyCurve` against seven frozen real-data fixtures
 (`src/lib/__tests__/fixtures/*.json.gz`, gzipped MAST Kepler PDC
-curves captured 2026-07-02/03) and compares to hand-verified
-expected values (dip count, pattern label, top-dip label / peak
-time / depth, best-fit period). Fails loudly (per-field diff +
-exit 1) on any drift.
+curves captured 2026-07-02/03 and 2026-07-06) and compares to
+hand-verified expected values (dip count, pattern label, top-dip
+label / peak time / depth, best-fit period, odd/even verdict +
+relative depth difference, secondary-eclipse verdict + depth). Fails
+loudly (per-field diff + exit 1) on any drift.
 
 Plain Node ≥ 22.6 executes the TS via native type stripping — no
 test framework, no extra deps (`allowImportingTsExtensions` was
@@ -1220,7 +1306,21 @@ K00931.01 (KIC9166862 — 351 dips ≈ NASA's 3.856 d period over the
 baseline; hand-verified via transit-count agreement), K01725.01
 (KIC10905746 — 53 variability dips, UNCERTAIN via the
 implausible-period guard; its real 0.15% transits are below the 1%
-dip threshold).
+dip threshold), K01317.01 (KIC4275739, added 2026-07-06 —
+DR25 DEPTH_ODDEVEN false positive; BLS locks NASA's flagged
+half-period 2.1718 d and odd/even must read MISMATCH Δ9.5%/15.4σ;
+captured complete, 11/11 quarters), K01130.01 (KIC8279765, added
+2026-07-06 — DR25 MOD_SEC false positive; secondary DETECTED
+2,311 ppm/74σ at NASA's true period, odd/even CONSISTENT — the
+complement of K01317.01's geometry), and K00002.01 = HAT-P-7b
+(KIC10666592, added 2026-07-06 — CONFIRMED hot Jupiter with the
+PLANET_OCCULT flag; secondary DETECTED 59 ppm/30.9σ, ratio 1.1%,
+0 dips → SPARSE). The odd/even and secondary expectations also pin
+the negative paths: no-confident-BLS stars (Tabby, K01725.01) must
+yield null for both checks, K02357.02/K00931.01 must stay
+CONSISTENT / NOT_DETECTED, and K01317.01 must read NOT_DETECTED at
+phase 0.5 (its secondary folds onto phase 0 under the half-period
+lock).
 
 Expectations were re-frozen 2026-07-04 for classifier v2 (BLS): the
 old K00931.01 quirk (periodicity 0.4996, a hair under the cutoff →

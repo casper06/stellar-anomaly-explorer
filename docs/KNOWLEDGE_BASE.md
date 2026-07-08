@@ -400,16 +400,44 @@ data (N/M quarters)" in the UI.
 
 ### 7.2 TOI 5523.02 — chart renders as solid blocks (12,431 dips)
 
-A TESS TOI whose rendered curve fills in as solid blocks rather than a
-line, with an implausibly high detected-dip count (12,431). Almost
-certainly a **high-cadence, multi-sector TESS edge case**: a
-continuous-viewing-zone star with many stitched sectors at 2-min
-cadence produces a very dense, possibly noisy series that overwhelms
-the dip detector and the per-pixel-column dedupe in the draw path. Not
-yet root-caused. The LTTB downsampling + per-pixel-column dedupe were
-built for exactly this class of artifact on Kepler oscillators; whether
-they need porting/retuning for the TESS multi-sector case is the open
-question.
+**Root-caused 2026-07-07** (fix still open). The original CVZ
+hypothesis was WRONG: TIC 443616612 is an ordinary 5-sector TESS
+target near the ecliptic (Dec −3.98°), 78,198 samples at 2-min
+cadence, fetched complete (5/5). Measured diagnosis:
+
+- **Detector: out-of-domain calibration, not a code bug.** The star's
+  photometric scatter is σ ≈ 1.6% (Tmag 13.77 at 2-min cadence), so
+  the fixed `threshold = 0.990` sits at **0.6σ below the mean** —
+  24.3% of ALL samples qualify as "in a dip". With no minimum
+  duration and no merging, the noise tail fragments into 12,431
+  contiguous runs: 70% are single-sample (one 2-min point), 63%
+  start within ≤3 samples of the previous dip's end. On Kepler PDC
+  (σ ~0.1–0.3%) the same threshold is 3–10σ, which is why it worked.
+  The count is the detector doing exactly what it's coded to do on
+  input outside its calibration domain. Fix direction: noise-relative
+  (sigma-aware) threshold, and/or minimum-duration + adjacent-run
+  merging — the dip-count analog of the implausible-period guard.
+- **Chart blocks: two compounding effects, both renderer-faithful.**
+  (1) The 5 sectors cover ~109 observed days spread across a
+  1,003-day x-span, so all data (and all 12,431 markers) pile into
+  ~11% of the canvas columns — ~71 dip markers per occupied column →
+  solid cyan/orange/white blocks (NOTABLE 5,320 / INTERESTING 994 /
+  NORMAL 6,116 dots stacked). (2) Mean per-column flux peak-to-peak
+  is 8.69% vs a p1–p99 y-range of 8.24% — every occupied column's
+  samples span the FULL y-range, so even perfect LTTB + per-column
+  dedupe (which deliberately keeps the extremes) strokes a
+  full-height vertical line per column. The white band is a faithful
+  rendering of a 1.6%-σ noise band; the colored blocks are the
+  12,431 dip markers. No renderer algorithm failure (detectDips runs
+  in 19 ms; classifyCurve in 526 ms).
+- **Classifier + vetting checks degrade gracefully.** baselineRMS
+  1.18% → HIGH_VARIABILITY (correct, priority rule 1: "dips here are
+  hard to trust"). BLS finds no confident signal (SDE 3.5 — red-noise
+  suppression, documented) → odd/even and secondary-eclipse checks
+  correctly return null. The known planet (P=3.47 d, 4,280 ppm) is
+  genuinely below detectability under this noise. The side panel
+  slices to 6 dip cards, so only the "DIPS DETECTED (12,431)" counter
+  and the canvas markers surface the pathology to the user.
 
 ### 7.3 TOI score cap asymmetry (KOI vs TOI scoring scale)
 
@@ -491,6 +519,6 @@ flowchart TD
 
 ---
 
-*Last updated 2026-07-05. When an open issue in §7 is fixed, move it to
+*Last updated 2026-07-07. When an open issue in §7 is fixed, move it to
 the relevant "FIXED" section with its root cause, and update the K00931.01
 entry (§4) once §7.1 is resolved.*

@@ -1,13 +1,17 @@
 import type { Dip } from './anomalyDetector'
 import { runBls, BLS_SDE_THRESHOLD, type BlsResult } from './bls'
+import { measureOddEvenDepths, type OddEvenResult } from './oddEven'
+import { measureSecondaryEclipse, type SecondaryEclipseResult } from './secondaryEclipse'
 
 /**
  * @description Version of the classification algorithm. BUMP THIS on any
- * change that can alter a star's pattern label or profile fields —
- * pattern-cache entries record the version they were computed under, and
- * the batch classifier treats entries from older versions as missing
- * (re-classifies them) instead of serving mixed-provenance labels. Same
- * lesson as the lightcurve cache's CACHE_SCHEMA_VERSION.
+ * change that can alter a star's PATTERN LABEL — pattern-cache entries
+ * store only the label (plus this version), and the batch classifier
+ * treats entries from older versions as missing (re-classifies them)
+ * instead of serving mixed-provenance labels. Same lesson as the
+ * lightcurve cache's CACHE_SCHEMA_VERSION. Purely additive profile
+ * fields that never feed `pickPattern` (e.g. the odd/even depth check)
+ * do NOT require a bump: they aren't cached, so they can't go stale.
  * v2: BLS period search added; PERIODIC_UNIFORM now requires a confident
  * BLS detection (gated on ≥3 visible dips); bestFitPeriodDays sourced
  * from BLS.
@@ -101,6 +105,24 @@ export interface CurveProfile {
    * visible dip pattern.
    */
   bls: BlsResult | null
+  /**
+   * Odd/even transit depth comparison, computed whenever the BLS
+   * detection is confident (like the `bls` field, independent of the
+   * pattern label — a SPARSE star with a confident signal still gets
+   * measured). Null when BLS isn't confident or the fold geometry
+   * doesn't support the measurement (too few cycles per parity). Never
+   * feeds the pattern label — purely an additional reported measurement,
+   * which is why adding it did not bump CLASSIFIER_VERSION.
+   */
+  oddEven: OddEvenResult | null
+  /**
+   * Phase-0.5 dimming (secondary eclipse position) measurement — the
+   * companion vetting check to `oddEven`, on the same confident-BLS
+   * gate and with the same non-label-affecting status (no
+   * CLASSIFIER_VERSION bump). Null when BLS isn't confident or too few
+   * cycles have usable phase-0.5 coverage.
+   */
+  secondary: SecondaryEclipseResult | null
 }
 
 /**
@@ -199,6 +221,12 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
     bls.sde >= BLS_SDE_THRESHOLD &&
     bls.periodDays >= MIN_PLAUSIBLE_PERIOD_DAYS
 
+  // Odd/even and the phase-0.5 check run on the same gate as the BLS
+  // readout line: any confident detection, regardless of what pattern
+  // label the curve ends up with.
+  const oddEven = blsConfident && bls ? measureOddEvenDepths(times, flux, bls) : null
+  const secondary = blsConfident && bls ? measureSecondaryEclipse(times, flux, bls) : null
+
   if (dipCount < MIN_DIPS_FOR_PATTERN) {
     return {
       pattern: 'SPARSE',
@@ -209,6 +237,8 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
       bestFitPeriodDays: null,
       dipCount,
       bls,
+      oddEven,
+      secondary,
     }
   }
 
@@ -242,6 +272,8 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
     bestFitPeriodDays: reportedPeriod,
     dipCount,
     bls,
+    oddEven,
+    secondary,
   }
 }
 
