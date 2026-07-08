@@ -491,6 +491,27 @@ PDC data. Depth is intentionally uncapped within the formula so a single
 deep transit can carry the whole score on its own.
 
 - `threshold` default: **0.990** — catches sub-1% dips.
+- **High-noise guard (2026-07-07, the TOI 5523.02 fix)**: the fixed
+  0.990 threshold was calibrated for Kepler noise (σ_rob 0.03–0.6% on
+  the frozen fixtures); on a σ≈1.6% TESS 2-min curve it sat at 0.6σ and
+  produced 12,431 noise-fragment "dips". Three measures, all constants
+  in `anomalyDetector.ts`:
+  1. **Sigma-relative floor**: when `robustFluxSigma` (1.4826×MAD) >
+     `DIP_NOISE_GATE_SIGMA = 0.0075`, the effective threshold becomes
+     `min(threshold, 1 − 3·σ_rob)` — a consistent 3σ cut. The gate sits
+     between the noisiest calibrated Kepler fixture (K01725.01, 0.575%)
+     and the pathological case (1.43%), so Kepler-domain behavior is
+     bit-identical. An ungated `min(0.990, 1−3σ)` was measured and
+     REJECTED: it drifts K01725.01 (53→0 dips) and K01317.01 (461→411).
+  2. **Fragmentation merge**: runs separated by < `DIP_MERGE_GAP_DAYS =
+     0.01` merge into one dip.
+  3. **Min duration**: dips shorter than `MIN_DIP_DURATION_DAYS = 0.02`
+     are dropped. Both time guards are structural no-ops at Kepler's
+     30-min cadence (one sample spans 0.0204 d) — active only on
+     high-cadence data.
+  Detection-sensitivity calibration, not a realness claim: "dip" now
+  means the same statistical thing (≥3σ, sustained) across missions.
+  TOI 5523.02: 12,431 → 20 dips; all 7 Kepler fixtures unchanged.
 - Score formula: `depth * 3 + min(sigma / 8, 0.3) + asymmetry * 0.1`,
   clamped to `[0, 1]`. A 20% dip alone contributes 0.60 from the depth
   term (= WOW threshold). Sigma and asymmetry add headroom for clean,
@@ -1176,7 +1197,7 @@ K02357.01 at P=2.4210 d / 157 ppm, matching NASA to 5e-5).
 
 `bestFitPeriodDays` is sourced from BLS and surfaced only when the
 label is `PERIODIC_UNIFORM` (anywhere else a period would contradict
-the label). `CLASSIFIER_VERSION` (currently 2) must be bumped on any
+the label). `CLASSIFIER_VERSION` (currently 3) must be bumped on any
 change that can alter LABELS — pattern-cache entries record it, and
 the batch treats old-version entries as missing (re-classifies).
 Purely additive `CurveProfile` fields that never feed `pickPattern`
@@ -1283,7 +1304,7 @@ the readout returns null in that case.
 
 ### Data regression test (`npm run test:data`)
 `src/lib/__tests__/dataRegression.test.ts` runs `detectDips` +
-`classifyCurve` against seven frozen real-data fixtures
+`classifyCurve` against eight frozen real-data fixtures
 (`src/lib/__tests__/fixtures/*.json.gz`, gzipped MAST Kepler PDC
 curves captured 2026-07-02/03 and 2026-07-06) and compares to
 hand-verified expected values (dip count, pattern label, top-dip

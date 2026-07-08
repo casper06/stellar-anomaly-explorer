@@ -400,7 +400,25 @@ data (N/M quarters)" in the UI.
 
 ### 7.2 TOI 5523.02 — chart renders as solid blocks (12,431 dips)
 
-**Root-caused 2026-07-07** (fix still open). The original CVZ
+**FIXED 2026-07-07** (same day as the root-cause below). Fix: (1) a
+sigma-relative threshold floor — when `robustFluxSigma` (1.4826×MAD)
+exceeds `DIP_NOISE_GATE_SIGMA = 0.0075`, the in-dip cut becomes
+`min(0.990, 1 − 3σ_rob)`; the gate sits between the noisiest calibrated
+Kepler fixture (K01725.01, σ_rob 0.575%) and this star (1.43%), chosen
+by a measured sweep that showed the UNGATED form drifts two Kepler
+fixtures (K01725.01 53→0, K01317.01 461→411) — the gate preserves all 7
+bit-identically. (2) Fragmentation merge (`DIP_MERGE_GAP_DAYS = 0.01`)
+and (3) min duration (`MIN_DIP_DURATION_DAYS = 0.02`) — both structural
+no-ops at Kepler's 30-min cadence, active at TESS 2-min. Result:
+TOI 5523.02 = 12,431 → **20 dips** (≥3σ sustained excursions, deepest
+8.5%), frozen as the 8th regression fixture; the dip-marker blocks in
+the chart are gone (the white per-sector noise envelope remains — that
+part is a faithful rendering of σ=1.6% data, per the diagnosis).
+`CLASSIFIER_VERSION` bumped 2→3 (dip count feeds the SPARSE gate, so
+high-noise stars' labels can change); the pattern cache needs a
+re-batch to refresh v2 entries. Original diagnosis kept below.
+
+**Root-caused 2026-07-07**. The original CVZ
 hypothesis was WRONG: TIC 443616612 is an ordinary 5-sector TESS
 target near the ecliptic (Dec −3.98°), 78,198 samples at 2-min
 cadence, fetched complete (5/5). Measured diagnosis:

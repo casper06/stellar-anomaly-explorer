@@ -15,8 +15,14 @@ import { measureSecondaryEclipse, type SecondaryEclipseResult } from './secondar
  * v2: BLS period search added; PERIODIC_UNIFORM now requires a confident
  * BLS detection (gated on ≥3 visible dips); bestFitPeriodDays sourced
  * from BLS.
+ * v3: dip-detector high-noise calibration (the TOI 5523.02 fix in
+ * `anomalyDetector.ts`): sigma-relative threshold floor beyond the noise
+ * gate + fragmentation merge + min-duration guard. Dip count feeds the
+ * SPARSE gate and every dip-derived scalar, so labels of high-noise
+ * stars can change (e.g. noise-dip IRREGULAR → SPARSE/HIGH_VARIABILITY);
+ * verified bit-identical on all frozen Kepler fixtures.
  */
-export const CLASSIFIER_VERSION = 2
+export const CLASSIFIER_VERSION = 3
 
 /**
  * @description Pattern label assigned by the classifier. Purely
