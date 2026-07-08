@@ -434,8 +434,10 @@ overwritten v2 labels no longer allow. Operational note: the batch
 run surfaced that Next dev auto-restarts on a memory threshold
 (~every 4k stars — the lightcurve L1 Map grows unboundedly under
 batch load); a 5-min watchdog that re-POSTs on worker death carried
-the run to completion across two auto-restarts. The unbounded L1 is
-a known open item.
+the run to completion across two auto-restarts. The unbounded L1
+was FIXED 2026-07-08: it is now a 40-entry LRU (`lib/lruCache.ts`),
+bounding L1 at ~80 MB worst-case while keeping the on-demand
+repeated-access benefit.
 
 **Root-caused 2026-07-07**. The original CVZ
 hypothesis was WRONG: TIC 443616612 is an ordinary 5-sector TESS
