@@ -183,3 +183,76 @@ export function describeVisibility(decDeg: number): string {
   }
   return parts.join(' · ')
 }
+
+/**
+ * @description The season an all-night culmination month falls in, for a
+ * given hemisphere. Purely the calendar-vs-hemisphere mapping (the same
+ * month is opposite seasons north vs south), used to phrase the
+ * story-framed visibility copy. Astronomical seasons by culmination
+ * month: Dec–Feb = northern winter / southern summer, and so on.
+ * @param month Month name as returned by {@link bestViewingMonth}.
+ * @param hemisphere 'north' or 'south'.
+ * @returns Season word ('summer' | 'autumn' | 'winter' | 'spring').
+ */
+function seasonForMonth(month: string, hemisphere: 'north' | 'south'): string {
+  const northSeasonByMonth: Record<string, string> = {
+    December: 'winter', January: 'winter', February: 'winter',
+    March: 'spring', April: 'spring', May: 'spring',
+    June: 'summer', July: 'summer', August: 'summer',
+    September: 'autumn', October: 'autumn', November: 'autumn',
+  }
+  const north = northSeasonByMonth[month] ?? 'summer'
+  if (hemisphere === 'north') return north
+  // Southern hemisphere seasons are offset by six months (opposite).
+  const opposite: Record<string, string> = {
+    winter: 'summer', summer: 'winter', spring: 'autumn', autumn: 'spring',
+  }
+  return opposite[north]
+}
+
+/**
+ * @description Story-framed celestial-visibility copy for the UI. Unlike
+ * {@link describeVisibility} (a compact latitude readout), this separates
+ * the two DIFFERENT facts that a naive one-liner conflates:
+ *
+ *  1. WHEN it is up all night, worldwide — derived from RA (the
+ *     culmination month), phrased as the observer's season.
+ *  2. WHETHER / HOW it climbs the sky depending on the observer's
+ *     hemisphere — derived purely from Dec geometry (unchanged math via
+ *     {@link visibilityFor}).
+ *
+ * A northern-declination target is framed for a northern observer ("high
+ * overhead … in summer"); a southern-declination target for a southern
+ * observer; equatorial targets say they suit both. The declination
+ * geometry is reported exactly as {@link visibilityFor} computes it — no
+ * new claims the math doesn't support.
+ * @param raDeg Right ascension, J2000, degrees.
+ * @param decDeg Declination, J2000, degrees.
+ * @returns One or two short English sentences.
+ */
+export function describeVisibilityStory(raDeg: number, decDeg: number): string {
+  const month = bestViewingMonth(raDeg)
+  const v = visibilityFor(decDeg)
+  const fmt = (x: number) => `${x >= 0 ? '+' : '−'}${Math.abs(Math.round(x))}°`
+
+  // Sentence 1 — WHEN, worldwide, framed by the relevant hemisphere's season.
+  const homeHemi: 'north' | 'south' = decDeg >= 0 ? 'north' : 'south'
+  const season = seasonForMonth(month, homeHemi)
+  const when = `Around ${month}, it climbs highest at midnight — the heart of ${homeHemi}ern-hemisphere ${season}.`
+
+  // Sentence 2 — WHO can see it, purely from declination geometry.
+  let who: string
+  if (v.minLatDeg <= -89.5 && v.maxLatDeg >= 89.5) {
+    who = 'It rides the celestial equator, so it rises for observers in both hemispheres.'
+  } else if (decDeg >= 0) {
+    who =
+      `From the northern hemisphere it stands high overhead; it still rises for anyone north of ${fmt(v.minLatDeg)} latitude, sinking lower the farther south you travel` +
+      (v.circumpolarFromDeg !== null ? `, and never sets above ${fmt(v.circumpolarFromDeg)}.` : '.')
+  } else {
+    who =
+      `From the southern hemisphere it stands high overhead; it still rises for anyone south of ${fmt(v.maxLatDeg)} latitude, sinking lower the farther north you travel` +
+      (v.circumpolarFromDeg !== null ? `, and never sets below ${fmt(v.circumpolarFromDeg)}.` : '.')
+  }
+
+  return `${when} ${who}`
+}

@@ -111,6 +111,43 @@ const SLIDES: Slide[] = [
     ),
   },
   {
+    title: 'WHERE THIS SKY IS, IN YOUR SKY',
+    body: (
+      <>
+        <p style={P}>
+          That dense red <Em color="#ff4d6d">blob</Em>{' '}isn&apos;t abstract:
+          it&apos;s a real patch of sky near <Em>Cygnus</Em>{' '}and{' '}
+          <Em>Lyra</Em>. If you stepped outside on a clear{' '}
+          <Em>summer</Em>{' '}night in the <Em>northern hemisphere</Em>{' '}— around
+          July — that patch would be almost straight{' '}
+          <Em>overhead at midnight</Em>. Kepler&apos;s field is far north
+          (declination ~+44°), so this is a northern-summer sky.
+        </p>
+        <p style={P}>
+          Two different facts decide when and where any star is visible,
+          and it&apos;s easy to mix them up:
+        </p>
+        <p style={{ ...P, lineHeight: 2 }}>
+          <Em color="#4cc9f0">WHEN</Em>{' '}— set by the star&apos;s{' '}
+          <Em>right ascension</Em>. It picks the month the star is up all
+          night, and that&apos;s the same month everywhere on Earth.
+          <br />
+          <Em color="#4cc9f0">HOW HIGH / WHETHER</Em>{' '}— set by the
+          star&apos;s <Em>declination</Em>{' '}(how far north or south it is).
+          A far-north star rides high for northern observers and skims —
+          or never clears — the horizon for southern ones.
+        </p>
+        <p style={P}>
+          So the panel&apos;s visibility line reads like a short story: it
+          names the season this star owns the night sky, then tells you
+          how it behaves depending on which hemisphere you&apos;re
+          standing in. A southern-sky target flips the whole thing — best
+          on a southern-summer night, high for southern observers.
+        </p>
+      </>
+    ),
+  },
+  {
     title: 'WHAT THE COUNTERS COUNT',
     body: (
       <>

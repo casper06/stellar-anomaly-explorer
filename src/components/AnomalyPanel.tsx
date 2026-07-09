@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import { useStore, type Anomaly, type LightcurveProvenance } from '@/lib/store'
 import type { CurveProfile, CurvePattern, DipShape } from '@/lib/curveClassifier'
 import { BLS_SDE_THRESHOLD } from '@/lib/bls'
-import { constellationAt, describeVisibility, bestViewingMonth } from '@/lib/constellations'
+import { constellationAt, describeVisibilityStory } from '@/lib/constellations'
 import LightCurve from './LightCurve'
 
 /**
@@ -1145,20 +1145,22 @@ export default function AnomalyPanel() {
           </div>
         </div>
 
-        {/* Celestial-orientation line: hemisphere visibility (pure
-            declination geometry) + the month this RA culminates around
-            midnight. Orientation aid, not an ephemeris. */}
+        {/* Celestial-orientation copy, storytelling frame: separates the
+            two facts a technical one-liner conflates — (a) WHEN it is up
+            all night worldwide, from RA (culmination month → season), and
+            (b) WHO can see it and how high, from Dec geometry alone.
+            Orientation aid, not an ephemeris; the declination math is
+            untouched (describeVisibilityStory reuses visibilityFor). */}
         <div
           style={{
-            fontSize: 8.5,
-            color: 'rgba(255,255,255,0.45)',
-            letterSpacing: 0.5,
-            lineHeight: 1.6,
+            fontSize: 9,
+            color: 'rgba(255,255,255,0.5)',
+            letterSpacing: 0.3,
+            lineHeight: 1.7,
             marginBottom: 14,
           }}
         >
-          {describeVisibility(selectedStar.dec)} · best viewed around{' '}
-          {bestViewingMonth(selectedStar.ra)}
+          {describeVisibilityStory(selectedStar.ra, selectedStar.dec)}
         </div>
 
         <Divider />
