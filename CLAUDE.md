@@ -129,6 +129,21 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 - Click-to-select via native raycasting; opens AnomalyPanel. Dense-field disambiguation: when a click hits 2+ stars within a 6-CSS-pixel screen radius, a popover appears at the click site listing each candidate (name, ΔRA/ΔDec from the clicked sky position in arcminutes) so the user can pick the intended one. Clicking off-card dismisses without selecting.
 - Star visualization SVG (radial gradient by B-V + corona + anomaly ring)
 - Glossary tooltips (?) for MAG/RA/DEC/COLOR/DIP/SCORE/DEPTH/DURATION/BKJD
+- **In-app tutorial** (`components/Tutorial.tsx`, 2026-07-09): a
+  "? TUTORIAL" button in the HUD header (next to search) launches a
+  7-slide walkthrough — the two datasets (Kepler's fixed ~115 sq-deg
+  field vs the ESA Hipparcos whole-sky background), what the mission
+  counters count (unique KOI/TOI candidate stars, NOT rendered-star
+  totals), the data-source badges incl. PARTIAL and why partial is
+  flagged not hidden, navigation (search/click/quadrants/flagging),
+  the sky-radar tint legend, lightcurve viewer controls, and the
+  citizen-science hand-off. Never auto-opens; Esc/backdrop/SKIP
+  dismiss; re-openable; ←/→ navigate; re-open resets to slide 1.
+  Deeper than (and separate from) the first-run Onboarding overlay.
+  Gotcha encoded in the copy style: Turbopack's JSX transform drops
+  the leading space of a text node that continues onto the next
+  source line, so boundary spaces after inline elements (`</Em>`,
+  badge/dot mocks) must be explicit `{' '}`.
 
 ### Known bugs / pending 🐛
 - (none currently tracked)
@@ -145,14 +160,6 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   requires cross-referencing existing RA/Dec data against an IAU
   constellation-boundaries catalog, plus visibility-by-latitude
   logic. Future idea — not being implemented now.
-- **In-app interactive tutorial**: a button (HUD, near the search
-  bar) that launches a slide-based or similarly didactic walkthrough
-  of how to use the app itself — navigation, what the markers mean,
-  how to read the lightcurve viewer, what the REAL DATA vs
-  DEV/SYNTHETIC badges mean, and how citizen-science reporting works.
-  This is product onboarding (deeper than the current first-run
-  overlay), separate from the astronomy-content feature above. Future
-  idea — not being implemented now.
 - **Target Pixel File (TPF) centroid analysis** (opt-in, per-star,
   on-demand ONLY): for a selected star, fetch its Kepler/TESS Target
   Pixel File from MAST and compute the flux-weighted centroid of the

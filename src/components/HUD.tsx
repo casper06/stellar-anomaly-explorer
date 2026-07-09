@@ -4,6 +4,7 @@ import { useStore, type Star } from '@/lib/store'
 import { KNOWN_ANOMALIES } from '@/lib/starCatalog'
 import { ALL_QUADRANT_IDS, quadrantCenter } from '@/lib/quadrants'
 import StarSearch from './StarSearch'
+import TutorialLauncher from './Tutorial'
 import { selectStarAndFetchCurve } from '@/lib/selectStar'
 import { RADAR_COLOR_HEX } from '@/lib/radarPalette'
 import type { CurvePattern } from '@/lib/curveClassifier'
@@ -337,6 +338,7 @@ export default function HUD() {
               </div>
             </div>
             <StarSearch />
+            <TutorialLauncher />
           </div>
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 1 }}>
