@@ -23,6 +23,8 @@ const GLOSSARY: Record<string, string> = {
   BKJD: 'Barycentric Kepler Julian Date: time system used by the Kepler telescope.',
   TJD: 'TESS Julian Date: time system used by the TESS telescope (BJD − 2457000).',
   SKY: 'The IAU constellation this position falls in — where the star sits in the real night sky. Below it: which Earth latitudes can ever see it, and the month it is highest around midnight.',
+  NASA_SCORE: "NASA's own catalog vetting score for this candidate, independent from the local detector and BLS results shown below. A low score here alongside high local activity (many dips, high variability, or a confident BLS signal) is expected, not contradictory — they are two separate instruments looking at the same star.",
+  TOI_SCALE: "This is a TESS (TOI) candidate, and the TOI score scale tops out around 50 rather than 100 — it lacks the extra NASA-vetting term that Kepler (KOI) scores carry. So a value like 41 sits near the top of TOI's range, not artificially low next to a KOI score.",
 }
 
 /**
@@ -1128,9 +1130,29 @@ export default function AnomalyPanel() {
           />
         </div>
 
-        {/* Score ring + star info */}
+        {/* Score ring + star info. The ring shows NASA's catalog vetting
+            score (0–100), which is independent from the local detector /
+            BLS findings surfaced further down — hence the NASA_SCORE
+            tooltip. For TESS (TOI) stars the TOI scale tops out near 50,
+            so an inline note + tooltip keeps a ~41 from reading as
+            artificially low against a KOI 0–100 score. Purely explanatory;
+            no scoring math is touched. */}
         <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 16 }}>
-          <ScoreRing score={selectedStar.anomalyScore} />
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 7, letterSpacing: 1, color: 'rgba(255,255,255,0.4)' }}>NASA SCORE</span>
+              <InfoBadge term="NASA_SCORE" />
+            </div>
+            <ScoreRing score={selectedStar.anomalyScore} />
+            {selectedStar.source === 'TESS' && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <span style={{ fontSize: 7, letterSpacing: 0.5, color: 'rgba(0,229,255,0.75)', whiteSpace: 'nowrap' }}>
+                  TOI scale · max ~50
+                </span>
+                <InfoBadge term="TOI_SCALE" />
+              </div>
+            )}
+          </div>
           <div style={{ flex: 1 }}>
             <InfoRow label="RA" value={`${selectedStar.ra.toFixed(4)}°`} term="RA" />
             <InfoRow label="DEC" value={`${selectedStar.dec.toFixed(4)}°`} term="DEC" />
