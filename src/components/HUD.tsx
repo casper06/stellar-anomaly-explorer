@@ -5,6 +5,7 @@ import { KNOWN_ANOMALIES } from '@/lib/starCatalog'
 import { ALL_QUADRANT_IDS, quadrantCenter } from '@/lib/quadrants'
 import StarSearch from './StarSearch'
 import TutorialLauncher from './Tutorial'
+import { constellationAt } from '@/lib/constellations'
 import { selectStarAndFetchCurve } from '@/lib/selectStar'
 import { RADAR_COLOR_HEX } from '@/lib/radarPalette'
 import type { CurvePattern } from '@/lib/curveClassifier'
@@ -342,7 +343,12 @@ export default function HUD() {
           </div>
           <div style={{ textAlign: 'right' }}>
             <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 1 }}>
-              RA {cameraTarget.ra.toFixed(4)}° · DEC {cameraTarget.dec.toFixed(4)}°
+              {/* constellationAt is a 357-row table scan — cheap enough to
+                  run on every render this readout already re-renders for. */}
+              RA {cameraTarget.ra.toFixed(4)}° · DEC {cameraTarget.dec.toFixed(4)}° ·{' '}
+              <span style={{ color: 'rgba(76,201,240,0.85)' }}>
+                {constellationAt(cameraTarget.ra, cameraTarget.dec).name.toUpperCase()}
+              </span>
             </div>
             <div style={{ fontSize: 9, color: statusColor, letterSpacing: 2, marginTop: 2 }}>
               {statusLabel}

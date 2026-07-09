@@ -185,6 +185,10 @@ const SLIDES: Slide[] = [
           get a white ring in the sky and live in the FLAGGED list.
           Visited anomalies dim so unexplored ones stand out.
         </p>
+        <p style={P}>
+          The <Em>constellation name</Em>{' '}in the header (top right) tells
+          you where you&apos;re pointed in the real sky.
+        </p>
       </>
     ),
   },

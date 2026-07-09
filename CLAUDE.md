@@ -144,22 +144,38 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   the leading space of a text node that continues onto the next
   source line, so boundary spaces after inline elements (`</Em>`,
   badge/dot mocks) must be explicit `{' '}`.
+- **Celestial orientation** (`lib/constellations.ts` +
+  `data/constellationZones.ts`, 2026-07-09): the HUD header readout
+  appends the constellation the camera points at ("RA … · DEC … ·
+  CYGNUS", live) and the AnomalyPanel gains a SKY row (constellation
+  of the selected star, glossary tooltip) plus a visibility line
+  ("Visible north of −46° · circumpolar above +46° · best viewed
+  around July"). Constellation lookup = IAU zone table VizieR VI/42
+  (Roman 1987; 357 rows, B1875, precedence-ordered) bundled as a
+  build-time TS constant — boundaries fixed by the IAU in 1930, never
+  change, so NO fetch/cache/health-check (unique among the app's
+  datasets); inputs precessed J2000→B1875 (IAU-1976 three-angle,
+  computed at module load). Visibility is pure declination geometry
+  (φ ∈ (δ−90°, δ+90°); circumpolar where |φ+δ| > 90°, same sign);
+  best month = RA mapped to midnight culmination via solar RA
+  (±2 weeks, hence "around"). Ground-truth unit tests: 11 known stars
+  (Tabby→Cyg, Polaris→UMi, Sirius→CMa, Spica→Vir, …) + a whole-sphere
+  sweep. Note the EPIC 201637175 seed sits in LEO (verified against
+  Spica/Regulus anchors), not Virgo as a naive RA guess suggests. The
+  zone table can't draw boundary OUTLINES — the phase-2 minimap
+  overlay needs the separate VI/49 polygon data (not bundled).
 
 ### Known bugs / pending 🐛
 - (none currently tracked)
 
 ### Next features 🚀
 - More Kepler/K2/TESS anomaly seeds beyond the current 11
-- **Celestial orientation / "where am I looking"**: users navigating
-  the 3D explorer have no reference for what part of the real sky a
-  given region corresponds to. Proposed: when navigating to a region,
-  show which constellation it falls in (e.g. "this is in Cygnus"), a
-  context mini-map showing that region relative to the whole sky, and
-  hemisphere visibility info (visible from the northern hemisphere at
-  X, southern at Y, or not visible at all from one of them). Likely
-  requires cross-referencing existing RA/Dec data against an IAU
-  constellation-boundaries catalog, plus visibility-by-latitude
-  logic. Future idea — not being implemented now.
+- **Celestial orientation phase 2 — minimap boundary overlay**: faint
+  constellation boundary polylines on the existing sky Minimap. Phase
+  1 (labels + visibility, see "What works") shipped 2026-07-09; the
+  outline overlay needs the VI/49 boundary POLYGONS (~200 KB, the
+  zone table can't draw outlines) — separate bundling decision.
+  Future idea — not being implemented now.
 - **Target Pixel File (TPF) centroid analysis** (opt-in, per-star,
   on-demand ONLY): for a selected star, fetch its Kepler/TESS Target
   Pixel File from MAST and compute the flux-weighted centroid of the

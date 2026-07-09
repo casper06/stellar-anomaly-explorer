@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { useStore, type Anomaly, type LightcurveProvenance } from '@/lib/store'
 import type { CurveProfile, CurvePattern, DipShape } from '@/lib/curveClassifier'
 import { BLS_SDE_THRESHOLD } from '@/lib/bls'
+import { constellationAt, describeVisibility, bestViewingMonth } from '@/lib/constellations'
 import LightCurve from './LightCurve'
 
 /**
@@ -21,6 +22,7 @@ const GLOSSARY: Record<string, string> = {
   DURATION: 'Dip duration in days.',
   BKJD: 'Barycentric Kepler Julian Date: time system used by the Kepler telescope.',
   TJD: 'TESS Julian Date: time system used by the TESS telescope (BJD − 2457000).',
+  SKY: 'The IAU constellation this position falls in — where the star sits in the real night sky. Below it: which Earth latitudes can ever see it, and the month it is highest around midnight.',
 }
 
 /**
@@ -1134,7 +1136,29 @@ export default function AnomalyPanel() {
             <InfoRow label="DEC" value={`${selectedStar.dec.toFixed(4)}°`} term="DEC" />
             <InfoRow label="MAG" value={selectedStar.magnitude.toFixed(2)} term="MAG" />
             <InfoRow label="COLOR" value={bvToColorName(selectedStar.colorIndex)} small term="COLOR" />
+            <InfoRow
+              label="SKY"
+              value={constellationAt(selectedStar.ra, selectedStar.dec).name}
+              small
+              term="SKY"
+            />
           </div>
+        </div>
+
+        {/* Celestial-orientation line: hemisphere visibility (pure
+            declination geometry) + the month this RA culminates around
+            midnight. Orientation aid, not an ephemeris. */}
+        <div
+          style={{
+            fontSize: 8.5,
+            color: 'rgba(255,255,255,0.45)',
+            letterSpacing: 0.5,
+            lineHeight: 1.6,
+            marginBottom: 14,
+          }}
+        >
+          {describeVisibility(selectedStar.dec)} · best viewed around{' '}
+          {bestViewingMonth(selectedStar.ra)}
         </div>
 
         <Divider />
