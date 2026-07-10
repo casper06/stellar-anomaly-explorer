@@ -1,0 +1,20 @@
+# Citation File Format (https://citation-file-format.github.io/)
+# Validate with: `cffconvert --validate` (pip install cffconvert)
+#
+# Package-scoped citation for the MIT-licensed engine. Nested inside the
+# monorepo, GitHub's "Cite this repository" button won't surface this file
+# (it reads the repo-root CITATION.cff), but it future-proofs an eventual
+# split into a standalone repo and gives npm consumers something to cite.
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "stellar-vetting-engine"
+authors:
+  - given-names: "Fernando Luis"
+    family-names: "Conti"
+    alias: "casper06"
+    website: "https://github.com/casper06"
+version: "0.1.0"
+date-released: "2026-07-06"
+repository-code: "https://github.com/casper06/stellar-anomaly-explorer"
+license: MIT
