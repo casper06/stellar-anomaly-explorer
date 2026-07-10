@@ -14,64 +14,14 @@
  * relative axis for dip detection, so the mission-specific epoch doesn't
  * matter inside this code.
  *
- * FITS spec summary used here:
- * - File is a stream of 2880-byte blocks.
- * - Each HDU = header block(s) + data block(s).
- * - Header lines are 80 chars: `KEYWORD = value / comment`.
- * - Header ends with an `END` line; data starts at the next 2880-byte boundary.
- * - BINTABLE data size = NAXIS1 (row bytes) × NAXIS2 (rows), padded to 2880.
- * - TFORM`n` describes column type (`D` = float64, `E` = float32, `J` = int32,
- *   `I` = int16). We support all four since Kepler/TESS PDC files use them.
+ * The low-level primitives (block/header parsing, HDU walking, column
+ * layout, TFORM type table) live in `fitsCore.ts`, shared with the
+ * target-pixel-file reader (`tpfReader.ts`). This module keeps only the
+ * scalar-column extraction specific to light-curve files.
+ *
+ * DO NOT import this from client code (uses Node Buffer).
  */
-
-const BLOCK = 2880
-
-/**
- * @description Parses one FITS header into a {key → value} map.
- * @param buf Full file buffer.
- * @param offset Byte offset where this HDU's header starts.
- * @returns Header map and the offset of the first byte after the header.
- */
-function parseHeader(buf: Buffer, offset: number): { header: Record<string, string>; dataStart: number } {
-  const header: Record<string, string> = {}
-  let cursor = offset
-  while (true) {
-    const block = buf.slice(cursor, cursor + BLOCK).toString('ascii')
-    for (let i = 0; i < BLOCK; i += 80) {
-      const line = block.slice(i, i + 80)
-      const key = line.slice(0, 8).trim()
-      if (key === 'END') {
-        return { header, dataStart: cursor + BLOCK }
-      }
-      if (key === '' || line[8] !== '=') continue
-      const rest = line.slice(9).trim()
-      // Strip trailing comment after the value
-      let value: string
-      if (rest.startsWith("'")) {
-        const end = rest.indexOf("'", 1)
-        value = end > 0 ? rest.slice(1, end).trim() : rest.slice(1).trim()
-      } else {
-        const slash = rest.indexOf('/')
-        value = slash >= 0 ? rest.slice(0, slash).trim() : rest.trim()
-      }
-      header[key] = value
-    }
-    cursor += BLOCK
-    if (cursor >= buf.length) break
-  }
-  return { header, dataStart: cursor }
-}
-
-/**
- * @description Maps FITS BINTABLE TFORM type letters to {bytes-per-element,
- * reader}. Only the types Kepler PDC files actually use are supported.
- */
-const TYPE_INFO: Record<string, { size: number; read: (b: Buffer, o: number) => number }> = {
-  D: { size: 8, read: (b, o) => b.readDoubleBE(o) },
-  E: { size: 4, read: (b, o) => b.readFloatBE(o) },
-  J: { size: 4, read: (b, o) => b.readInt32BE(o) },
-  I: { size: 2, read: (b, o) => b.readInt16BE(o) },
-}
+import { enumerateHdus, bintableColumnLayout, FITS_TYPE_INFO } from './fitsCore'
 
 /**
  * @description Extracts two named columns from the first BINTABLE extension
@@ -88,66 +38,19 @@ export function readMastLightcurveColumns(
   colNames: [string, string],
 ): { col1: (number | null)[]; col2: (number | null)[] } {
   // Walk HDUs until we hit a BINTABLE extension.
-  let offset = 0
-  let header: Record<string, string> | null = null
-  let dataStart = 0
+  const bintable = enumerateHdus(buf).find(h => h.header['XTENSION'] === 'BINTABLE')
+  if (!bintable) throw new Error('No BINTABLE extension found in FITS file')
 
-  while (offset < buf.length) {
-    const parsed = parseHeader(buf, offset)
-    const xtension = parsed.header['XTENSION']
-    const isBintable = xtension === 'BINTABLE'
-
-    // Compute this HDU's data size to advance past it if we don't use it
-    const naxis = parseInt(parsed.header['NAXIS'] ?? '0', 10)
-    let dataBytes = 0
-    if (naxis > 0) {
-      const bitpix = Math.abs(parseInt(parsed.header['BITPIX'] ?? '0', 10))
-      let n = bitpix / 8
-      for (let i = 1; i <= naxis; i++) n *= parseInt(parsed.header[`NAXIS${i}`] ?? '0', 10)
-      const pcount = parseInt(parsed.header['PCOUNT'] ?? '0', 10)
-      const gcount = parseInt(parsed.header['GCOUNT'] ?? '1', 10)
-      dataBytes = (n + pcount) * gcount
-    }
-    const padded = Math.ceil(dataBytes / BLOCK) * BLOCK
-
-    if (isBintable) {
-      header = parsed.header
-      dataStart = parsed.dataStart
-      break
-    }
-    offset = parsed.dataStart + padded
-  }
-
-  if (!header) throw new Error('No BINTABLE extension found in FITS file')
-
-  const nRows = parseInt(header['NAXIS2'] ?? '0', 10)
-  const rowBytes = parseInt(header['NAXIS1'] ?? '0', 10)
-  const nFields = parseInt(header['TFIELDS'] ?? '0', 10)
-
-  // Compute each column's offset within a row + its element type
-  type ColMeta = { offsetInRow: number; repeat: number; type: string }
-  const cols: Record<string, ColMeta> = {}
-  let offsetInRow = 0
-  for (let i = 1; i <= nFields; i++) {
-    const name = header[`TTYPE${i}`] ?? ''
-    const form = header[`TFORM${i}`] ?? ''
-    // TFORM is like "1D", "1E", "768E" — leading digits = repeat count
-    const match = form.match(/^(\d*)([A-Z])/)
-    const repeat = match && match[1] ? parseInt(match[1], 10) : 1
-    const type = match ? match[2] : ''
-    const info = TYPE_INFO[type]
-    const size = info ? info.size * repeat : 0
-    cols[name] = { offsetInRow, repeat, type }
-    offsetInRow += size
-  }
+  const { header, dataStart } = bintable
+  const { cols, rowBytes, nRows } = bintableColumnLayout(header)
 
   const meta1 = cols[colNames[0]]
   const meta2 = cols[colNames[1]]
   if (!meta1 || !meta2) {
     throw new Error(`Columns not found: have ${Object.keys(cols).join(', ')}`)
   }
-  const reader1 = TYPE_INFO[meta1.type]
-  const reader2 = TYPE_INFO[meta2.type]
+  const reader1 = FITS_TYPE_INFO[meta1.type]
+  const reader2 = FITS_TYPE_INFO[meta2.type]
   if (!reader1 || !reader2) {
     throw new Error(`Unsupported TFORM types: ${meta1.type}, ${meta2.type}`)
   }

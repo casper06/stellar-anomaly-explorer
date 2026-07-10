@@ -34,6 +34,7 @@ src/
     api/
       stars/route.ts                 # Proxies VizieR Hipparcos catalog (avoids CORS)
       lightcurve/[id]/route.ts       # Fetches & parses Kepler PDC FITS from MAST
+      centroid/[id]/route.ts         # On-demand Kepler TPF difference-image centroid vetting
       koi/route.ts                   # Proxies NASA Exoplanet Archive KOI cumulative table
       toi/route.ts                   # Proxies NASA Exoplanet Archive TOI catalog (TESS)
       pattern-cache/route.ts         # GET/POST sky-radar precomputed pattern cache
@@ -48,7 +49,11 @@ src/
   lib/
     starCatalog.ts        # Catalog client (calls /api/stars; synthetic fallback)
     anomalyDetector.ts    # Dip detection + lightcurve client (calls /api/lightcurve)
-    fitsReader.ts         # Minimal FITS BINTABLE reader (server-side, no deps)
+    fitsCore.ts           # Shared low-level FITS primitives (header/HDU/column layout)
+    fitsReader.ts         # Scalar light-curve column reader (built on fitsCore)
+    tpfReader.ts          # Kepler Target Pixel File image-cube reader (built on fitsCore)
+    centroidVet.ts        # Difference-image centroid engine + gates (dependency-free)
+    centroidClient.ts     # Browser fetch wrapper for /api/centroid
     store.ts              # Global Zustand state
     quadrants.ts          # 6×6 Kepler-field grid (A1–F6); RA/Dec ↔ quadrant id
     persistence.ts        # localStorage Set helpers (visited / flagged)
@@ -58,9 +63,11 @@ src/
     selectStar.ts         # Shared "select + fly + fetch curve" flow used by clicks and search
     externalEndpoints.ts  # Single source of truth for all external URLs (routes + health check import it)
 scripts/
-    external-health.mjs   # npm run test:external-health — live probe of the 5 external services
+    external-health.mjs   # npm run test:external-health — live probe of the 6 external contracts
+    capture-centroid-fixtures.mjs # Refreeze the centroid ground-truth fixtures (live network)
 docs/
     KNOWLEDGE_BASE.md     # Permanent record of confirmed findings + design decisions
+    DESIGN_tpf-centroid-analysis.md # TPF Phase-0 audit (measured) + phase-1 design record
 ```
 
 ## UI language
@@ -165,6 +172,29 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   zone table can't draw boundary OUTLINES — the phase-2 minimap
   overlay needs the separate VI/49 polygon data (not bundled).
 
+- **Pixel-level centroid vetting** (2026-07-10, Kepler-only): opt-in
+  "RUN PIXEL-LEVEL VETTING" card in the fullscreen overlay (below the
+  classifier readout; shown only for real-data KIC targets with a
+  confident BLS signal). Downloads 6 evenly-spread TPF quarters
+  (`_lpd-targ.fits.gz`, ~15 MB) from MAST via `/api/centroid/[id]`,
+  stacks in-transit vs out-of-transit pixel stamps at the BLS
+  ephemeris, and reports the difference-image centroid offset
+  (vector-averaged across quarters, error from quarter scatter,
+  verdict gate = ≥3σ AND ≥2″ floor). Renders the mean out-of-transit
+  stamp (aperture outlined, × photocenter) beside the difference image
+  (○ signal centroid + offset line). Saturated targets (Kp < 11.5,
+  authoritative KEPMAG from the TPF header) are REFUSED with an
+  explanation — never measured (NASA's own table carries a bogus 6.6″
+  offset for mag-9.2 Kepler-3b). Calibrated against DR25 ground truth
+  (`koi_fpflag_co` / `koi_dicco_msky`): the K02606.01 centroid FP
+  measures 7.20″ ± 0.70″ vs NASA's 7.069″ ± 0.091″; four frozen
+  fixtures pin both verdict directions, the sub-pixel sensitivity
+  floor (K01075.01 must NOT fire), and the saturation refusal. TESS is
+  deliberately NOT implemented (derived-URL contract + no queryable
+  ground truth; the health check monitors the derivation anyway).
+  Strictly on-demand: never batch, never auto-run. See
+  docs/DESIGN_tpf-centroid-analysis.md for the measured Phase-0 basis.
+
 ### Known bugs / pending 🐛
 - (none currently tracked)
 
@@ -176,22 +206,17 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   outline overlay needs the VI/49 boundary POLYGONS (~200 KB, the
   zone table can't draw outlines) — separate bundling decision.
   Future idea — not being implemented now.
-- **Target Pixel File (TPF) centroid analysis** (opt-in, per-star,
-  on-demand ONLY): for a selected star, fetch its Kepler/TESS Target
-  Pixel File from MAST and compute the flux-weighted centroid of the
-  aperture over time. A transit on the TARGET star keeps the centroid
-  fixed; an apparent "transit" that actually comes from a background
-  eclipsing binary blended into the aperture pulls the centroid toward
-  the contaminating source during the dip. Surfacing an in-transit vs
-  out-of-transit centroid shift is the standard first-order false-
-  positive vetting test citizen scientists and the Kepler/TESS teams
-  use. Must stay OPT-IN and on-demand: TPFs are large (per-cadence
-  postage-stamp images, MB–tens of MB per quarter/sector) and computing
-  centroids is far heavier than the light-curve path, so it can't run
-  in the batch or on every selection — only when a user explicitly asks
-  for it on one star. Descriptive framing per the classifier rule (show
-  the measured centroid shift; don't assert "this is a false positive").
-  Future idea — not being implemented now.
+- **TPF centroid vetting phase 2 — TESS + refinements**: phase 1
+  (Kepler-only) shipped 2026-07-10 (see "What works"). Deferred parts,
+  in rough priority order: (a) TESS `_tp.fits` support — blocked on
+  the derived-URL contract (monitored by health check 6) and on
+  finding TESS ground truth to calibrate against (no queryable
+  per-TOI equivalent of `koi_dicco_msky`; TESS 21″/px also makes the
+  arcsec floor ~10× worse); (b) physical-CCD/WCS-frame vector
+  averaging (currently stamp-frame — empirically fine at the 2″
+  floor, the known refinement if the floor ever needs to drop);
+  (c) per-transit bootstrap errors as a cross-check on the
+  quarter-scatter error bar. Future ideas — not being implemented now.
 
 ## Real-data integration
 
@@ -255,13 +280,18 @@ lightcurve route's `mastTapQueryUrl` / `mastConeSearchUrl` /
 their TAP/VizieR URLs from here.
 
 ### External-dependency health check (`npm run test:external-health`)
-Live-network probe of the 5 external services, using the exact
+Live-network probe of the 6 external contracts, using the exact
 `externalEndpoints.ts` constants. NOT part of `npm test` (which stays
 offline/fast). Each check verifies the CONTRACT, not just reachability:
 Hipparcos required columns present; KOI schema; TOI `tid` column
 present (the historical `tic_id` mistake); MAST TAP returns
 `access_url` rows; a MAST segment actually downloads as valid FITS
-(`SIMPLE  =` magic). Exit 0 = all healthy, 1 = any failure. Designed
+(`SIMPLE  =` magic); and the **TESS TPF URL derivation** — an
+UNSHIPPED contract (`-s_lc.fits` → `-s_tp.fits` naming pattern, not a
+documented MAST interface) monitored from day one so a future TESS
+pixel-vetting implementation never builds on an unwatched assumption
+(ranged GET, first FITS block magic only — never the ~47 MB sector
+file). Exit 0 = all healthy, 1 = any failure. Designed
 to catch the class of silent contract change (VizieR column rename,
 endpoint move) that degraded the app to a fallback undetected. It
 distinguishes a VizieR upstream outage ("service degraded") from a
@@ -513,8 +543,41 @@ through to the route with matching query params. `StarField.selectStar`
 sets `onDemand: !/^(KIC|TIC|EPIC)\d+$/.test(id)` and always includes
 the star's RA/Dec so the cone-search path has what it needs.
 
-### `lib/fitsReader.ts`
-- Server-side only, no dependencies; ~150 lines hand-rolled FITS BINTABLE reader.
+### `/api/centroid/[id]` (pixel-level vetting, Kepler-only)
+- GET with required `period` / `epoch` (BKJD) / `duration` (hours)
+  query params — the confident BLS ephemeris. Only `KIC{N}` ids; 400
+  `unsupported` otherwise.
+- Discovery reuses the SAME obscore TAP query as `/api/lightcurve`
+  (Kepler TPF rows come back under `dataproduct_type='timeseries'`);
+  only the filename filter differs (`_lpd-targ.fits.gz`, never the
+  short-cadence `_spd-targ`). 6 quarters picked evenly across the
+  mission; bounded pool of 3.
+- **Saturation gate order matters**: the FIRST quarter is downloaded
+  alone and its header KEPMAG checked (authoritative — catalog
+  magnitudes for merged KOI entries are the 13.5 default); a
+  saturated target (Kp < 11.5) is refused before the other 5
+  downloads happen.
+- Disk cache `centroid-KIC*.json` (schema-versioned like the
+  lightcurve cache, 30-day TTL) ALSO keyed on the ephemeris: a cached
+  result is served only when period/epoch/duration match within
+  tolerance (rel 1e-3 / 0.1 d / 25%) — a BLS re-run that moves the
+  ephemeris means the stacks no longer describe the requested signal.
+- Engine: `lib/centroidVet.ts` (`runCentroidVet`), calibration + gate
+  constants documented in-module. Regression: 4 frozen fixtures in
+  `centroidRegression.test.ts` (runs in `npm run test:data`);
+  refreeze via `scripts/capture-centroid-fixtures.mjs` (live network)
+  + `--print` on the test to re-measure before updating EXPECTED.
+
+### `lib/fitsCore.ts` / `lib/fitsReader.ts` / `lib/tpfReader.ts`
+- `fitsCore.ts` holds the shared low-level primitives (2880-byte block +
+  header parsing, HDU walking with data-size arithmetic, BINTABLE
+  column layout incl. TDIM, the TFORM type table). Extracted from
+  `fitsReader.ts` when TPF support landed — the image-cube reader
+  needed ~65 of its ~150 lines verbatim. `fitsReader` keeps the
+  scalar two-column extraction; `tpfReader.readKeplerTpf` reads the
+  Kepler `_lpd-targ.fits.gz` pixel product (gunzip + TDIM-shaped FLUX
+  array column + APERTURE bitmask image + KEPMAG/QUARTER metadata).
+- Server-side only, no dependencies.
 - Supports the types Kepler AND TESS PDC files use (`D`, `E`, `J`, `I`).
   Both mission products share the same HDU layout, the same BINTABLE
   structure, and the same `TIME` / `PDCSAP_FLUX` column names —
@@ -1400,7 +1463,8 @@ BEFORE and AFTER touching the listed area:**
 
 | Touching | Run |
 |---|---|
-| `anomalyDetector` / `curveClassifier` / `fitsReader` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
+| `anomalyDetector` / `curveClassifier` / `fitsReader` / `fitsCore` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
+| `tpfReader` / `centroidVet` / `/api/centroid` | `npm run test:data` + `npm run test:unit` (centroid fixtures live in test:data) |
 | `selectStar` / `store` / `persistence` | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
 | `StarField` selection paths / CameraSync / disambiguation popover / HUD panels | `npm run test:e2e` |
 | anything else | `npx tsc --noEmit` + verify in the browser, as always |

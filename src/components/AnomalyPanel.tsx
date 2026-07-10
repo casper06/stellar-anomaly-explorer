@@ -1,8 +1,10 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore, type Anomaly, type LightcurveProvenance } from '@/lib/store'
 import type { CurveProfile, CurvePattern, DipShape } from '@/lib/curveClassifier'
-import { BLS_SDE_THRESHOLD } from '@/lib/bls'
+import { BLS_SDE_THRESHOLD, type BlsResult } from '@/lib/bls'
+import type { CentroidStamp, CentroidVetResult } from '@/lib/centroidVet'
+import { fetchCentroidVet, type CentroidVetPayload, type CentroidVetFailure } from '@/lib/centroidClient'
 import { constellationAt, describeVisibilityStory } from '@/lib/constellations'
 import LightCurve from './LightCurve'
 
@@ -369,6 +371,7 @@ function zooniverseLinkFor(starId: string): string {
  * @returns A fixed-position fullscreen overlay.
  */
 function LightCurveFullscreen({
+  starId,
   starName,
   source,
   times,
@@ -383,6 +386,7 @@ function LightCurveFullscreen({
   mission,
   onClose,
 }: {
+  starId: string
   starName: string
   source: 'real' | 'unavailable' | 'synthetic'
   times: number[]
@@ -457,13 +461,39 @@ function LightCurveFullscreen({
           position: 'relative',
         }}
       >
-        {/* Classifier readout — floats top-left over the chart corner.
-            Rendered AFTER the chart panel in source order so the
-            absolute positioning keeps it on top without z-index
-            gymnastics. Contains only measured features; no causal
-            interpretation. */}
+        {/* Classifier readout — floats top-left over the chart corner as a
+            column: the readout card, then (when eligible) the opt-in
+            pixel-level vetting panel below it. The column ignores pointer
+            events so chart interactions pass through; the vetting panel
+            re-enables them on itself (it has a button). Contains only
+            measured features; no causal interpretation. */}
         {profile && (
-          <ClassifierReadout profile={profile} partial={partial} segments={segments} mission={mission} />
+          <div
+            style={{
+              position: 'absolute',
+              top: 72,
+              left: 16,
+              zIndex: 5,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
+              pointerEvents: 'none',
+            }}
+          >
+            <ClassifierReadout profile={profile} partial={partial} segments={segments} mission={mission} />
+            {/* Pixel-level vetting is Kepler-only (KIC targets with real
+                data) and needs a confident BLS ephemeris to define the
+                in/out-of-transit windows — same gate as the odd/even and
+                phase-0.5 lines. keyed by star so state never leaks across
+                selections. */}
+            {source === 'real' &&
+              mission === 'Kepler' &&
+              /^KIC\d+$/.test(starId) &&
+              profile.bls &&
+              profile.bls.sde >= BLS_SDE_THRESHOLD && (
+                <PixelVettingPanel key={starId} starId={starId} bls={profile.bls} />
+              )}
+          </div>
         )}
         {/* Top bar — fixed-height header */}
         <div
@@ -649,13 +679,12 @@ function ClassifierReadout({
 }) {
   const copy = PATTERN_COPY[profile.pattern]
   const unit = mission === 'TESS' ? 'sectors' : 'quarters'
+  // Positioning lives on the wrapper column in LightCurveFullscreen (the
+  // readout stacks above the opt-in pixel-vetting panel); this card only
+  // styles itself.
   return (
     <div
       style={{
-        position: 'absolute',
-        top: 72,
-        left: 16,
-        zIndex: 5,
         background: 'rgba(0,0,0,0.78)',
         border: `1px solid ${copy.color}55`,
         borderRadius: 6,
@@ -815,6 +844,310 @@ function ReadoutRow({ label, value }: { label: string; value: string }) {
     >
       <span style={{ color: 'rgba(255,255,255,0.5)' }}>{label}</span>
       <span style={{ color: 'white', fontFamily: 'inherit' }}>{value}</span>
+    </div>
+  )
+}
+
+/**
+ * @description Narration steps for the pixel-vetting fetch (time-driven —
+ * the route has no SSE; mirrors what it actually does: TAP discovery,
+ * bounded TPF downloads, stacking, centroid). Cold path runs ~10–30 s.
+ */
+const VETTING_STEPS = [
+  'Querying MAST for Target Pixel Files…',
+  'Downloading pixel stamps (~15 MB across 6 quarters)…',
+  'Stacking in-transit vs out-of-transit images…',
+  'Measuring difference-image centroid…',
+]
+const VETTING_STEP_MS = 4000
+
+/**
+ * @description Renders one nx×ny pixel stamp on a canvas: a log-stretched
+ * grayscale for the mean out-of-transit image, or a red-scaled positive
+ * map for the difference image. Overlays: the optimal-aperture outline
+ * (out image only), an × at the star's photocenter, and — on the
+ * difference image — a ○ at the difference centroid plus a connecting
+ * line so the measured offset is visible as geometry, not just a number.
+ * Displayed with y flipped (stamp row 0 at the bottom) to match sky/CCD
+ * orientation conventions.
+ * @param stamp Stamp payload from the vetting result (JSON round-trip
+ * turns non-finite pixels into null).
+ * @param kind Which image to draw ('out' | 'diff').
+ * @param title Small caption under the canvas.
+ * @returns Canvas + caption column.
+ */
+function StampCanvas({
+  stamp,
+  kind,
+  title,
+}: {
+  stamp: CentroidStamp
+  kind: 'out' | 'diff'
+  title: string
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const cell = 18
+  const w = stamp.nx * cell
+  const h = stamp.ny * cell
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    const img = kind === 'out' ? stamp.meanOut : stamp.diff
+    // JSON serialization maps NaN → null; normalize to finite-or-null.
+    const finite = img.map(v => (v !== null && Number.isFinite(v) ? v : null))
+    const positives = finite.filter((v): v is number => v !== null && v > 0)
+    const maxV = positives.length > 0 ? Math.max(...positives) : 1
+
+    ctx.fillStyle = '#000'
+    ctx.fillRect(0, 0, w, h)
+    for (let p = 0; p < finite.length; p++) {
+      const x = p % stamp.nx
+      const y = Math.floor(p / stamp.nx)
+      const cx = x * cell
+      const cy = (stamp.ny - 1 - y) * cell // flip: stamp row 0 at bottom
+      const v = finite[p]
+      if (v === null) {
+        ctx.fillStyle = 'rgba(255,255,255,0.06)' // uncollected pixel
+      } else if (v <= 0) {
+        ctx.fillStyle = 'rgba(255,255,255,0.03)'
+      } else {
+        const t = Math.log1p(v) / Math.log1p(maxV) // log stretch
+        ctx.fillStyle =
+          kind === 'out'
+            ? `rgba(${Math.round(120 + 135 * t)}, ${Math.round(130 + 125 * t)}, ${Math.round(150 + 105 * t)}, ${0.15 + 0.85 * t})`
+            : `rgba(${Math.round(180 + 75 * t)}, ${Math.round(60 + 60 * t)}, ${Math.round(60 + 30 * t)}, ${0.15 + 0.85 * t})`
+      }
+      ctx.fillRect(cx, cy, cell - 1, cell - 1)
+    }
+
+    // Optimal-aperture outline (out image only) — the photometer's pixels.
+    if (kind === 'out' && stamp.apertureMask) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.7)'
+      ctx.lineWidth = 1
+      for (let p = 0; p < stamp.apertureMask.length; p++) {
+        if (!(stamp.apertureMask[p] & 2)) continue
+        const x = p % stamp.nx
+        const y = Math.floor(p / stamp.nx)
+        ctx.strokeRect(x * cell + 0.5, (stamp.ny - 1 - y) * cell + 0.5, cell - 2, cell - 2)
+      }
+    }
+
+    /**
+     * Converts stamp pixel coordinates (pixel centers) to canvas position
+     * under the vertical flip used above.
+     */
+    const toCanvas = ([px, py]: [number, number]): [number, number] => [
+      (px + 0.5) * cell,
+      (stamp.ny - 1 - py + 0.5) * cell,
+    ]
+    const [phx, phy] = toCanvas(stamp.photocenter)
+
+    if (kind === 'diff') {
+      const [dx, dy] = toCanvas(stamp.diffCentroid)
+      // Offset line photocenter → difference centroid.
+      ctx.strokeStyle = 'rgba(76,201,240,0.9)'
+      ctx.lineWidth = 1.5
+      ctx.beginPath()
+      ctx.moveTo(phx, phy)
+      ctx.lineTo(dx, dy)
+      ctx.stroke()
+      // ○ = where the transit signal comes from.
+      ctx.beginPath()
+      ctx.arc(dx, dy, 5, 0, Math.PI * 2)
+      ctx.stroke()
+    }
+
+    // × = the star's photocenter (both stamps).
+    ctx.strokeStyle = 'rgba(255,255,255,0.95)'
+    ctx.lineWidth = 1.5
+    ctx.beginPath()
+    ctx.moveTo(phx - 4, phy - 4)
+    ctx.lineTo(phx + 4, phy + 4)
+    ctx.moveTo(phx + 4, phy - 4)
+    ctx.lineTo(phx - 4, phy + 4)
+    ctx.stroke()
+  }, [stamp, kind, w, h, cell])
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center' }}>
+      <canvas ref={canvasRef} width={w} height={h} style={{ borderRadius: 3 }} />
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.45)', letterSpacing: 1, textAlign: 'center' }}>
+        {title}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * @description Opt-in pixel-level vetting panel shown below the classifier
+ * readout in the fullscreen overlay (Kepler targets with a confident BLS
+ * signal only). Nothing is fetched until the user clicks the button —
+ * TPF quarters are ~15 MB per run, so this is strictly on-demand, never
+ * automatic (and never part of the batch).
+ *
+ * Result copy follows the describe-don't-diagnose rule: the panel reports
+ * the measured offset, its significance, and the documented sensitivity
+ * floor; it never asserts "blend"/"false positive"/"planet". The
+ * saturation refusal is likewise phrased as a property of the data.
+ * @param starId Selected star's catalog id (KIC…).
+ * @param bls Confident BLS detection supplying the ephemeris.
+ * @returns Bordered card with the button / progress / measurement.
+ */
+function PixelVettingPanel({ starId, bls }: { starId: string; bls: BlsResult }) {
+  const [state, setState] = useState<'idle' | 'loading' | 'done'>('idle')
+  const [payload, setPayload] = useState<CentroidVetPayload | CentroidVetFailure | null>(null)
+  const [stepIdx, setStepIdx] = useState(0)
+
+  useEffect(() => {
+    if (state !== 'loading') return
+    const id = setInterval(() => {
+      setStepIdx(i => Math.min(i + 1, VETTING_STEPS.length - 1))
+    }, VETTING_STEP_MS)
+    return () => clearInterval(id)
+  }, [state])
+
+  /** Kicks off the on-demand measurement (single flight per mount). */
+  const run = async () => {
+    setState('loading')
+    setStepIdx(0)
+    const res = await fetchCentroidVet(starId, bls)
+    setPayload(res)
+    setState('done')
+  }
+
+  const result: CentroidVetResult | null =
+    payload && payload.status === 'ok' ? payload.result : null
+
+  return (
+    <div
+      style={{
+        background: 'rgba(0,0,0,0.78)',
+        border: '1px solid rgba(76,201,240,0.35)',
+        borderRadius: 6,
+        padding: '10px 14px',
+        maxWidth: 320,
+        pointerEvents: 'auto',
+        backdropFilter: 'blur(4px)',
+      }}
+    >
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginBottom: 6 }}>
+        PIXEL-LEVEL VETTING · KEPLER TPF
+      </div>
+
+      {state === 'idle' && (
+        <>
+          <button
+            onClick={run}
+            style={{
+              width: '100%',
+              background: 'rgba(76,201,240,0.12)',
+              border: '1px solid rgba(76,201,240,0.5)',
+              borderRadius: 4,
+              padding: '7px 10px',
+              color: '#4cc9f0',
+              fontSize: 10,
+              letterSpacing: 1.5,
+              cursor: 'pointer',
+              fontFamily: 'inherit',
+            }}
+          >
+            RUN PIXEL-LEVEL VETTING
+          </button>
+          <div style={{ marginTop: 6, fontSize: 8.5, color: 'rgba(255,255,255,0.45)', lineHeight: 1.5 }}>
+            On-demand only: downloads ~15 MB of this star&apos;s Kepler pixel data
+            (6 quarters) from NASA/MAST and measures where the periodic dimming
+            signal originates on the detector. Takes ~10–30 s.
+          </div>
+        </>
+      )}
+
+      {state === 'loading' && (
+        <div style={{ fontSize: 9.5, color: '#4cc9f0', lineHeight: 1.6 }}>
+          {VETTING_STEPS[stepIdx]}
+          <div
+            style={{
+              marginTop: 6,
+              height: 2,
+              background: 'rgba(76,201,240,0.15)',
+              borderRadius: 1,
+              overflow: 'hidden',
+            }}
+          >
+            <div
+              style={{
+                height: '100%',
+                width: '40%',
+                background: '#4cc9f0',
+                animation: 'vetting-sweep 1.2s ease-in-out infinite alternate',
+              }}
+            />
+          </div>
+          <style jsx>{`
+            @keyframes vetting-sweep {
+              from { margin-left: 0; }
+              to   { margin-left: 60%; }
+            }
+          `}</style>
+        </div>
+      )}
+
+      {state === 'done' && payload && payload.status !== 'ok' && (
+        <div style={{ fontSize: 9.5, color: '#f4a261', lineHeight: 1.5 }}>{payload.message}</div>
+      )}
+
+      {state === 'done' && result && result.status === 'saturated' && (
+        <div style={{ fontSize: 9.5, color: '#f4a261', lineHeight: 1.5 }}>
+          Target too bright for a reliable centroid (Kp{' '}
+          {result.kepmag !== null ? result.kepmag.toFixed(1) : '?'} — saturated pixels bleed
+          along CCD columns). Measurement refused rather than reporting a
+          meaningless offset.
+        </div>
+      )}
+
+      {state === 'done' && result && result.status === 'insufficient' && (
+        <div style={{ fontSize: 9.5, color: 'rgba(255,255,255,0.6)', lineHeight: 1.5 }}>
+          Not enough usable in/out-of-transit pixel data at this ephemeris
+          ({result.quartersUsed} usable quarters; 3 needed for an error bar).
+        </div>
+      )}
+
+      {state === 'done' && result && result.status === 'measured' && (
+        <div>
+          {result.stamp && (
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'center', marginBottom: 8 }}>
+              <StampCanvas
+                stamp={result.stamp}
+                kind="out"
+                title="MEAN OUT-OF-TRANSIT (aperture outlined, × photocenter)"
+              />
+              <StampCanvas
+                stamp={result.stamp}
+                kind="diff"
+                title="DIFFERENCE IMAGE (○ transit-signal centroid)"
+              />
+            </div>
+          )}
+          <div
+            style={{
+              fontSize: 9.5,
+              lineHeight: 1.6,
+              color: result.verdict === 'OFFSET_DETECTED' ? '#f4a261' : 'rgba(255,255,255,0.7)',
+            }}
+          >
+            {result.verdict === 'OFFSET_DETECTED'
+              ? `Transit-signal centroid offset: ${result.offsetArcsec!.toFixed(2)}″ ± ${result.offsetErrArcsec!.toFixed(2)}″ (${result.sigma!.toFixed(1)}σ) from the star's photocenter — the dimming originates away from the target's position.`
+              : `No significant centroid offset: ${result.offsetArcsec!.toFixed(2)}″ ± ${result.offsetErrArcsec!.toFixed(2)}″ (${result.sigma!.toFixed(1)}σ; this check resolves offsets ≳ ${result.floorArcsec}″).`}
+          </div>
+          <div style={{ marginTop: 5, fontSize: 8, color: 'rgba(255,255,255,0.35)', lineHeight: 1.5 }}>
+            {result.quartersUsed} quarters vector-averaged · stamp from{' '}
+            {result.stamp ? result.stamp.label.replace(/_lpd-targ\.fits\.gz$/, '') : '—'} · NASA/MAST
+            Kepler Target Pixel Files
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -1383,6 +1716,7 @@ export default function AnomalyPanel() {
     </div>
     {showLightcurve && lightcurve && lightcurve.flux.length > 0 && (
       <LightCurveFullscreen
+        starId={selectedStar.id}
         starName={selectedStar.name}
         source={lightcurve.source}
         times={lightcurve.times}
