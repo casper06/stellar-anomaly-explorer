@@ -3,9 +3,30 @@
 **Status:** Phase 1 IMPLEMENTED 2026-07-10, Kepler-only scope
 (`fitsCore.ts` extraction, `tpfReader.ts`, `centroidVet.ts`,
 `/api/centroid/[id]`, opt-in UI in the fullscreen overlay, 4 frozen
-regression fixtures, TESS-TPF-derivation health-check entry). TESS
-support explicitly deferred (derived-URL contract, no queryable ground
-truth). Sections below are the Phase-0 audit record that motivated the
+regression fixtures, TESS-TPF-derivation health-check entry).
+
+**Phase 2 IMPLEMENTED 2026-07-10 (same day):** the phase-1 ~1.8″
+systematic was investigated hypothesis-first. The frame-rotation
+hypothesis (stamp-frame vs sky-frame averaging) was REFUTED by
+measurement: every calibration star's six quarters share ONE WCS
+rotation angle (Kepler's focal-plane 4-fold symmetry), so a constant
+rotation can't change a vector-mean magnitude — K01317.01 reads
+1.812″ in both frames. The real cause was the REFERENCE point: the
+out-of-transit moment photocenter is biased by neighbor crowding and
+stamp truncation. Measuring the difference-image centroid against the
+FLUX column's WCS reference pixel — which the pipeline sets to the
+target's catalog position, i.e. NASA's `koi_dikco_msky` convention —
+collapses K01317.01 to 0.119″ ± 0.118 (NASA dikco 0.040″) and
+K00931.01 to 0.337″ ± 0.134 (dikco 0.095″), while the K02606.01 FP
+fires at 7.326″ ± 0.858 (dikco 6.889″ ± 0.091). The 2″ verdict floor
+STAYS: clean planet K01800.01 measures 1.163″ ± 0.369 (dikco 0.443″),
+so a 1″ floor would false-alarm on a real planet. TESS support also
+shipped in phase 2 (same math — TESS TPFs carry identical WCS
+keywords; URLs derived per health-check 6; half-pixel floor ~10″;
+labeled QUALITATIVE/UNVALIDATED in the UI — no public TESS ground
+truth exists; WASP-126 b frozen as a drift-pin fixture).
+
+Sections below are the Phase-0 audit record that motivated the
 design; measured numbers were reproduced by the shipped engine.
 This is the Phase-0 audit for the "Target Pixel File (TPF) centroid
 analysis" future feature listed in CLAUDE.md. Everything below marked

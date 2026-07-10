@@ -1,26 +1,30 @@
 /**
- * @description Reader for Kepler Target Pixel Files (`_lpd-targ.fits.gz`,
- * the long-cadence per-quarter pixel product). Built on the shared FITS
- * primitives in `fitsCore.ts`. Extracts the per-cadence image cube plus
- * the metadata the centroid engine and the saturation gate need.
+ * @description Reader for Kepler and TESS Target Pixel Files (Kepler
+ * `_lpd-targ.fits.gz` long-cadence quarters; TESS `-s_tp.fits` 2-min
+ * sectors). Built on the shared FITS primitives in `fitsCore.ts`.
+ * Extracts the per-cadence image cube plus the metadata the centroid
+ * engine and the saturation gate need — including the FLUX column's
+ * per-segment WCS, which the engine uses to measure offsets against the
+ * target's catalog position in true sky arcseconds.
  *
  * Real file structure (verified against live MAST downloads, 2026-07-10;
- * see docs/DESIGN_tpf-centroid-analysis.md §1.3):
- * - HDU 0 PRIMARY: identity keywords — KEPLERID, QUARTER, KEPMAG (the
- *   saturation-gate input), MODULE/OUTPUT, RA_OBJ/DEC_OBJ. No data.
- * - HDU 1 BINTABLE `TARGETTABLES`: one row per cadence. Columns used:
- *   `TIME` (1D, BKJD), `QUALITY` (1J), `FLUX` (nE with TDIM=(nx,ny) —
- *   calibrated, background-subtracted e-/s image stamp, row-major with
- *   the first TDIM axis varying fastest).
+ * see docs/DESIGN_tpf-centroid-analysis.md §1.3 — the two missions'
+ * products are near-identical):
+ * - HDU 0 PRIMARY: identity keywords — KEPLERID/TICID, QUARTER/SECTOR,
+ *   KEPMAG/TESSMAG (the saturation-gate input), RA_OBJ/DEC_OBJ. No data.
+ * - HDU 1 BINTABLE `TARGETTABLES` (Kepler) / `PIXELS` (TESS): one row per
+ *   cadence. Columns used: `TIME` (1D, BKJD/TJD), `QUALITY` (1J), `FLUX`
+ *   (nE with TDIM=(nx,ny) — calibrated, background-subtracted e-/s image
+ *   stamp, row-major with the first TDIM axis varying fastest). The FLUX
+ *   column carries a full per-segment WCS in the header (`1CTYPn` =
+ *   RA---TAN, `1CRPXn`/`2CRPXn` reference pixel — which IS the target's
+ *   catalog position per the pipeline astrometry (`1CRVLn`/`2CRVLn` equal
+ *   RA_OBJ/DEC_OBJ), `1CDLTn`/`2CDLTn` pixel scale in deg, and the
+ *   `11PCn`…`22PCn` rotation matrix).
  * - HDU 2 IMAGE `APERTURE`: int32 bitmask image, same stamp shape.
  *   Bit 1 (value 1) = pixel was collected; bit 2 (value 2) = pixel is in
  *   the optimal photometric aperture.
- *
- * Kepler-only by design: TESS `_tp.fits` support is explicitly deferred
- * (its TPF discovery URL is a derived naming pattern, not a documented
- * MAST contract, and TESS has no queryable per-TOI centroid ground truth
- * to calibrate against). The structure is near-identical, so the TESS
- * reader would be a thin variant when/if that decision changes.
+ * - HDU 3 (TESS only): `TARGET COSMIC RAY` table — ignored.
  *
  * Server-side only (Node Buffer + zlib). DO NOT import from client code.
  */
@@ -28,21 +32,53 @@ import { gunzipSync } from 'node:zlib'
 import { enumerateHdus, bintableColumnLayout, FITS_TYPE_INFO } from './fitsCore'
 
 /**
- * @description Parsed contents of one Kepler TPF quarter — everything the
- * centroid engine consumes, in engine-ready layout.
+ * @description Linear WCS of the FLUX column for one TPF segment: enough
+ * to convert a pixel-space offset from the reference pixel into a
+ * tangent-plane sky offset (ΔRA·cosδ, ΔDec). The TAN projection's
+ * curvature is negligible at the sub-pixel offsets the engine measures.
+ */
+export interface TpfWcs {
+  /** Reference pixel along stamp x, 1-based (FITS convention). Equals the target's catalog position. */
+  crpx1: number
+  /** Reference pixel along stamp y, 1-based. */
+  crpx2: number
+  /** RA at the reference pixel (deg). */
+  crval1: number
+  /** Dec at the reference pixel (deg). */
+  crval2: number
+  /** Pixel scale along axis 1 (deg/px; negative — RA grows east). */
+  cdelt1: number
+  /** Pixel scale along axis 2 (deg/px). */
+  cdelt2: number
+  /** Rotation matrix elements (PC convention). */
+  pc11: number
+  pc12: number
+  pc21: number
+  pc22: number
+}
+
+/**
+ * @description Parsed contents of one TPF segment (Kepler quarter or TESS
+ * sector) — everything the centroid engine consumes, in engine-ready
+ * layout.
  */
 export interface TpfQuarter {
-  /** Kepler magnitude (Kp) from the primary header; null when absent. */
-  kepmag: number | null
-  /** KIC id from the primary header; null when absent. */
-  keplerId: number | null
-  /** Mission quarter number from the primary header; null when absent. */
-  quarter: number | null
+  /** Which mission produced the file (from TELESCOP); null when absent. */
+  mission: 'Kepler' | 'TESS' | null
+  /**
+   * Target brightness from the primary header — KEPMAG (Kp) for Kepler,
+   * TESSMAG (Tmag) for TESS. Drives the saturation gate. Null when absent.
+   */
+  mag: number | null
+  /** KIC/TIC id from the primary header; null when absent. */
+  targetId: number | null
+  /** Mission segment number (QUARTER or SECTOR); null when absent. */
+  segment: number | null
   /** Stamp width in pixels (first TDIM axis, varies fastest in the cube). */
   nx: number
   /** Stamp height in pixels (second TDIM axis). */
   ny: number
-  /** Per-cadence timestamps (BKJD). NaN preserved for gap cadences. */
+  /** Per-cadence timestamps (BKJD/TJD). NaN preserved for gap cadences. */
   times: number[]
   /** Per-cadence pipeline quality flags (0 = clean). */
   quality: number[]
@@ -52,10 +88,8 @@ export interface TpfQuarter {
    * for uncollected / missing pixels.
    */
   flux: Float32Array
-  /** Physical CCD column of the stamp corner (1CRV5P); null when absent. */
-  refCol: number | null
-  /** Physical CCD row of the stamp corner (2CRV5P); null when absent. */
-  refRow: number | null
+  /** FLUX-column WCS for this segment; null when the keywords are absent. */
+  wcs: TpfWcs | null
   /**
    * Aperture bitmask image (`nx*ny`, same pixel order as `flux`); bit 2
    * marks the optimal photometric aperture. Null when the APERTURE HDU
@@ -64,7 +98,7 @@ export interface TpfQuarter {
   apertureMask: Int32Array | null
 }
 
-/** @description Gzip magic bytes — Kepler TPFs are served `.gz`. */
+/** @description Gzip magic bytes — Kepler TPFs are served `.gz`; TESS raw. */
 const GZIP_MAGIC_0 = 0x1f
 const GZIP_MAGIC_1 = 0x8b
 
@@ -82,17 +116,41 @@ function headerNumber(header: Record<string, string>, key: string): number | nul
 }
 
 /**
- * @description Reads a Kepler long-cadence Target Pixel File into the
- * engine-ready `TpfQuarter` shape. Accepts gzipped or raw FITS bytes
- * (MAST serves `_lpd-targ.fits.gz`; the fixture-capture path may hand in
- * already-unpacked buffers).
+ * @description Extracts the FLUX column's per-segment WCS from the pixel
+ * BINTABLE header. Returns null when any required keyword is missing —
+ * the engine then falls back to its fixed-pixel-scale photocenter path.
+ * @param header Pixel-table extension header.
+ * @param colNum 1-based FITS column number of FLUX (keywords are per-column).
+ * @returns The linear WCS, or null.
+ */
+function readFluxWcs(header: Record<string, string>, colNum: number): TpfWcs | null {
+  const n = colNum
+  const wcs = {
+    crpx1: headerNumber(header, `1CRPX${n}`),
+    crpx2: headerNumber(header, `2CRPX${n}`),
+    crval1: headerNumber(header, `1CRVL${n}`),
+    crval2: headerNumber(header, `2CRVL${n}`),
+    cdelt1: headerNumber(header, `1CDLT${n}`),
+    cdelt2: headerNumber(header, `2CDLT${n}`),
+    pc11: headerNumber(header, `11PC${n}`),
+    pc12: headerNumber(header, `12PC${n}`),
+    pc21: headerNumber(header, `21PC${n}`),
+    pc22: headerNumber(header, `22PC${n}`),
+  }
+  for (const v of Object.values(wcs)) if (v === null) return null
+  return wcs as TpfWcs
+}
+
+/**
+ * @description Reads a Kepler or TESS Target Pixel File into the
+ * engine-ready `TpfQuarter` shape. Accepts gzipped or raw FITS bytes.
  * @param raw File contents (gzipped or plain FITS).
- * @returns Parsed quarter.
+ * @returns Parsed segment.
  * @throws Error when no BINTABLE exists, a required column (TIME / FLUX /
  * QUALITY) is missing or has an unsupported type, or FLUX carries no
  * parseable TDIM shape.
  */
-export function readKeplerTpf(raw: Buffer): TpfQuarter {
+export function readTpf(raw: Buffer): TpfQuarter {
   const buf =
     raw.length >= 2 && raw[0] === GZIP_MAGIC_0 && raw[1] === GZIP_MAGIC_1 ? gunzipSync(raw) : raw
 
@@ -131,6 +189,9 @@ export function readKeplerTpf(raw: Buffer): TpfQuarter {
     throw new Error(`FLUX TDIM (${nx}×${ny}) disagrees with repeat count ${fluxMeta.repeat}`)
   }
 
+  // FLUX's 1-based column number (per-column WCS keywords are indexed by it).
+  const fluxColNum = Object.keys(cols).indexOf('FLUX') + 1
+
   const dataStart = bintable.dataStart
   const times = new Array<number>(nRows)
   const quality = new Array<number>(nRows)
@@ -160,17 +221,19 @@ export function readKeplerTpf(raw: Buffer): TpfQuarter {
     }
   }
 
+  const telescop = primary['TELESCOP'] ?? ''
+  const mission = telescop === 'Kepler' ? 'Kepler' : telescop === 'TESS' ? 'TESS' : null
   return {
-    kepmag: headerNumber(primary, 'KEPMAG'),
-    keplerId: headerNumber(primary, 'KEPLERID'),
-    quarter: headerNumber(primary, 'QUARTER'),
+    mission,
+    mag: headerNumber(primary, 'KEPMAG') ?? headerNumber(primary, 'TESSMAG'),
+    targetId: headerNumber(primary, 'KEPLERID') ?? headerNumber(primary, 'TICID'),
+    segment: headerNumber(primary, 'QUARTER') ?? headerNumber(primary, 'SECTOR'),
     nx,
     ny,
     times,
     quality,
     flux,
-    refCol: headerNumber(bintable.header, '1CRV5P'),
-    refRow: headerNumber(bintable.header, '2CRV5P'),
+    wcs: readFluxWcs(bintable.header, fluxColNum),
     apertureMask,
   }
 }

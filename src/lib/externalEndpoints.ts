@@ -17,9 +17,11 @@
  *   3. NASA Exoplanet Archive TOI (TESS)         → `TOI_TAP_URL`
  *   4. MAST VO-TAP obscore (segment discovery)   → `mastTapQueryUrl()`
  *   5. MAST archive FITS download (segment data) → resolved from a TAP row
- *   6. TESS TPF URL derivation (unshipped)       → `deriveTessTpfUrl()`
- *      — monitored ahead of any TESS pixel-vetting implementation, so a
- *      naming-convention change surfaces before we ever build on it.
+ *   6. TESS TPF URL derivation                   → `deriveTessTpfUrl()`
+ *      — used by /api/centroid's TESS path (obscore doesn't list TESS
+ *      `_tp.fits`; the URL is derived from the `-s_lc.fits` listing).
+ *      Monitored since BEFORE the TESS path shipped, per the
+ *      never-build-on-an-unwatched-assumption rule.
  */
 
 /**
@@ -190,11 +192,11 @@ export const TESS_TPF_HEALTH_PROBE_TARGET = '185336364'
  * deterministic: the TPF shares the light curve's full stem with suffix
  * `-s_tp.fits` instead of `-s_lc.fits`.
  *
- * ⚠ This is a DERIVED naming pattern, not a documented MAST contract —
- * which is exactly why TESS pixel vetting is NOT implemented yet (the
- * shipped feature is Kepler-only) and why the health check probes this
- * derivation anyway: if the convention ever changes, we find out from the
- * health report, not from a future implementation silently 404ing.
+ * ⚠ This is a DERIVED naming pattern, not a documented MAST contract.
+ * It is now load-bearing: /api/centroid's TESS path discovers TPFs
+ * through it (the health check watched it before the implementation
+ * landed, so a convention change surfaces in the health report, not as
+ * a silent 404 in production).
  * @param accessUrl TAP-provided `access_url` of a TESS `-s_lc.fits` row.
  * @returns Downloadable TPF URL via the MAST Download API, or null when
  * the input is not a TESS 2-min PDC light-curve URL.

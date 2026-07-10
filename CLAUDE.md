@@ -172,28 +172,38 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   zone table can't draw boundary OUTLINES — the phase-2 minimap
   overlay needs the separate VI/49 polygon data (not bundled).
 
-- **Pixel-level centroid vetting** (2026-07-10, Kepler-only): opt-in
-  "RUN PIXEL-LEVEL VETTING" card in the fullscreen overlay (below the
-  classifier readout; shown only for real-data KIC targets with a
-  confident BLS signal). Downloads 6 evenly-spread TPF quarters
-  (`_lpd-targ.fits.gz`, ~15 MB) from MAST via `/api/centroid/[id]`,
+- **Pixel-level centroid vetting** (phase 1 2026-07-10 Kepler-only;
+  phase 2 same day added the WCS reference + TESS): opt-in "RUN
+  PIXEL-LEVEL VETTING" card in the fullscreen overlay (below the
+  classifier readout; shown for real-data KIC/TIC targets with a
+  confident BLS signal, id matching the serving mission). Downloads
+  evenly-spread TPF segments from MAST via `/api/centroid/[id]`
+  (Kepler: 6 quarters ~15 MB; TESS: up to 4 sectors ~47 MB EACH),
   stacks in-transit vs out-of-transit pixel stamps at the BLS
   ephemeris, and reports the difference-image centroid offset
-  (vector-averaged across quarters, error from quarter scatter,
-  verdict gate = ≥3σ AND ≥2″ floor). Renders the mean out-of-transit
-  stamp (aperture outlined, × photocenter) beside the difference image
-  (○ signal centroid + offset line). Saturated targets (Kp < 11.5,
-  authoritative KEPMAG from the TPF header) are REFUSED with an
-  explanation — never measured (NASA's own table carries a bogus 6.6″
-  offset for mag-9.2 Kepler-3b). Calibrated against DR25 ground truth
-  (`koi_fpflag_co` / `koi_dicco_msky`): the K02606.01 centroid FP
-  measures 7.20″ ± 0.70″ vs NASA's 7.069″ ± 0.091″; four frozen
-  fixtures pin both verdict directions, the sub-pixel sensitivity
-  floor (K01075.01 must NOT fire), and the saturation refusal. TESS is
-  deliberately NOT implemented (derived-URL contract + no queryable
-  ground truth; the health check monitors the derivation anyway).
-  Strictly on-demand: never batch, never auto-run. See
-  docs/DESIGN_tpf-centroid-analysis.md for the measured Phase-0 basis.
+  **measured against the target's CATALOG POSITION through each
+  segment's FLUX-column WCS** (NASA's `koi_dikco_msky` convention) —
+  vector-averaged across segments, error from segment scatter,
+  verdict gate = ≥3σ AND a half-pixel floor (Kepler 2″; TESS ~10″).
+  Phase-2 finding (measured, hypothesis-driven): the phase-1 ~1.8″
+  systematic was NOT frame rotation (Kepler's focal-plane symmetry
+  keeps each star's stamp orientation constant across quarters —
+  stamp-frame and sky-frame vector means are identical); it was the
+  photocenter REFERENCE, biased by crowding/truncation. The WCS
+  reference pixel (= catalog position) kills it: K01317.01
+  1.81″→0.12″ (NASA dikco 0.04″), K00931.01 1.92″→0.34″ (0.095″),
+  while the K02606.01 FP fires at 7.33″ ± 0.86 (dikco 6.889″ ±
+  0.091). The 2″ floor STAYS: clean planet K01800.01 reads 1.16″ ±
+  0.37 (dikco 0.443″), so a 1″ floor would false-alarm. Saturated
+  targets (Kp < 11.5 / Tmag < 6.8, authoritative header magnitude)
+  are REFUSED. TESS results are labeled QUALITATIVE/UNVALIDATED in
+  the UI (no public per-TOI centroid ground truth; 21″ pixels). Five
+  frozen fixtures (4 Kepler vs dikco + WASP-126 b as a TESS drift
+  pin) pin verdicts, the floor, the refusal, and the TESS path.
+  Segment downloads retry (3 attempts — 47 MB TESS files drop
+  connections routinely); `insufficient` outcomes are never cached
+  (transient artifact, observed live). Strictly on-demand: never
+  batch, never auto-run. See docs/DESIGN_tpf-centroid-analysis.md.
 
 ### Known bugs / pending 🐛
 - (none currently tracked)
@@ -206,17 +216,15 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   outline overlay needs the VI/49 boundary POLYGONS (~200 KB, the
   zone table can't draw outlines) — separate bundling decision.
   Future idea — not being implemented now.
-- **TPF centroid vetting phase 2 — TESS + refinements**: phase 1
-  (Kepler-only) shipped 2026-07-10 (see "What works"). Deferred parts,
-  in rough priority order: (a) TESS `_tp.fits` support — blocked on
-  the derived-URL contract (monitored by health check 6) and on
-  finding TESS ground truth to calibrate against (no queryable
-  per-TOI equivalent of `koi_dicco_msky`; TESS 21″/px also makes the
-  arcsec floor ~10× worse); (b) physical-CCD/WCS-frame vector
-  averaging (currently stamp-frame — empirically fine at the 2″
-  floor, the known refinement if the floor ever needs to drop);
-  (c) per-transit bootstrap errors as a cross-check on the
-  quarter-scatter error bar. Future ideas — not being implemented now.
+- **TPF centroid vetting phase 3 — refinements**: phases 1–2 shipped
+  2026-07-10 (see "What works"; phase 2 = catalog-position/WCS
+  reference + TESS). Remaining ideas: (a) PRF-fitted difference-image
+  centroid (would approach NASA's 0.07″ dicco precision and could
+  lower the 2″ floor — the moment centroid + catalog reference is the
+  current accuracy limit); (b) per-transit bootstrap errors as a
+  cross-check on the segment-scatter error bar; (c) TESS validation
+  if a public per-TOI centroid table ever appears. Future ideas — not
+  being implemented now.
 
 ## Real-data integration
 
@@ -543,30 +551,37 @@ through to the route with matching query params. `StarField.selectStar`
 sets `onDemand: !/^(KIC|TIC|EPIC)\d+$/.test(id)` and always includes
 the star's RA/Dec so the cone-search path has what it needs.
 
-### `/api/centroid/[id]` (pixel-level vetting, Kepler-only)
-- GET with required `period` / `epoch` (BKJD) / `duration` (hours)
-  query params — the confident BLS ephemeris. Only `KIC{N}` ids; 400
-  `unsupported` otherwise.
-- Discovery reuses the SAME obscore TAP query as `/api/lightcurve`
-  (Kepler TPF rows come back under `dataproduct_type='timeseries'`);
-  only the filename filter differs (`_lpd-targ.fits.gz`, never the
-  short-cadence `_spd-targ`). 6 quarters picked evenly across the
-  mission; bounded pool of 3.
-- **Saturation gate order matters**: the FIRST quarter is downloaded
-  alone and its header KEPMAG checked (authoritative — catalog
-  magnitudes for merged KOI entries are the 13.5 default); a
-  saturated target (Kp < 11.5) is refused before the other 5
-  downloads happen.
-- Disk cache `centroid-KIC*.json` (schema-versioned like the
-  lightcurve cache, 30-day TTL) ALSO keyed on the ephemeris: a cached
-  result is served only when period/epoch/duration match within
-  tolerance (rel 1e-3 / 0.1 d / 25%) — a BLS re-run that moves the
-  ephemeris means the stacks no longer describe the requested signal.
-- Engine: `lib/centroidVet.ts` (`runCentroidVet`), calibration + gate
-  constants documented in-module. Regression: 4 frozen fixtures in
-  `centroidRegression.test.ts` (runs in `npm run test:data`);
-  refreeze via `scripts/capture-centroid-fixtures.mjs` (live network)
-  + `--print` on the test to re-measure before updating EXPECTED.
+### `/api/centroid/[id]` (pixel-level vetting, Kepler + TESS)
+- GET with required `period` / `epoch` (BKJD/TJD) / `duration` (hours)
+  query params — the confident BLS ephemeris. `KIC{N}` → Kepler,
+  `TIC{N}` → TESS; 400 `unsupported` otherwise.
+- Discovery reuses the SAME obscore TAP query as `/api/lightcurve`.
+  Kepler TPF rows are listed directly (filter `_lpd-targ.fits.gz`,
+  never short-cadence `_spd-targ`). TESS `_tp.fits` rows are NOT in
+  obscore — URLs are DERIVED from the `-s_lc.fits` listing via
+  `deriveTessTpfUrl` (the load-bearing naming contract watched by
+  health check 6). Kepler: 6 quarters; TESS: 4 sectors (~47 MB each).
+  Bounded pool of 3, 3 attempts per segment (big TESS files drop
+  connections routinely — observed live).
+- **Saturation gate order matters**: the FIRST segment is downloaded
+  alone and its header KEPMAG/TESSMAG checked (authoritative —
+  catalog magnitudes for merged KOI/TOI entries are defaults); a
+  saturated target (Kp < 11.5 / Tmag < 6.8) is refused before the
+  remaining downloads happen.
+- Disk cache `centroid-KIC*/TIC*.json` (schema v2 — v1 entries used
+  the biased photocenter reference; 30-day TTL) ALSO keyed on the
+  ephemeris: served only when period/epoch/duration match within
+  tolerance (rel 1e-3 / 0.1 d / 25%). `insufficient` results are
+  NEVER cached — they're usually transient download artifacts and
+  would otherwise stick for the TTL.
+- Engine: `lib/centroidVet.ts` (`runCentroidVet`) — offsets measured
+  against the target's catalog position through each segment's WCS
+  (`referenceFrame: 'catalog-wcs'`; photocenter fallback only when
+  WCS keywords are absent). Calibration + gate constants documented
+  in-module (ground truth = `koi_dikco_msky`). Regression: 5 frozen
+  fixtures in `centroidRegression.test.ts` (runs in `npm run
+  test:data`); refreeze via `scripts/capture-centroid-fixtures.mjs`
+  (live network) + `--print` on the test before updating EXPECTED.
 
 ### `lib/fitsCore.ts` / `lib/fitsReader.ts` / `lib/tpfReader.ts`
 - `fitsCore.ts` holds the shared low-level primitives (2880-byte block +

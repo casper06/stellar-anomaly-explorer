@@ -2,11 +2,11 @@ import { NextResponse } from 'next/server'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { mastTapQueryUrl, resolveSegmentDownloadUrl } from '@/lib/externalEndpoints'
-import { readKeplerTpf } from '@/lib/tpfReader'
+import { mastTapQueryUrl, resolveSegmentDownloadUrl, deriveTessTpfUrl } from '@/lib/externalEndpoints'
+import { readTpf } from '@/lib/tpfReader'
 import {
   runCentroidVet,
-  isSaturatedKepmag,
+  isSaturatedMag,
   type CentroidQuarterInput,
   type CentroidVetResult,
 } from '@/lib/centroidVet'
@@ -19,27 +19,40 @@ import {
  * difference-image centroid offset measurement (see `lib/centroidVet.ts`
  * for the method and its calibration).
  *
- * STRICTLY on-demand and Kepler-only:
+ * STRICTLY on-demand:
  * - Never called by the batch classifier or on ordinary selection — only
  *   from the explicit opt-in button in the fullscreen light-curve overlay.
- * - Only `KIC{N}` ids are accepted. TESS TPF support is deferred (its
- *   discovery URL is a derived naming pattern, not a documented MAST
- *   contract — see the external-health check's derivation probe).
+ * - `KIC{N}` ids → Kepler quarters (obscore-listed `_lpd-targ.fits.gz`).
+ * - `TIC{N}` ids → TESS sectors. MAST's obscore does NOT list TESS
+ *   `_tp.fits` products, so the URLs are DERIVED from the listed
+ *   `-s_lc.fits` rows via `deriveTessTpfUrl` — the naming-pattern
+ *   contract monitored by external-health check 6. TESS results are
+ *   UNVALIDATED (no public per-TOI centroid ground truth) and the UI
+ *   labels them qualitative.
  *
  * Query params (all required, from the confident BLS detection):
  * - `period`   — signal period in days.
- * - `epoch`    — mid-transit epoch in BKJD (the TPF TIME system).
+ * - `epoch`    — mid-transit epoch in BKJD/TJD (the TPF TIME system).
  * - `duration` — box duration in hours.
  *
- * Saturation refusal: the authoritative Kepler magnitude comes from the
- * FIRST downloaded quarter's primary header (KEPMAG), not from the
- * catalog (merged KOI entries carry a default magnitude, not the real
- * one). A saturated target is refused after that single download —
- * the remaining quarters are never fetched.
+ * Saturation refusal: the authoritative magnitude comes from the FIRST
+ * downloaded segment's primary header (KEPMAG / TESSMAG), not from the
+ * catalog (merged KOI/TOI entries carry defaults, not the real value).
+ * A saturated target is refused after that single download — the
+ * remaining segments are never fetched.
  */
 
-/** @description How many TPF quarters to fetch, spread evenly across the mission. */
+/** @description How many Kepler TPF quarters to fetch, spread evenly across the mission. */
 const TPF_QUARTERS_TO_FETCH = 6
+
+/**
+ * @description How many TESS sectors to fetch. Lower than Kepler's 6
+ * because a TESS 2-min sector TPF is ~47 MB (vs 1–7 MB per Kepler
+ * quarter): 4 sectors ≈ 190 MB keeps the on-demand download bounded
+ * while staying above the 3-segment error-bar minimum. Targets with
+ * fewer observed sectors just use what exists.
+ */
+const TESS_SECTORS_TO_FETCH = 4
 
 /**
  * @description Max simultaneous TPF downloads. Same rationale as the
@@ -57,8 +70,13 @@ const TPF_FETCH_TIMEOUT_MS = 120000
  * change to the fetch pipeline, the TPF parser, or the centroid engine
  * that can alter the result — same provenance lesson as the lightcurve
  * route's CACHE_SCHEMA_VERSION.
+ *
+ * v1 → v2 (phase 2): offsets are now measured against the target's
+ * CATALOG POSITION through each segment's WCS (was: moment photocenter
+ * at a fixed pixel scale — subject to a ~1–2″ crowding bias, see
+ * centroidVet.ts calibration notes). Every v1 entry is invalid.
  */
-const CENTROID_CACHE_SCHEMA_VERSION = 1
+const CENTROID_CACHE_SCHEMA_VERSION = 2
 
 /**
  * @description Disk-cache TTL. TPF pixel data is static; the entry only
@@ -79,12 +97,22 @@ const CACHE_DURATION_REL_TOL = 0.25
 /** @description Directory under OS temp where results are cached (shared cache root). */
 const DISK_CACHE_DIR = path.join(os.tmpdir(), 'stellar-cache')
 
-/** @description Provenance block returned with every successful measurement. */
-const CENTROID_PROVENANCE = {
-  sourceName: 'NASA/MAST Kepler Target Pixel Files',
-  mission: 'Kepler',
-  dataType: 'Per-quarter pixel stamps (difference-image centroid)',
-} as const
+/**
+ * @description Provenance block per mission, returned with every
+ * successful measurement.
+ * @param mission Which mission served the pixel data.
+ * @returns Provenance labels for the UI citation line.
+ */
+function centroidProvenance(mission: 'Kepler' | 'TESS') {
+  return {
+    sourceName: `NASA/MAST ${mission} Target Pixel Files`,
+    mission,
+    dataType:
+      mission === 'Kepler'
+        ? 'Per-quarter pixel stamps (difference-image centroid)'
+        : 'Per-sector pixel stamps (difference-image centroid, unvalidated)',
+  }
+}
 
 /** @description Ephemeris inputs the measurement ran against. */
 interface CentroidInputs {
@@ -185,17 +213,27 @@ interface TapResponse {
 }
 
 /**
- * @description Discovers the target's long-cadence TPF quarters via the
- * SAME obscore query the lightcurve route uses (Kepler TPF rows come back
- * from `dataproduct_type='timeseries'`; only the filename filter differs:
- * `_lpd-targ.fits.gz` instead of `_llc.fits`). Returns download URLs in
- * chronological order (the archive filename embeds the timestamp).
- * @param targetName Archive target name (`kplrNNNNNNNNN`).
+ * @description Discovers the target's TPF segments via the SAME obscore
+ * query the lightcurve route uses (`dataproduct_type='timeseries'`).
+ * - Kepler: TPF rows are listed directly — filter `_lpd-targ.fits.gz`
+ *   (never the `_spd-targ` short-cadence product, 10–30× bigger and
+ *   useless for a 30-min box signal).
+ * - TESS: obscore does NOT list `_tp.fits` rows, so the TPF URLs are
+ *   DERIVED from the listed `-s_lc.fits` rows via `deriveTessTpfUrl`
+ *   (the naming-pattern contract watched by external-health check 6).
+ * Returns download-ready URLs in chronological order (the archive
+ * filenames embed timestamps/sector numbers).
+ * @param mission Which collection to query.
+ * @param targetName Archive target name (`kplrNNNNNNNNN` / bare TIC int).
  * @param tag Log prefix.
- * @returns Chronologically-sorted TPF download URLs (empty on failure).
+ * @returns Chronologically-sorted TPF URLs (empty on failure).
  */
-async function discoverTpfQuarters(targetName: string, tag: string): Promise<string[]> {
-  const tapUrl = mastTapQueryUrl('Kepler', targetName)
+async function discoverTpfSegments(
+  mission: 'Kepler' | 'TESS',
+  targetName: string,
+  tag: string,
+): Promise<string[]> {
+  const tapUrl = mastTapQueryUrl(mission, targetName)
   const res = await fetch(tapUrl, { signal: AbortSignal.timeout(60000) })
   if (!res.ok) {
     console.error(`${tag} TAP status ${res.status} for ${targetName}`)
@@ -208,14 +246,18 @@ async function discoverTpfQuarters(targetName: string, tag: string): Promise<str
     console.error(`${tag} TAP response missing access_url column`)
     return []
   }
-  const urls: string[] = []
+  const urls = new Set<string>()
   for (const row of tap.data ?? []) {
     const u = row[urlIdx]
-    // Long-cadence TPFs only — the `_spd-targ` short-cadence product is
-    // 10–30× bigger and adds nothing for a 30-min-cadence box signal.
-    if (typeof u === 'string' && u.includes('_lpd-targ.fits')) urls.push(u)
+    if (typeof u !== 'string') continue
+    if (mission === 'Kepler') {
+      if (u.includes('_lpd-targ.fits')) urls.add(u)
+    } else {
+      const derived = deriveTessTpfUrl(u)
+      if (derived !== null) urls.add(derived)
+    }
   }
-  return urls.sort()
+  return [...urls].sort()
 }
 
 /**
@@ -236,70 +278,92 @@ function spreadQuarters(urls: string[], count: number): string[] {
 }
 
 /**
- * @description Downloads and parses one TPF quarter.
- * @param accessUrl TAP access_url for the quarter.
+ * @description Downloads and parses one TPF segment.
+ * @param accessUrl TAP access_url (Kepler) or derived download URL (TESS).
+ * `resolveSegmentDownloadUrl` is idempotent on already-resolved URLs.
  * @param tag Log prefix.
- * @returns Parsed quarter as engine input plus the header kepmag, or null
- * on any failure (logged, never thrown — one bad quarter shouldn't kill
- * the measurement).
+ * @returns Parsed segment as engine input plus the header magnitude, or
+ * null on any failure (logged, never thrown — one bad segment shouldn't
+ * kill the measurement).
  */
-async function fetchQuarter(
+/** @description Download attempts per segment (TESS sectors are ~47 MB; connection resets are routine). */
+const SEGMENT_MAX_ATTEMPTS = 3
+
+/** @description Linear backoff between segment retry attempts (ms). */
+const SEGMENT_RETRY_BACKOFF_MS = 500
+
+async function fetchSegment(
   accessUrl: string,
   tag: string,
-): Promise<{ input: CentroidQuarterInput; kepmag: number | null } | null> {
+): Promise<{ input: CentroidQuarterInput; mag: number | null } | null> {
   const downloadUrl = resolveSegmentDownloadUrl(accessUrl)
-  const fname = downloadUrl.split('/').pop() ?? downloadUrl
-  try {
-    const res = await fetch(downloadUrl, { signal: AbortSignal.timeout(TPF_FETCH_TIMEOUT_MS) })
-    if (!res.ok) {
-      console.error(`${tag} quarter ${fname} → HTTP ${res.status}`)
-      return null
+  const fname = decodeURIComponent(downloadUrl.split('/').pop() ?? downloadUrl).split('/').pop() ?? downloadUrl
+  for (let attempt = 1; attempt <= SEGMENT_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(downloadUrl, { signal: AbortSignal.timeout(TPF_FETCH_TIMEOUT_MS) })
+      if (!res.ok) {
+        console.error(`${tag} segment ${fname} → HTTP ${res.status}`)
+        // 4xx won't fix itself; 5xx/429 might.
+        if (res.status < 500 && res.status !== 429) return null
+        if (attempt === SEGMENT_MAX_ATTEMPTS) return null
+        await new Promise(r => setTimeout(r, SEGMENT_RETRY_BACKOFF_MS * attempt))
+        continue
+      }
+      const buf = Buffer.from(await res.arrayBuffer())
+      const tpf = readTpf(buf)
+      console.error(
+        `${tag} segment ${fname} → ${tpf.mission ?? '?'} seg ${tpf.segment ?? '?'} ${tpf.nx}×${tpf.ny}, ${tpf.times.length} cadences, mag=${tpf.mag ?? '?'}, wcs=${tpf.wcs ? 'yes' : 'NO'}${attempt > 1 ? ` (attempt ${attempt})` : ''}`,
+      )
+      return {
+        input: {
+          label: fname,
+          nx: tpf.nx,
+          ny: tpf.ny,
+          times: tpf.times,
+          quality: tpf.quality,
+          flux: tpf.flux,
+          wcs: tpf.wcs,
+          apertureMask: tpf.apertureMask,
+        },
+        mag: tpf.mag,
+      }
+    } catch (e) {
+      // Connection-level failure (ECONNRESET / timeout) — the class the
+      // lightcurve route's pool retries. Big TESS sectors hit it often
+      // (observed live: 2/4 sectors dropped on first attempt).
+      console.error(
+        `${tag} segment ${fname} → attempt ${attempt}/${SEGMENT_MAX_ATTEMPTS} failed:`,
+        e instanceof Error ? e.message : e,
+      )
+      if (attempt === SEGMENT_MAX_ATTEMPTS) return null
+      await new Promise(r => setTimeout(r, SEGMENT_RETRY_BACKOFF_MS * attempt))
     }
-    const buf = Buffer.from(await res.arrayBuffer())
-    const tpf = readKeplerTpf(buf)
-    console.error(
-      `${tag} quarter ${fname} → Q${tpf.quarter ?? '?'} ${tpf.nx}×${tpf.ny}, ${tpf.times.length} cadences, Kp=${tpf.kepmag ?? '?'}`,
-    )
-    return {
-      input: {
-        label: fname,
-        nx: tpf.nx,
-        ny: tpf.ny,
-        times: tpf.times,
-        quality: tpf.quality,
-        flux: tpf.flux,
-        apertureMask: tpf.apertureMask,
-      },
-      kepmag: tpf.kepmag,
-    }
-  } catch (e) {
-    console.error(`${tag} quarter ${fname} → failed:`, e instanceof Error ? e.message : e)
-    return null
   }
+  return null
 }
 
 /**
- * @description Downloads a list of quarters through a small bounded pool.
+ * @description Downloads a list of segments through a small bounded pool.
  * Order of results matches input; failures are dropped (logged in
- * `fetchQuarter`).
- * @param urls Quarter access_urls.
+ * `fetchSegment`).
+ * @param urls Segment URLs.
  * @param tag Log prefix.
- * @returns Successfully-parsed quarters.
+ * @returns Successfully-parsed segments.
  */
-async function fetchQuartersBounded(
+async function fetchSegmentsBounded(
   urls: string[],
   tag: string,
-): Promise<Array<{ input: CentroidQuarterInput; kepmag: number | null }>> {
-  const results = new Array<{ input: CentroidQuarterInput; kepmag: number | null } | null>(urls.length).fill(null)
+): Promise<Array<{ input: CentroidQuarterInput; mag: number | null }>> {
+  const results = new Array<{ input: CentroidQuarterInput; mag: number | null } | null>(urls.length).fill(null)
   let next = 0
   const worker = async () => {
     while (next < urls.length) {
       const i = next++
-      results[i] = await fetchQuarter(urls[i], tag)
+      results[i] = await fetchSegment(urls[i], tag)
     }
   }
   await Promise.all(Array.from({ length: Math.min(TPF_DOWNLOAD_CONCURRENCY, urls.length) }, worker))
-  return results.filter((r): r is { input: CentroidQuarterInput; kepmag: number | null } => r !== null)
+  return results.filter((r): r is { input: CentroidQuarterInput; mag: number | null } => r !== null)
 }
 
 /**
@@ -318,9 +382,13 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
   const durationHours = Number(url.searchParams.get('duration'))
 
   const kicMatch = id.match(/^KIC(\d+)$/)
-  if (!kicMatch) {
+  const ticMatch = id.match(/^TIC(\d+)$/)
+  if (!kicMatch && !ticMatch) {
     return NextResponse.json(
-      { status: 'unsupported' as const, message: 'Pixel-level vetting is available for Kepler (KIC) targets only.' },
+      {
+        status: 'unsupported' as const,
+        message: 'Pixel-level vetting is available for Kepler (KIC) and TESS (TIC) targets only.',
+      },
       { status: 400 },
     )
   }
@@ -330,52 +398,67 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       { status: 400 },
     )
   }
+  const mission: 'Kepler' | 'TESS' = kicMatch ? 'Kepler' : 'TESS'
+  const provenance = centroidProvenance(mission)
   const inputs: CentroidInputs = { periodDays, epochDays, durationHours }
-  console.error(`${tag} GET ${id} P=${periodDays}d t0=${epochDays} dur=${durationHours}h`)
+  console.error(`${tag} GET ${id} (${mission}) P=${periodDays}d t0=${epochDays} dur=${durationHours}h`)
 
   const cached = await readCache(id, inputs, tag)
   if (cached) {
-    return NextResponse.json({ status: 'ok' as const, result: cached, provenance: CENTROID_PROVENANCE })
+    return NextResponse.json({ status: 'ok' as const, result: cached, mission, provenance })
   }
 
   try {
-    const targetName = `kplr${kicMatch[1].padStart(9, '0')}`
-    const allQuarters = await discoverTpfQuarters(targetName, tag)
-    console.error(`${tag} ${allQuarters.length} TPF quarters discoverable for ${targetName}`)
-    if (allQuarters.length === 0) {
+    // TESS `target_name` in obscore is the bare TIC integer (same rule as
+    // the lightcurve route); Kepler uses the 9-digit-padded kplr form.
+    const targetName = kicMatch
+      ? `kplr${kicMatch[1].padStart(9, '0')}`
+      : String(parseInt(ticMatch![1], 10))
+    const allSegments = await discoverTpfSegments(mission, targetName, tag)
+    console.error(`${tag} ${allSegments.length} TPF segments discoverable for ${mission}/${targetName}`)
+    if (allSegments.length === 0) {
       return NextResponse.json({
         status: 'error' as const,
-        message: 'No Kepler Target Pixel Files found at MAST for this star.',
+        message: `No ${mission} Target Pixel Files found at MAST for this star.`,
       })
     }
-    const picks = spreadQuarters(allQuarters, TPF_QUARTERS_TO_FETCH)
+    const picks = spreadQuarters(
+      allSegments,
+      mission === 'Kepler' ? TPF_QUARTERS_TO_FETCH : TESS_SECTORS_TO_FETCH,
+    )
 
-    // Saturation gate: download ONE quarter first and read the
-    // authoritative KEPMAG from its header. Refusing here saves the
-    // remaining downloads for targets we won't measure anyway.
-    const first = await fetchQuarter(picks[0], tag)
+    // Saturation gate: download ONE segment first and read the
+    // authoritative KEPMAG/TESSMAG from its header. Refusing here saves
+    // the remaining downloads for targets we won't measure anyway.
+    const first = await fetchSegment(picks[0], tag)
     if (!first) {
       return NextResponse.json({
         status: 'error' as const,
-        message: 'Could not download pixel data from MAST (first quarter failed).',
+        message: 'Could not download pixel data from MAST (first segment failed).',
       })
     }
-    if (isSaturatedKepmag(first.kepmag)) {
-      const result = runCentroidVet([], periodDays, epochDays, durationHours, first.kepmag)
+    if (isSaturatedMag(mission, first.mag)) {
+      const result = runCentroidVet([], periodDays, epochDays, durationHours, first.mag, mission)
       await writeCache(id, inputs, result, tag)
-      return NextResponse.json({ status: 'ok' as const, result, provenance: CENTROID_PROVENANCE })
+      return NextResponse.json({ status: 'ok' as const, result, mission, provenance })
     }
 
-    const rest = await fetchQuartersBounded(picks.slice(1), tag)
-    const quarterInputs = [first.input, ...rest.map(r => r.input)]
-    const result = runCentroidVet(quarterInputs, periodDays, epochDays, durationHours, first.kepmag)
+    const rest = await fetchSegmentsBounded(picks.slice(1), tag)
+    const segmentInputs = [first.input, ...rest.map(r => r.input)]
+    const result = runCentroidVet(segmentInputs, periodDays, epochDays, durationHours, first.mag, mission)
     console.error(
       `${tag} ${id} → status=${result.status} verdict=${result.verdict ?? '-'} ` +
         `offset=${result.offsetArcsec?.toFixed(2) ?? '-'}″ ±${result.offsetErrArcsec?.toFixed(2) ?? '-'} ` +
-        `σ=${result.sigma?.toFixed(1) ?? '-'} quarters=${result.quartersUsed}`,
+        `σ=${result.sigma?.toFixed(1) ?? '-'} ref=${result.referenceFrame ?? '-'} segments=${result.quartersUsed}`,
     )
-    await writeCache(id, inputs, result, tag)
-    return NextResponse.json({ status: 'ok' as const, result, provenance: CENTROID_PROVENANCE })
+    // Cache `measured` and `saturated` only. An `insufficient` outcome is
+    // usually a transient artifact (segment downloads dropped, as observed
+    // live on the TESS path) — freezing it for the TTL would make a
+    // recoverable failure sticky for 30 days.
+    if (result.status !== 'insufficient') {
+      await writeCache(id, inputs, result, tag)
+    }
+    return NextResponse.json({ status: 'ok' as const, result, mission, provenance })
   } catch (e) {
     console.error(`${tag} caught:`, e)
     return NextResponse.json({

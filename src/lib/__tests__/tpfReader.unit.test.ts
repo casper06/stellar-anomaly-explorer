@@ -1,11 +1,13 @@
 /**
- * @description Unit tests for the Kepler Target Pixel File reader. Each
- * test constructs a minimal synthetic TPF FITS buffer to the real product
- * spec (verified against live MAST downloads: PRIMARY with KEPMAG/QUARTER,
- * TARGETTABLES BINTABLE with a TDIM-shaped FLUX array column, APERTURE
- * int32 image) and asserts extraction behavior: cube pixel ordering, TDIM
- * parsing, NaN preservation, header metadata, the aperture bitmask, the
- * gzip path, and the documented error paths.
+ * @description Unit tests for the Target Pixel File reader (Kepler +
+ * TESS). Each test constructs a minimal synthetic TPF FITS buffer to the
+ * real product spec (verified against live MAST downloads: PRIMARY with
+ * KEPMAG/TESSMAG + QUARTER/SECTOR, pixel BINTABLE with a TDIM-shaped
+ * FLUX array column carrying per-column WCS keywords, APERTURE int32
+ * image) and asserts extraction behavior: cube pixel ordering, TDIM
+ * parsing, NaN preservation, header metadata for both missions, the
+ * FLUX-column WCS, the aperture bitmask, the gzip path, and the
+ * documented error paths.
  *
  * Run via `npm run test:unit` (plain Node ≥ 22.6, node:test + native
  * type stripping — no framework).
@@ -13,7 +15,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { gzipSync } from 'node:zlib'
-import { readKeplerTpf } from '../tpfReader.ts'
+import { readTpf } from '../tpfReader.ts'
 
 const BLOCK = 2880
 
@@ -55,35 +57,64 @@ function padData(data: Buffer): Buffer {
 /**
  * @description Primary HDU carrying the identity keywords a real Kepler
  * TPF has (KEPMAG drives the saturation gate).
- * @param overrides Cards to add/replace (e.g. omit KEPMAG).
+ * @param extra Cards to append (e.g. TESS variants).
  * @returns Header-only primary HDU bytes.
  */
-function tpfPrimaryHdu(extra: string[] = []): Buffer {
+function keplerPrimaryHdu(): Buffer {
   return headerBlocks([
     card('SIMPLE', 'T'),
     card('BITPIX', '8'),
     card('NAXIS', '0'),
+    card('TELESCOP', "'Kepler'"),
     card('KEPLERID', '5991936'),
     card('QUARTER', '9'),
     card('KEPMAG', '13.424'),
-    ...extra,
   ])
 }
 
+/** @description Primary HDU with the TESS identity keywords. */
+function tessPrimaryHdu(): Buffer {
+  return headerBlocks([
+    card('SIMPLE', 'T'),
+    card('BITPIX', '8'),
+    card('NAXIS', '0'),
+    card('TELESCOP', "'TESS'"),
+    card('TICID', '185336364'),
+    card('SECTOR', '41'),
+    card('TESSMAG', '11.352'),
+  ])
+}
+
+/** @description WCS cards for the FLUX column (column 2 in the synthetic table). */
+function fluxWcsCards(): string[] {
+  return [
+    card('1CRPX2', '1.5'),
+    card('2CRPX2', '1.25'),
+    card('1CRVL2', '301.5'),
+    card('2CRVL2', '44.4'),
+    card('1CDLT2', '-0.0011'),
+    card('2CDLT2', '0.0011'),
+    card('11PC2', '0.6'),
+    card('12PC2', '0.8'),
+    card('21PC2', '0.8'),
+    card('22PC2', '-0.6'),
+  ]
+}
+
 /**
- * @description Builds the TARGETTABLES BINTABLE HDU with the three columns
- * the reader needs (TIME 1D, FLUX nE + TDIM, QUALITY 1J) for a 2×2 stamp.
+ * @description Builds the pixel BINTABLE HDU with the three columns the
+ * reader needs (TIME 1D, FLUX nE + TDIM, QUALITY 1J) for a 2×2 stamp.
  * @param times Per-cadence timestamps (NaN allowed).
  * @param cubes Per-cadence 4-pixel stamps in (x + y*2) order.
  * @param quality Per-cadence quality flags.
- * @param opts Optional TDIM override / omission for error-path tests.
+ * @param opts TDIM override/omission and WCS inclusion for error-path tests.
  * @returns Full HDU bytes.
  */
-function targetTablesHdu(
+function pixelTableHdu(
   times: number[],
   cubes: number[][],
   quality: number[],
-  opts: { tdim?: string | null } = {},
+  opts: { tdim?: string | null; wcs?: boolean } = {},
 ): Buffer {
   const nRows = times.length
   const rowBytes = 8 + 16 + 4 // 1D + 4E + 1J
@@ -103,10 +134,9 @@ function targetTablesHdu(
     card('TTYPE2', "'FLUX'"),
     card('TFORM2', "'4E'"),
     ...(tdim !== null ? [card('TDIM2', tdim)] : []),
+    ...(opts.wcs === false ? [] : fluxWcsCards()),
     card('TTYPE3', "'QUALITY'"),
     card('TFORM3', "'1J'"),
-    card('1CRV5P', '230'),
-    card('2CRV5P', '125'),
   ]
   const data = Buffer.alloc(nRows * rowBytes)
   for (let r = 0; r < nRows; r++) {
@@ -143,11 +173,11 @@ function apertureHdu(mask: number[]): Buffer {
   return Buffer.concat([headerBlocks(cards), padData(data)])
 }
 
-/** @description A complete synthetic 2-cadence, 2×2-stamp TPF file. */
+/** @description A complete synthetic 2-cadence, 2×2-stamp Kepler TPF file. */
 function standardTpf(): Buffer {
   return Buffer.concat([
-    tpfPrimaryHdu(),
-    targetTablesHdu(
+    keplerPrimaryHdu(),
+    pixelTableHdu(
       [1000.5, 1000.520434],
       [
         [10, 20, 30, 40],
@@ -159,39 +189,61 @@ function standardTpf(): Buffer {
   ])
 }
 
-describe('readKeplerTpf', () => {
-  it('extracts the cube, times, quality, and header metadata', () => {
-    const tpf = readKeplerTpf(standardTpf())
+describe('readTpf', () => {
+  it('extracts the cube, times, quality, and Kepler header metadata', () => {
+    const tpf = readTpf(standardTpf())
     assert.equal(tpf.nx, 2)
     assert.equal(tpf.ny, 2)
     assert.deepEqual(tpf.times, [1000.5, 1000.520434])
     assert.deepEqual(tpf.quality, [0, 8])
     assert.deepEqual(Array.from(tpf.flux), [10, 20, 30, 40, 11, 21, 31, 41])
-    assert.equal(tpf.kepmag, 13.424)
-    assert.equal(tpf.keplerId, 5991936)
-    assert.equal(tpf.quarter, 9)
-    assert.equal(tpf.refCol, 230)
-    assert.equal(tpf.refRow, 125)
+    assert.equal(tpf.mission, 'Kepler')
+    assert.equal(tpf.mag, 13.424)
+    assert.equal(tpf.targetId, 5991936)
+    assert.equal(tpf.segment, 9)
+  })
+
+  it('extracts the FLUX-column WCS (per-segment sky reference)', () => {
+    const tpf = readTpf(standardTpf())
+    assert.ok(tpf.wcs)
+    assert.equal(tpf.wcs!.crpx1, 1.5)
+    assert.equal(tpf.wcs!.crpx2, 1.25)
+    assert.equal(tpf.wcs!.crval1, 301.5)
+    assert.equal(tpf.wcs!.cdelt1, -0.0011)
+    assert.equal(tpf.wcs!.pc12, 0.8)
+    assert.equal(tpf.wcs!.pc22, -0.6)
+  })
+
+  it('reads TESS identity keywords (TESSMAG / TICID / SECTOR)', () => {
+    const buf = Buffer.concat([tessPrimaryHdu(), pixelTableHdu([2000.5], [[1, 2, 3, 4]], [0])])
+    const tpf = readTpf(buf)
+    assert.equal(tpf.mission, 'TESS')
+    assert.equal(tpf.mag, 11.352)
+    assert.equal(tpf.targetId, 185336364)
+    assert.equal(tpf.segment, 41)
+  })
+
+  it('returns null WCS when the keywords are absent (fallback path signal)', () => {
+    const buf = Buffer.concat([keplerPrimaryHdu(), pixelTableHdu([1.5], [[1, 2, 3, 4]], [0], { wcs: false })])
+    const tpf = readTpf(buf)
+    assert.equal(tpf.wcs, null)
   })
 
   it('reads the APERTURE bitmask in the same pixel order as the cube', () => {
-    const tpf = readKeplerTpf(standardTpf())
+    const tpf = readTpf(standardTpf())
     assert.ok(tpf.apertureMask)
     assert.deepEqual(Array.from(tpf.apertureMask!), [1, 3, 3, 1])
   })
 
-  it('accepts gzipped input (MAST serves _lpd-targ.fits.gz)', () => {
-    const tpf = readKeplerTpf(gzipSync(standardTpf()))
+  it('accepts gzipped input (MAST serves Kepler TPFs as .gz)', () => {
+    const tpf = readTpf(gzipSync(standardTpf()))
     assert.deepEqual(Array.from(tpf.flux), [10, 20, 30, 40, 11, 21, 31, 41])
-    assert.equal(tpf.kepmag, 13.424)
+    assert.equal(tpf.mag, 13.424)
   })
 
   it('preserves NaN in times and flux (gap cadences / uncollected pixels)', () => {
-    const buf = Buffer.concat([
-      tpfPrimaryHdu(),
-      targetTablesHdu([NaN], [[NaN, 5, NaN, 7]], [0]),
-    ])
-    const tpf = readKeplerTpf(buf)
+    const buf = Buffer.concat([keplerPrimaryHdu(), pixelTableHdu([NaN], [[NaN, 5, NaN, 7]], [0])])
+    const tpf = readTpf(buf)
     assert.ok(Number.isNaN(tpf.times[0]))
     assert.ok(Number.isNaN(tpf.flux[0]))
     assert.equal(tpf.flux[1], 5)
@@ -199,40 +251,41 @@ describe('readKeplerTpf', () => {
     assert.equal(tpf.flux[3], 7)
   })
 
-  it('returns null aperture/kepmag when those parts are absent', () => {
-    const noKepmag = headerBlocks([card('SIMPLE', 'T'), card('BITPIX', '8'), card('NAXIS', '0')])
-    const buf = Buffer.concat([noKepmag, targetTablesHdu([1.5], [[1, 2, 3, 4]], [0])])
-    const tpf = readKeplerTpf(buf)
-    assert.equal(tpf.kepmag, null)
+  it('returns null aperture/mag when those parts are absent', () => {
+    const noMag = headerBlocks([card('SIMPLE', 'T'), card('BITPIX', '8'), card('NAXIS', '0')])
+    const buf = Buffer.concat([noMag, pixelTableHdu([1.5], [[1, 2, 3, 4]], [0])])
+    const tpf = readTpf(buf)
+    assert.equal(tpf.mag, null)
+    assert.equal(tpf.mission, null)
     assert.equal(tpf.apertureMask, null)
   })
 
   it('throws when no BINTABLE extension exists', () => {
-    assert.throws(() => readKeplerTpf(tpfPrimaryHdu()), /No BINTABLE/)
+    assert.throws(() => readTpf(keplerPrimaryHdu()), /No BINTABLE/)
   })
 
   it('throws (naming available columns) when a required column is missing', () => {
     // Rename FLUX so the reader can't find it.
-    const hdu = targetTablesHdu([1.5], [[1, 2, 3, 4]], [0])
+    const hdu = pixelTableHdu([1.5], [[1, 2, 3, 4]], [0])
     const broken = Buffer.from(hdu)
     const idx = broken.indexOf(Buffer.from("TTYPE2  = 'FLUX'", 'ascii'))
     broken.write("TTYPE2  = 'FLOX'", idx, 'ascii')
     assert.throws(
-      () => readKeplerTpf(Buffer.concat([tpfPrimaryHdu(), broken])),
+      () => readTpf(Buffer.concat([keplerPrimaryHdu(), broken])),
       /TPF columns not found.*have TIME, FLOX, QUALITY/,
     )
   })
 
   it('throws when FLUX has no parseable TDIM shape', () => {
-    const buf = Buffer.concat([tpfPrimaryHdu(), targetTablesHdu([1.5], [[1, 2, 3, 4]], [0], { tdim: null })])
-    assert.throws(() => readKeplerTpf(buf), /no parseable TDIM/)
+    const buf = Buffer.concat([keplerPrimaryHdu(), pixelTableHdu([1.5], [[1, 2, 3, 4]], [0], { tdim: null })])
+    assert.throws(() => readTpf(buf), /no parseable TDIM/)
   })
 
   it('throws when TDIM disagrees with the TFORM repeat count', () => {
     const buf = Buffer.concat([
-      tpfPrimaryHdu(),
-      targetTablesHdu([1.5], [[1, 2, 3, 4]], [0], { tdim: "'(3,2)  '" }),
+      keplerPrimaryHdu(),
+      pixelTableHdu([1.5], [[1, 2, 3, 4]], [0], { tdim: "'(3,2)  '" }),
     ])
-    assert.throws(() => readKeplerTpf(buf), /disagrees with repeat count/)
+    assert.throws(() => readTpf(buf), /disagrees with repeat count/)
   })
 })

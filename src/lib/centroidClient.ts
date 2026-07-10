@@ -12,6 +12,8 @@ import type { BlsResult } from './bls'
 export interface CentroidVetPayload {
   status: 'ok'
   result: CentroidVetResult
+  /** Which mission's pixel data was measured (drives the UI's validation labeling). */
+  mission: 'Kepler' | 'TESS'
   provenance: { sourceName: string; mission: string; dataType: string }
 }
 

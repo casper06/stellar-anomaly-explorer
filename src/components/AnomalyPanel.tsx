@@ -481,17 +481,18 @@ function LightCurveFullscreen({
             }}
           >
             <ClassifierReadout profile={profile} partial={partial} segments={segments} mission={mission} />
-            {/* Pixel-level vetting is Kepler-only (KIC targets with real
-                data) and needs a confident BLS ephemeris to define the
-                in/out-of-transit windows — same gate as the odd/even and
-                phase-0.5 lines. keyed by star so state never leaks across
-                selections. */}
+            {/* Pixel-level vetting needs real data from a mission whose
+                TPFs we can fetch (Kepler KIC / TESS TIC — the id must
+                match the mission that served the curve) and a confident
+                BLS ephemeris to define the in/out-of-transit windows —
+                same gate as the odd/even and phase-0.5 lines. Keyed by
+                star so state never leaks across selections. */}
             {source === 'real' &&
-              mission === 'Kepler' &&
-              /^KIC\d+$/.test(starId) &&
+              ((mission === 'Kepler' && /^KIC\d+$/.test(starId)) ||
+                (mission === 'TESS' && /^TIC\d+$/.test(starId))) &&
               profile.bls &&
               profile.bls.sde >= BLS_SDE_THRESHOLD && (
-                <PixelVettingPanel key={starId} starId={starId} bls={profile.bls} />
+                <PixelVettingPanel key={starId} starId={starId} mission={mission} bls={profile.bls} />
               )}
           </div>
         )}
@@ -943,11 +944,14 @@ function StampCanvas({
       (px + 0.5) * cell,
       (stamp.ny - 1 - py + 0.5) * cell,
     ]
-    const [phx, phy] = toCanvas(stamp.photocenter)
+    // The offset's reference point: the target's catalog position (WCS)
+    // when available, else the photocenter (legacy fallback path).
+    const reference = stamp.catalogPosition ?? stamp.photocenter
+    const [phx, phy] = toCanvas(reference)
 
     if (kind === 'diff') {
       const [dx, dy] = toCanvas(stamp.diffCentroid)
-      // Offset line photocenter → difference centroid.
+      // Offset line: catalog position → difference centroid.
       ctx.strokeStyle = 'rgba(76,201,240,0.9)'
       ctx.lineWidth = 1.5
       ctx.beginPath()
@@ -960,7 +964,7 @@ function StampCanvas({
       ctx.stroke()
     }
 
-    // × = the star's photocenter (both stamps).
+    // × = the reference point (both stamps).
     ctx.strokeStyle = 'rgba(255,255,255,0.95)'
     ctx.lineWidth = 1.5
     ctx.beginPath()
@@ -996,7 +1000,15 @@ function StampCanvas({
  * @param bls Confident BLS detection supplying the ephemeris.
  * @returns Bordered card with the button / progress / measurement.
  */
-function PixelVettingPanel({ starId, bls }: { starId: string; bls: BlsResult }) {
+function PixelVettingPanel({
+  starId,
+  mission,
+  bls,
+}: {
+  starId: string
+  mission: 'Kepler' | 'TESS'
+  bls: BlsResult
+}) {
   const [state, setState] = useState<'idle' | 'loading' | 'done'>('idle')
   const [payload, setPayload] = useState<CentroidVetPayload | CentroidVetFailure | null>(null)
   const [stepIdx, setStepIdx] = useState(0)
@@ -1034,7 +1046,7 @@ function PixelVettingPanel({ starId, bls }: { starId: string; bls: BlsResult }) 
       }}
     >
       <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginBottom: 6 }}>
-        PIXEL-LEVEL VETTING · KEPLER TPF
+        PIXEL-LEVEL VETTING · {mission.toUpperCase()} TPF
       </div>
 
       {state === 'idle' && (
@@ -1057,10 +1069,30 @@ function PixelVettingPanel({ starId, bls }: { starId: string; bls: BlsResult }) 
             RUN PIXEL-LEVEL VETTING
           </button>
           <div style={{ marginTop: 6, fontSize: 8.5, color: 'rgba(255,255,255,0.45)', lineHeight: 1.5 }}>
-            On-demand only: downloads ~15 MB of this star&apos;s Kepler pixel data
-            (6 quarters) from NASA/MAST and measures where the periodic dimming
-            signal originates on the detector. Takes ~10–30 s.
+            {mission === 'Kepler'
+              ? 'On-demand only: downloads ~15 MB of this star’s Kepler pixel data (6 quarters) from NASA/MAST and measures where the periodic dimming signal originates on the sky, relative to the target’s catalog position. Takes ~10–30 s.'
+              : 'On-demand only: downloads this star’s TESS pixel data (up to 4 sectors, ~50 MB EACH) from NASA/MAST and measures where the periodic dimming signal originates on the sky. Can take a minute or more.'}
           </div>
+          {mission === 'TESS' && (
+            <div
+              style={{
+                marginTop: 6,
+                padding: '5px 7px',
+                borderRadius: 4,
+                background: 'rgba(244,162,97,0.1)',
+                border: '1px solid rgba(244,162,97,0.4)',
+                fontSize: 8.5,
+                color: '#f4a261',
+                lineHeight: 1.5,
+              }}
+            >
+              ⚠ QUALITATIVE FOR TESS — this check is calibrated against Kepler
+              DR25 ground truth only; no equivalent public per-target centroid
+              values exist for TESS, and TESS&apos;s ~21″ pixels make the
+              measurement far coarser. Treat the result as indicative, not
+              validated.
+            </div>
+          )}
         </>
       )}
 
@@ -1100,7 +1132,7 @@ function PixelVettingPanel({ starId, bls }: { starId: string; bls: BlsResult }) 
 
       {state === 'done' && result && result.status === 'saturated' && (
         <div style={{ fontSize: 9.5, color: '#f4a261', lineHeight: 1.5 }}>
-          Target too bright for a reliable centroid (Kp{' '}
+          Target too bright for a reliable centroid ({mission === 'Kepler' ? 'Kp' : 'Tmag'}{' '}
           {result.kepmag !== null ? result.kepmag.toFixed(1) : '?'} — saturated pixels bleed
           along CCD columns). Measurement refused rather than reporting a
           meaningless offset.
@@ -1110,7 +1142,8 @@ function PixelVettingPanel({ starId, bls }: { starId: string; bls: BlsResult }) 
       {state === 'done' && result && result.status === 'insufficient' && (
         <div style={{ fontSize: 9.5, color: 'rgba(255,255,255,0.6)', lineHeight: 1.5 }}>
           Not enough usable in/out-of-transit pixel data at this ephemeris
-          ({result.quartersUsed} usable quarters; 3 needed for an error bar).
+          ({result.quartersUsed} usable {mission === 'Kepler' ? 'quarters' : 'sectors'}; 3
+          needed for an error bar).
         </div>
       )}
 
@@ -1121,7 +1154,7 @@ function PixelVettingPanel({ starId, bls }: { starId: string; bls: BlsResult }) 
               <StampCanvas
                 stamp={result.stamp}
                 kind="out"
-                title="MEAN OUT-OF-TRANSIT (aperture outlined, × photocenter)"
+                title={`MEAN OUT-OF-TRANSIT (aperture outlined, × ${result.stamp.catalogPosition ? 'catalog position' : 'photocenter'})`}
               />
               <StampCanvas
                 stamp={result.stamp}
@@ -1138,13 +1171,19 @@ function PixelVettingPanel({ starId, bls }: { starId: string; bls: BlsResult }) 
             }}
           >
             {result.verdict === 'OFFSET_DETECTED'
-              ? `Transit-signal centroid offset: ${result.offsetArcsec!.toFixed(2)}″ ± ${result.offsetErrArcsec!.toFixed(2)}″ (${result.sigma!.toFixed(1)}σ) from the star's photocenter — the dimming originates away from the target's position.`
-              : `No significant centroid offset: ${result.offsetArcsec!.toFixed(2)}″ ± ${result.offsetErrArcsec!.toFixed(2)}″ (${result.sigma!.toFixed(1)}σ; this check resolves offsets ≳ ${result.floorArcsec}″).`}
+              ? `Transit-signal centroid offset: ${result.offsetArcsec!.toFixed(2)}″ ± ${result.offsetErrArcsec!.toFixed(2)}″ (${result.sigma!.toFixed(1)}σ) from the target's catalog position — the dimming originates away from the target.`
+              : `No significant centroid offset: ${result.offsetArcsec!.toFixed(2)}″ ± ${result.offsetErrArcsec!.toFixed(2)}″ (${result.sigma!.toFixed(1)}σ; this check resolves offsets ≳ ${Math.round(result.floorArcsec)}″).`}
           </div>
+          {mission === 'TESS' && (
+            <div style={{ marginTop: 5, fontSize: 8.5, color: '#f4a261', lineHeight: 1.5 }}>
+              ⚠ Qualitative — unvalidated for TESS (no public per-target
+              centroid ground truth; ~21″ pixels).
+            </div>
+          )}
           <div style={{ marginTop: 5, fontSize: 8, color: 'rgba(255,255,255,0.35)', lineHeight: 1.5 }}>
-            {result.quartersUsed} quarters vector-averaged · stamp from{' '}
-            {result.stamp ? result.stamp.label.replace(/_lpd-targ\.fits\.gz$/, '') : '—'} · NASA/MAST
-            Kepler Target Pixel Files
+            {result.quartersUsed} {mission === 'Kepler' ? 'quarters' : 'sectors'} vector-averaged ·
+            stamp from {result.stamp ? result.stamp.label.replace(/(_lpd-targ\.fits\.gz|_tp\.fits)$/, '') : '—'} ·
+            NASA/MAST {mission} Target Pixel Files
           </div>
         </div>
       )}

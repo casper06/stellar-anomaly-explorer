@@ -16,11 +16,11 @@
  *   3. NASA Exoplanet Archive TOI (TESS)       — /api/toi
  *   4. MAST VO-TAP obscore (segment discovery) — /api/lightcurve, /api/centroid
  *   5. MAST archive FITS download (segment)    — /api/lightcurve
- *   6. TESS TPF URL derivation                 — NOT SHIPPED: monitored
- *      ahead of any TESS pixel-vetting implementation. The TPF URL is a
- *      derived naming pattern (`-s_lc.fits` → `-s_tp.fits`), not a
- *      documented MAST contract, so we watch it from day one rather than
- *      building on an unmonitored assumption later.
+ *   6. TESS TPF URL derivation                 — /api/centroid (TESS
+ *      path). The TPF URL is a derived naming pattern (`-s_lc.fits` →
+ *      `-s_tp.fits`), not a documented MAST contract; it was monitored
+ *      here BEFORE the TESS implementation landed and is load-bearing
+ *      now.
  *
  * Each check verifies not just "reachable" but "still shaped how we
  * parse it" — the Hipparcos required columns, the `tid` TOI column, an
@@ -178,8 +178,8 @@ async function checkMastDownload() {
 }
 
 /**
- * @description Check 6 — TESS TPF URL derivation (unshipped contract,
- * monitored ahead of implementation). Queries the TESS collection for a
+ * @description Check 6 — TESS TPF URL derivation (load-bearing for
+ * /api/centroid's TESS path). Queries the TESS collection for a
  * known 2-min target, takes the first `-s_lc.fits` access_url, derives
  * the `_tp.fits` URL via the shared `deriveTessTpfUrl`, and confirms the
  * derived file EXISTS and is FITS — via a ranged GET (a full sector TPF
@@ -233,7 +233,7 @@ async function main() {
   const mastTap = await runCheck('MAST VO-TAP (discovery)', checkMastTap)
   results.push(mastTap)
   results.push(await runCheck('MAST FITS download', checkMastDownload))
-  results.push(await runCheck('TESS TPF URL derivation (unshipped)', checkTessTpfDerivation))
+  results.push(await runCheck('TESS TPF URL derivation', checkTessTpfDerivation))
 
   const nameW = Math.max(...results.map(r => r.name.length))
   for (const r of results) {
