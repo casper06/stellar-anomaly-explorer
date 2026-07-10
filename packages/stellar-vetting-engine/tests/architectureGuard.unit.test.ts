@@ -13,26 +13,17 @@
  * - Bare package specifiers: ONLY `node:*` builtins are allowed. A new
  *   third-party dependency in an engine module is an architectural
  *   decision, not a convenience — add it here consciously if it ever
- *   happens, with its license noted (the extraction plan assumes the
- *   subset can be re-licensed MIT, so any dependency must be
- *   MIT-compatible).
- * - Relative imports: must point at another engine module.
+ *   happens, with its license noted (this package is MIT, so any
+ *   dependency must be MIT-compatible).
+ * - Relative imports: must point at another engine module. NO
+ *   exceptions: the historical `curveClassifier → anomalyDetector`
+ *   type-only exception was resolved at extraction time by moving
+ *   `detectDips` + `Dip` into `dipDetector.ts` (the app kept
+ *   `anomalyDetector.ts` as its pure fetch client).
  * - `require(...)` / dynamic `import(...)` are scanned too, so the rule
  *   can't be dodged.
  *
- * KNOWN DEBT (explicit, verified exception — do not widen silently):
- * `curveClassifier.ts` imports `type Dip` from `./anomalyDetector`.
- * `anomalyDetector.ts` is a MIXED module: it holds the pure `detectDips`
- * science code AND the app-specific lightcurve client
- * (`fetch('/api/lightcurve/…')`, a `process.env.NODE_ENV` dev-synthetic
- * gate), so it is deliberately NOT in the engine set. The `Dip` import
- * is type-only (erased at compile time — zero runtime coupling), and the
- * exception below asserts it STAYS type-only; turning it into a value
- * import fails this test. The clean fix — recorded as extraction-phase
- * work, not done here — is to move `detectDips` + its types into an
- * engine module and leave `anomalyDetector.ts` as the app-side client.
- *
- * Run via `npm run test:unit` (plain Node ≥ 22.6, node:test).
+ * Run via the package's `npm test` (plain Node ≥ 22.6, node:test).
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
@@ -40,14 +31,15 @@ import { readFileSync } from 'node:fs'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const LIB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
+const LIB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src')
 
 /**
- * @description The engine set: core science modules that must stay
- * portable. Keep in sync with the extraction plan — a new pure
- * measurement module belongs in this list.
+ * @description The engine set: every module in the package's `src/`.
+ * A new pure measurement module belongs in this list (and in index.ts).
  */
 const ENGINE_MODULES = [
+  'index.ts',
+  'dipDetector.ts',
   'bls.ts',
   'curveClassifier.ts',
   'oddEven.ts',
@@ -56,21 +48,6 @@ const ENGINE_MODULES = [
   'fitsReader.ts',
   'tpfReader.ts',
   'centroidVet.ts',
-]
-
-/**
- * @description Documented exceptions to the relative-import rule. Each
- * entry allows ONE specifier in ONE file, and only as a type-only
- * import. Adding an entry here is a reviewed decision — see the module
- * doc's KNOWN DEBT note for the single current case.
- */
-const KNOWN_TYPE_ONLY_EXCEPTIONS: Array<{ file: string; specifier: string; reason: string }> = [
-  {
-    file: 'curveClassifier.ts',
-    specifier: './anomalyDetector',
-    reason:
-      'type Dip lives in the mixed detector+client module; type-only import, zero runtime coupling. Fix at extraction time by moving detectDips into the engine set.',
-  },
 ]
 
 /** @description One import found in a source file. */
@@ -144,17 +121,6 @@ describe('architecture guard — engine modules stay portable', () => {
         if (specifier.startsWith('.')) {
           const target = libFileFor(specifier)
           if (target !== null && engineSet.has(target)) continue
-          const exception = KNOWN_TYPE_ONLY_EXCEPTIONS.find(
-            e => e.file === file && e.specifier === specifier,
-          )
-          if (exception) {
-            if (!imp.typeOnly) {
-              violations.push(
-                `${specifier} — allowed ONLY as a type-only import (${exception.reason}); found value import: ${imp.line}`,
-              )
-            }
-            continue
-          }
           violations.push(`relative import outside the engine set: '${specifier}' (${imp.line})`)
         } else if (specifier.startsWith('node:')) {
           continue // Node builtins are part of the runtime, not a dependency.
@@ -174,19 +140,7 @@ describe('architecture guard — engine modules stay portable', () => {
 
   it('every engine module exists (list stays in sync with the codebase)', () => {
     for (const file of ENGINE_MODULES) {
-      assert.doesNotThrow(() => readFileSync(path.join(LIB_DIR, file)), `${file} missing from src/lib`)
+      assert.doesNotThrow(() => readFileSync(path.join(LIB_DIR, file)), `${file} missing from src/`)
     }
-  })
-
-  it('the documented exception is still needed (remove it when the debt is paid)', () => {
-    // If curveClassifier stops importing from ./anomalyDetector, this
-    // exception must be deleted rather than lingering as a hole.
-    const src = stripComments(readFileSync(path.join(LIB_DIR, 'curveClassifier.ts'), 'utf8'))
-    const stillThere = /from\s*['"]\.\/anomalyDetector['"]/.test(src)
-    assert.equal(
-      stillThere,
-      true,
-      'curveClassifier no longer imports ./anomalyDetector — delete the KNOWN_TYPE_ONLY_EXCEPTIONS entry.',
-    )
   })
 })

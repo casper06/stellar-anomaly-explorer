@@ -22,7 +22,7 @@
  *   `toi` table. TESS sectors are ~47 MB each, so the TESS fixture keeps
  *   only the first MAX_TESS_CYCLES_PER_SECTOR transit windows per sector.
  *
- * Run: `node --import ./scripts/register-ts-resolver.mjs scripts/capture-centroid-fixtures.mjs`
+ * Run (from the package dir): `node --import ./scripts/register-ts-resolver.mjs scripts/capture-centroid-fixtures.mjs`
  * Re-run only when refreezing fixtures (engine changes that alter
  * expected values still only need `--print` in the regression test; a
  * re-CAPTURE is needed only if the required window multipliers grow past
@@ -33,10 +33,14 @@ import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import { gzipSync } from 'node:zlib'
 import { fileURLToPath } from 'node:url'
-import { readTpf } from '../src/lib/tpfReader.ts'
-import { deriveTessTpfUrl } from '../src/lib/externalEndpoints.ts'
+import { readTpf } from '../src/tpfReader.ts'
+// The TESS TPF URL derivation lives in the APP's endpoint registry (it is
+// an app/external-service concern, not engine math); this capture tool is
+// repo-internal and never ships in the npm tarball, so reaching into the
+// app source is acceptable here.
+import { deriveTessTpfUrl } from '../../../src/lib/externalEndpoints.ts'
 
-const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'lib', '__tests__', 'fixtures')
+const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'tests', 'fixtures')
 
 /** @description Stars to freeze. `pixels: false` = header-only (saturation refusal case). */
 const STARS = [

@@ -14,8 +14,8 @@ import {
   measureOddEvenDepths,
   ODD_EVEN_SIGMA_THRESHOLD,
   MIN_CYCLES_PER_PARITY,
-} from '../oddEven.ts'
-import type { BlsResult } from '../bls.ts'
+} from '../src/oddEven.ts'
+import type { BlsResult } from '../src/bls.ts'
 
 /**
  * @description Deterministic PRNG (mulberry32) so test data is stable

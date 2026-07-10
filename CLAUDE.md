@@ -48,11 +48,12 @@ src/
     StarSearch.tsx        # Header search field + suggestion dropdown
   lib/
     starCatalog.ts        # Catalog client (calls /api/stars; synthetic fallback)
-    anomalyDetector.ts    # Dip detection + lightcurve client (calls /api/lightcurve)
-    fitsCore.ts           # Shared low-level FITS primitives (header/HDU/column layout)
-    fitsReader.ts         # Scalar light-curve column reader (built on fitsCore)
-    tpfReader.ts          # Kepler Target Pixel File image-cube reader (built on fitsCore)
-    centroidVet.ts        # Difference-image centroid engine + gates (dependency-free)
+    anomalyDetector.ts    # App-side lightcurve client + dev synthetic generator
+                          # (re-exports the engine's detectDips/Dip for old imports)
+    bls.ts / curveClassifier.ts / oddEven.ts / secondaryEclipse.ts /
+    fitsCore.ts / fitsReader.ts / tpfReader.ts / centroidVet.ts /
+    dipDetector.ts        # ONE-LINE SHIMS re-exporting the MIT engine package
+                          # (packages/stellar-vetting-engine — see below)
     centroidClient.ts     # Browser fetch wrapper for /api/centroid
     store.ts              # Global Zustand state
     quadrants.ts          # 6×6 Kepler-field grid (A1–F6); RA/Dec ↔ quadrant id
@@ -62,9 +63,16 @@ src/
     batchClassifier.ts    # Shared runtime state + worker for the batch classify job
     selectStar.ts         # Shared "select + fly + fetch curve" flow used by clicks and search
     externalEndpoints.ts  # Single source of truth for all external URLs (routes + health check import it)
+packages/
+  stellar-vetting-engine/ # MIT-licensed extracted science engine (app is GPL;
+                          # see KNOWLEDGE_BASE §9). src/ = the 9 engine modules
+                          # + index.ts barrel (SPDX headers); tests/ = engine
+                          # unit+regression suites AND the frozen fixtures
+                          # (e2e + capture script reference these); own
+                          # package.json (tsup build → ESM+CJS+d.ts, own
+                          # npm install). NOT published to npm yet.
 scripts/
     external-health.mjs   # npm run test:external-health — live probe of the 6 external contracts
-    capture-centroid-fixtures.mjs # Refreeze the centroid ground-truth fixtures (live network)
 docs/
     KNOWLEDGE_BASE.md     # Permanent record of confirmed findings + design decisions
     DESIGN_tpf-centroid-analysis.md # TPF Phase-0 audit (measured) + phase-1 design record
@@ -580,7 +588,7 @@ the star's RA/Dec so the cone-search path has what it needs.
   WCS keywords are absent). Calibration + gate constants documented
   in-module (ground truth = `koi_dikco_msky`). Regression: 5 frozen
   fixtures in `centroidRegression.test.ts` (runs in `npm run
-  test:data`); refreeze via `scripts/capture-centroid-fixtures.mjs`
+  test:data`); refreeze via `packages/stellar-vetting-engine/scripts/capture-centroid-fixtures.mjs`
   (live network) + `--print` on the test before updating EXPECTED.
 
 ### `lib/fitsCore.ts` / `lib/fitsReader.ts` / `lib/tpfReader.ts`
@@ -1484,8 +1492,16 @@ BEFORE and AFTER touching the listed area:**
 | `StarField` selection paths / CameraSync / disambiguation popover / HUD panels | `npm run test:e2e` |
 | anything else | `npx tsc --noEmit` + verify in the browser, as always |
 
-`npm test` = `test:unit && test:data` — the fast no-browser gate
-(~5 s total), safe to run reflexively.
+`npm test` = `test:unit && test:engine` — the fast no-browser gate,
+safe to run reflexively. `test:unit` = APP unit tests
+(`src/lib/__tests__`); `test:engine` = the engine package's full suite
+(its unit tests + both data-regression suites + the architecture
+guard, run via `npm --prefix packages/stellar-vetting-engine test`);
+`test:data` delegates to the package's data-regression suites only
+(for `--print` refreezing, run inside the package:
+`cd packages/stellar-vetting-engine && node --import ./scripts/register-ts-resolver.mjs tests/centroidRegression.test.ts --print`).
+Engine tests and the frozen fixtures LIVE in the package
+(`packages/stellar-vetting-engine/tests/`).
 
 **Layer 1 — unit (`npm run test:unit`)**: `node --test` over
 `src/lib/__tests__/*.unit.test.ts`. Zero dependencies — plain Node

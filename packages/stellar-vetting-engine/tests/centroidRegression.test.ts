@@ -44,7 +44,7 @@ import {
   type CentroidQuarterInput,
   type CentroidVetResult,
   type CentroidWcs,
-} from '../centroidVet.ts'
+} from '../src/centroidVet.ts'
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures')
 const PRINT_MODE = process.argv.includes('--print')

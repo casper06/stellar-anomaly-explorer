@@ -23,9 +23,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { fileURLToPath } from 'node:url'
-import { detectDips } from '../anomalyDetector.ts'
-import { classifyCurve } from '../curveClassifier.ts'
-import { BLS_SDE_THRESHOLD } from '../bls.ts'
+import { detectDips } from '../src/dipDetector.ts'
+import { classifyCurve } from '../src/curveClassifier.ts'
+import { BLS_SDE_THRESHOLD } from '../src/bls.ts'
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures')
 

@@ -9,7 +9,7 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { runBls, BLS_SDE_THRESHOLD } from '../bls.ts'
+import { runBls, BLS_SDE_THRESHOLD } from '../src/bls.ts'
 
 /**
  * @description Deterministic PRNG (mulberry32) so test data is stable

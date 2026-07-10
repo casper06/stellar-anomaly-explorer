@@ -15,7 +15,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { gzipSync } from 'node:zlib'
-import { readTpf } from '../tpfReader.ts'
+import { readTpf } from '../src/tpfReader.ts'
 
 const BLOCK = 2880
 

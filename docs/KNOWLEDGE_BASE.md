@@ -556,8 +556,59 @@ flowchart TD
     PANEL --> ZOO & NASA & SETI
 ```
 
+## 9. Dual-license structure: GPL app + MIT engine package (2026-07-10)
+
+The core science modules were extracted into a standalone package at
+`packages/stellar-vetting-engine` (npm-ready, NOT yet published):
+`dipDetector`, `bls`, `curveClassifier`, `oddEven`, `secondaryEclipse`,
+`fitsCore`, `fitsReader`, `tpfReader`, `centroidVet`, exported through
+`src/index.ts` and built to ESM + CJS + `.d.ts` with tsup.
+
+**Licensing decision (deliberate, same copyright holder):**
+- The **app** (everything outside `packages/`) stays
+  **GPL-3.0-or-later** — it is a product, and copyleft is the intended
+  posture for it.
+- The **engine package** is **MIT** — measurement code this general
+  should be adoptable by other researchers, pipelines, and tools without
+  copyleft friction. This is the numpy/astropy/scipy pattern: the
+  scientific commons layers under permissive licenses, applications on
+  top choose their own. Fer is the sole copyright holder of both, so the
+  relicensing of the extracted subset required no third-party consent;
+  a dependency-license audit (2026-07-10) confirmed the subset imports
+  ONLY `node:` builtins — zero third-party code is being relicensed.
+- MIT code flowing INTO the GPL app is compatible (the app consumes the
+  package); the reverse direction is the one that must stay conscious:
+  moving APP code into the PACKAGE changes its license, so it's a
+  reviewed decision, enforced culturally and by the package's
+  architecture-guard test (default-deny imports; every `src/` file
+  carries an `// SPDX-License-Identifier: MIT` header).
+
+**Mechanics:**
+- The app imports the engine through one-line shims in `src/lib/`
+  (`bls.ts`, `curveClassifier.ts`, …) that `export *` from the package
+  SOURCE (`../../packages/stellar-vetting-engine/src/…`) — call sites
+  are unchanged, Next bundles the TS directly, and there is exactly one
+  source of truth. The app does NOT consume the built `dist/`.
+- `anomalyDetector.ts` was split at extraction time: `detectDips` +
+  `Dip` + the noise-guard constants moved into the package
+  (`dipDetector.ts`); the app kept the lightcurve fetch client and the
+  dev-only synthetic generator, re-exporting the detector for existing
+  imports. This retired the architecture guard's single documented
+  exception — the guard now runs with ZERO exceptions, inside the
+  package's own test suite.
+- Engine tests + the frozen real-data fixtures moved into
+  `packages/stellar-vetting-engine/tests/` (fixtures are NOT duplicated:
+  the e2e specs and the fixture-capture script reference the package's
+  copy). Root `npm test` = app unit tests + the package's full suite;
+  root `npm run test:data` delegates to the package. The package suite
+  runs standalone (`npm test` inside the package, app not running) —
+  verified, including the built dist via both ESM and CJS entry points.
+- Publish decision deferred (possibly aligned with JOSS submission).
+  The name `stellar-vetting-engine` is provisional until an npm
+  availability check at publish time.
+
 ---
 
-*Last updated 2026-07-07. When an open issue in §7 is fixed, move it to
+*Last updated 2026-07-10. When an open issue in §7 is fixed, move it to
 the relevant "FIXED" section with its root cause, and update the K00931.01
 entry (§4) once §7.1 is resolved.*

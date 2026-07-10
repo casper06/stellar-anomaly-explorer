@@ -15,7 +15,7 @@ import {
   detectDips,
   robustFluxSigma,
   DIP_NOISE_GATE_SIGMA,
-} from '../anomalyDetector.ts'
+} from '../src/dipDetector.ts'
 
 /**
  * @description Deterministic PRNG (mulberry32) so test data is stable

@@ -12,7 +12,7 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { readMastLightcurveColumns } from '../fitsReader.ts'
+import { readMastLightcurveColumns } from '../src/fitsReader.ts'
 
 const BLOCK = 2880
 
