@@ -10,13 +10,18 @@
  * the plain-Node health-check harness can import it without pulling in the
  * Next.js server bundle.
  *
- * Five external dependencies are represented, matching the five health
+ * Six external contracts are represented, matching the six health
  * checks:
  *   1. VizieR (Hipparcos catalog)                → `VIZIER_HIP_URL`
  *   2. NASA Exoplanet Archive KOI (Kepler)       → `KOI_TAP_URL`
  *   3. NASA Exoplanet Archive TOI (TESS)         → `TOI_TAP_URL`
  *   4. MAST VO-TAP obscore (segment discovery)   → `mastTapQueryUrl()`
  *   5. MAST archive FITS download (segment data) → resolved from a TAP row
+ *   6. TESS TPF URL derivation                   → `deriveTessTpfUrl()`
+ *      — used by /api/centroid's TESS path (obscore doesn't list TESS
+ *      `_tp.fits`; the URL is derived from the `-s_lc.fits` listing).
+ *      Monitored since BEFORE the TESS path shipped, per the
+ *      never-build-on-an-unwatched-assumption rule.
  */
 
 /**
@@ -170,3 +175,36 @@ export function resolveSegmentDownloadUrl(accessUrl: string): string {
  * (KIC 8462852) is guaranteed to have Kepler coverage.
  */
 export const MAST_HEALTH_PROBE_TARGET = 'kplr008462852'
+
+/**
+ * @description TESS target (bare TIC integer, the obscore `target_name`
+ * form) used by the health check's TPF URL-derivation probe. Tabby's Star
+ * again (TIC 185336364) — it has multiple 2-min-cadence sectors, so a
+ * `-s_lc.fits` row is guaranteed in the TAP listing.
+ */
+export const TESS_TPF_HEALTH_PROBE_TARGET = '185336364'
+
+/**
+ * @description Derives a TESS Target Pixel File download URL from a TESS
+ * PDC light-curve `access_url`. MAST's obscore view does NOT list TESS
+ * `_tp.fits` products (confirmed 2026-07-10 — the listing carries `_lc`,
+ * `_fast-lc` and DV rows only), but the SPOC naming convention is
+ * deterministic: the TPF shares the light curve's full stem with suffix
+ * `-s_tp.fits` instead of `-s_lc.fits`.
+ *
+ * ⚠ This is a DERIVED naming pattern, not a documented MAST contract.
+ * It is now load-bearing: /api/centroid's TESS path discovers TPFs
+ * through it (the health check watched it before the implementation
+ * landed, so a convention change surfaces in the health report, not as
+ * a silent 404 in production).
+ * @param accessUrl TAP-provided `access_url` of a TESS `-s_lc.fits` row.
+ * @returns Downloadable TPF URL via the MAST Download API, or null when
+ * the input is not a TESS 2-min PDC light-curve URL.
+ */
+export function deriveTessTpfUrl(accessUrl: string): string | null {
+  const uriMatch = accessUrl.match(/[?&]uri=([^&]+)/)
+  const inner = uriMatch ? decodeURIComponent(uriMatch[1]) : accessUrl
+  if (!inner.startsWith('mast:TESS/') || !inner.endsWith('-s_lc.fits')) return null
+  const tpUri = inner.replace(/-s_lc\.fits$/, '-s_tp.fits')
+  return `https://mast.stsci.edu/api/v0.1/Download/file?uri=${encodeURIComponent(tpUri)}`
+}

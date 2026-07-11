@@ -1,0 +1,55 @@
+{
+  "name": "stellar-vetting-engine",
+  "version": "0.1.0",
+  "description": "Portable, dependency-free transit-photometry measurement and vetting engine: FITS reading (Kepler/TESS PDC light curves + Target Pixel Files), dip detection, BLS period search, descriptive light-curve classification, odd/even depth and phase-0.5 dimming checks, and difference-image centroid vetting — calibrated against NASA Kepler DR25 ground truth.",
+  "license": "MIT",
+  "author": "Fernando Luis Conti (https://github.com/casper06)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/casper06/stellar-anomaly-explorer.git",
+    "directory": "packages/stellar-vetting-engine"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --platform node --target node18 --clean",
+    "test": "npm run test:unit && npm run test:data",
+    "test:unit": "node --import ./scripts/register-ts-resolver.mjs --test tests/*.unit.test.ts",
+    "test:data": "node --import ./scripts/register-ts-resolver.mjs tests/dataRegression.test.ts && node --import ./scripts/register-ts-resolver.mjs tests/centroidRegression.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsup": "^8",
+    "typescript": "^5"
+  },
+  "keywords": [
+    "astronomy",
+    "photometry",
+    "transit",
+    "exoplanet",
+    "kepler",
+    "tess",
+    "bls",
+    "fits",
+    "light-curve",
+    "vetting",
+    "centroid"
+  ]
+}

@@ -34,6 +34,7 @@ src/
     api/
       stars/route.ts                 # Proxies VizieR Hipparcos catalog (avoids CORS)
       lightcurve/[id]/route.ts       # Fetches & parses Kepler PDC FITS from MAST
+      centroid/[id]/route.ts         # On-demand Kepler TPF difference-image centroid vetting
       koi/route.ts                   # Proxies NASA Exoplanet Archive KOI cumulative table
       toi/route.ts                   # Proxies NASA Exoplanet Archive TOI catalog (TESS)
       pattern-cache/route.ts         # GET/POST sky-radar precomputed pattern cache
@@ -47,8 +48,13 @@ src/
     StarSearch.tsx        # Header search field + suggestion dropdown
   lib/
     starCatalog.ts        # Catalog client (calls /api/stars; synthetic fallback)
-    anomalyDetector.ts    # Dip detection + lightcurve client (calls /api/lightcurve)
-    fitsReader.ts         # Minimal FITS BINTABLE reader (server-side, no deps)
+    anomalyDetector.ts    # App-side lightcurve client + dev synthetic generator
+                          # (re-exports the engine's detectDips/Dip for old imports)
+    bls.ts / curveClassifier.ts / oddEven.ts / secondaryEclipse.ts /
+    fitsCore.ts / fitsReader.ts / tpfReader.ts / centroidVet.ts /
+    dipDetector.ts        # ONE-LINE SHIMS re-exporting the MIT engine package
+                          # (packages/stellar-vetting-engine — see below)
+    centroidClient.ts     # Browser fetch wrapper for /api/centroid
     store.ts              # Global Zustand state
     quadrants.ts          # 6×6 Kepler-field grid (A1–F6); RA/Dec ↔ quadrant id
     persistence.ts        # localStorage Set helpers (visited / flagged)
@@ -57,10 +63,19 @@ src/
     batchClassifier.ts    # Shared runtime state + worker for the batch classify job
     selectStar.ts         # Shared "select + fly + fetch curve" flow used by clicks and search
     externalEndpoints.ts  # Single source of truth for all external URLs (routes + health check import it)
+packages/
+  stellar-vetting-engine/ # MIT-licensed extracted science engine (app is GPL;
+                          # see KNOWLEDGE_BASE §9). src/ = the 9 engine modules
+                          # + index.ts barrel (SPDX headers); tests/ = engine
+                          # unit+regression suites AND the frozen fixtures
+                          # (e2e + capture script reference these); own
+                          # package.json (tsup build → ESM+CJS+d.ts, own
+                          # npm install). NOT published to npm yet.
 scripts/
-    external-health.mjs   # npm run test:external-health — live probe of the 5 external services
+    external-health.mjs   # npm run test:external-health — live probe of the 6 external contracts
 docs/
     KNOWLEDGE_BASE.md     # Permanent record of confirmed findings + design decisions
+    DESIGN_tpf-centroid-analysis.md # TPF Phase-0 audit (measured) + phase-1 design record
 ```
 
 ## UI language
@@ -129,46 +144,95 @@ For type aliases and interfaces, a single `@description` block is enough; docume
 - Click-to-select via native raycasting; opens AnomalyPanel. Dense-field disambiguation: when a click hits 2+ stars within a 6-CSS-pixel screen radius, a popover appears at the click site listing each candidate (name, ΔRA/ΔDec from the clicked sky position in arcminutes) so the user can pick the intended one. Clicking off-card dismisses without selecting.
 - Star visualization SVG (radial gradient by B-V + corona + anomaly ring)
 - Glossary tooltips (?) for MAG/RA/DEC/COLOR/DIP/SCORE/DEPTH/DURATION/BKJD
+- **In-app tutorial** (`components/Tutorial.tsx`, 2026-07-09): a
+  "? TUTORIAL" button in the HUD header (next to search) launches a
+  7-slide walkthrough — the two datasets (Kepler's fixed ~115 sq-deg
+  field vs the ESA Hipparcos whole-sky background), what the mission
+  counters count (unique KOI/TOI candidate stars, NOT rendered-star
+  totals), the data-source badges incl. PARTIAL and why partial is
+  flagged not hidden, navigation (search/click/quadrants/flagging),
+  the sky-radar tint legend, lightcurve viewer controls, and the
+  citizen-science hand-off. Never auto-opens; Esc/backdrop/SKIP
+  dismiss; re-openable; ←/→ navigate; re-open resets to slide 1.
+  Deeper than (and separate from) the first-run Onboarding overlay.
+  Gotcha encoded in the copy style: Turbopack's JSX transform drops
+  the leading space of a text node that continues onto the next
+  source line, so boundary spaces after inline elements (`</Em>`,
+  badge/dot mocks) must be explicit `{' '}`.
+- **Celestial orientation** (`lib/constellations.ts` +
+  `data/constellationZones.ts`, 2026-07-09): the HUD header readout
+  appends the constellation the camera points at ("RA … · DEC … ·
+  CYGNUS", live) and the AnomalyPanel gains a SKY row (constellation
+  of the selected star, glossary tooltip) plus a visibility line
+  ("Visible north of −46° · circumpolar above +46° · best viewed
+  around July"). Constellation lookup = IAU zone table VizieR VI/42
+  (Roman 1987; 357 rows, B1875, precedence-ordered) bundled as a
+  build-time TS constant — boundaries fixed by the IAU in 1930, never
+  change, so NO fetch/cache/health-check (unique among the app's
+  datasets); inputs precessed J2000→B1875 (IAU-1976 three-angle,
+  computed at module load). Visibility is pure declination geometry
+  (φ ∈ (δ−90°, δ+90°); circumpolar where |φ+δ| > 90°, same sign);
+  best month = RA mapped to midnight culmination via solar RA
+  (±2 weeks, hence "around"). Ground-truth unit tests: 11 known stars
+  (Tabby→Cyg, Polaris→UMi, Sirius→CMa, Spica→Vir, …) + a whole-sphere
+  sweep. Note the EPIC 201637175 seed sits in LEO (verified against
+  Spica/Regulus anchors), not Virgo as a naive RA guess suggests. The
+  zone table can't draw boundary OUTLINES — the phase-2 minimap
+  overlay needs the separate VI/49 polygon data (not bundled).
+
+- **Pixel-level centroid vetting** (phase 1 2026-07-10 Kepler-only;
+  phase 2 same day added the WCS reference + TESS): opt-in "RUN
+  PIXEL-LEVEL VETTING" card in the fullscreen overlay (below the
+  classifier readout; shown for real-data KIC/TIC targets with a
+  confident BLS signal, id matching the serving mission). Downloads
+  evenly-spread TPF segments from MAST via `/api/centroid/[id]`
+  (Kepler: 6 quarters ~15 MB; TESS: up to 4 sectors ~47 MB EACH),
+  stacks in-transit vs out-of-transit pixel stamps at the BLS
+  ephemeris, and reports the difference-image centroid offset
+  **measured against the target's CATALOG POSITION through each
+  segment's FLUX-column WCS** (NASA's `koi_dikco_msky` convention) —
+  vector-averaged across segments, error from segment scatter,
+  verdict gate = ≥3σ AND a half-pixel floor (Kepler 2″; TESS ~10″).
+  Phase-2 finding (measured, hypothesis-driven): the phase-1 ~1.8″
+  systematic was NOT frame rotation (Kepler's focal-plane symmetry
+  keeps each star's stamp orientation constant across quarters —
+  stamp-frame and sky-frame vector means are identical); it was the
+  photocenter REFERENCE, biased by crowding/truncation. The WCS
+  reference pixel (= catalog position) kills it: K01317.01
+  1.81″→0.12″ (NASA dikco 0.04″), K00931.01 1.92″→0.34″ (0.095″),
+  while the K02606.01 FP fires at 7.33″ ± 0.86 (dikco 6.889″ ±
+  0.091). The 2″ floor STAYS: clean planet K01800.01 reads 1.16″ ±
+  0.37 (dikco 0.443″), so a 1″ floor would false-alarm. Saturated
+  targets (Kp < 11.5 / Tmag < 6.8, authoritative header magnitude)
+  are REFUSED. TESS results are labeled QUALITATIVE/UNVALIDATED in
+  the UI (no public per-TOI centroid ground truth; 21″ pixels). Five
+  frozen fixtures (4 Kepler vs dikco + WASP-126 b as a TESS drift
+  pin) pin verdicts, the floor, the refusal, and the TESS path.
+  Segment downloads retry (3 attempts — 47 MB TESS files drop
+  connections routinely); `insufficient` outcomes are never cached
+  (transient artifact, observed live). Strictly on-demand: never
+  batch, never auto-run. See docs/DESIGN_tpf-centroid-analysis.md.
 
 ### Known bugs / pending 🐛
 - (none currently tracked)
 
 ### Next features 🚀
 - More Kepler/K2/TESS anomaly seeds beyond the current 11
-- **Celestial orientation / "where am I looking"**: users navigating
-  the 3D explorer have no reference for what part of the real sky a
-  given region corresponds to. Proposed: when navigating to a region,
-  show which constellation it falls in (e.g. "this is in Cygnus"), a
-  context mini-map showing that region relative to the whole sky, and
-  hemisphere visibility info (visible from the northern hemisphere at
-  X, southern at Y, or not visible at all from one of them). Likely
-  requires cross-referencing existing RA/Dec data against an IAU
-  constellation-boundaries catalog, plus visibility-by-latitude
-  logic. Future idea — not being implemented now.
-- **In-app interactive tutorial**: a button (HUD, near the search
-  bar) that launches a slide-based or similarly didactic walkthrough
-  of how to use the app itself — navigation, what the markers mean,
-  how to read the lightcurve viewer, what the REAL DATA vs
-  DEV/SYNTHETIC badges mean, and how citizen-science reporting works.
-  This is product onboarding (deeper than the current first-run
-  overlay), separate from the astronomy-content feature above. Future
-  idea — not being implemented now.
-- **Target Pixel File (TPF) centroid analysis** (opt-in, per-star,
-  on-demand ONLY): for a selected star, fetch its Kepler/TESS Target
-  Pixel File from MAST and compute the flux-weighted centroid of the
-  aperture over time. A transit on the TARGET star keeps the centroid
-  fixed; an apparent "transit" that actually comes from a background
-  eclipsing binary blended into the aperture pulls the centroid toward
-  the contaminating source during the dip. Surfacing an in-transit vs
-  out-of-transit centroid shift is the standard first-order false-
-  positive vetting test citizen scientists and the Kepler/TESS teams
-  use. Must stay OPT-IN and on-demand: TPFs are large (per-cadence
-  postage-stamp images, MB–tens of MB per quarter/sector) and computing
-  centroids is far heavier than the light-curve path, so it can't run
-  in the batch or on every selection — only when a user explicitly asks
-  for it on one star. Descriptive framing per the classifier rule (show
-  the measured centroid shift; don't assert "this is a false positive").
+- **Celestial orientation phase 2 — minimap boundary overlay**: faint
+  constellation boundary polylines on the existing sky Minimap. Phase
+  1 (labels + visibility, see "What works") shipped 2026-07-09; the
+  outline overlay needs the VI/49 boundary POLYGONS (~200 KB, the
+  zone table can't draw outlines) — separate bundling decision.
   Future idea — not being implemented now.
+- **TPF centroid vetting phase 3 — refinements**: phases 1–2 shipped
+  2026-07-10 (see "What works"; phase 2 = catalog-position/WCS
+  reference + TESS). Remaining ideas: (a) PRF-fitted difference-image
+  centroid (would approach NASA's 0.07″ dicco precision and could
+  lower the 2″ floor — the moment centroid + catalog reference is the
+  current accuracy limit); (b) per-transit bootstrap errors as a
+  cross-check on the segment-scatter error bar; (c) TESS validation
+  if a public per-TOI centroid table ever appears. Future ideas — not
+  being implemented now.
 
 ## Real-data integration
 
@@ -232,13 +296,18 @@ lightcurve route's `mastTapQueryUrl` / `mastConeSearchUrl` /
 their TAP/VizieR URLs from here.
 
 ### External-dependency health check (`npm run test:external-health`)
-Live-network probe of the 5 external services, using the exact
+Live-network probe of the 6 external contracts, using the exact
 `externalEndpoints.ts` constants. NOT part of `npm test` (which stays
 offline/fast). Each check verifies the CONTRACT, not just reachability:
 Hipparcos required columns present; KOI schema; TOI `tid` column
 present (the historical `tic_id` mistake); MAST TAP returns
 `access_url` rows; a MAST segment actually downloads as valid FITS
-(`SIMPLE  =` magic). Exit 0 = all healthy, 1 = any failure. Designed
+(`SIMPLE  =` magic); and the **TESS TPF URL derivation** — an
+UNSHIPPED contract (`-s_lc.fits` → `-s_tp.fits` naming pattern, not a
+documented MAST interface) monitored from day one so a future TESS
+pixel-vetting implementation never builds on an unwatched assumption
+(ranged GET, first FITS block magic only — never the ~47 MB sector
+file). Exit 0 = all healthy, 1 = any failure. Designed
 to catch the class of silent contract change (VizieR column rename,
 endpoint move) that degraded the app to a fallback undetected. It
 distinguishes a VizieR upstream outage ("service degraded") from a
@@ -252,12 +321,27 @@ real column-contract change so the report is actionable.
   period, depth, duration, score, ra, dec). Returns ~9,500 rows as of
   2026 — one per Kepler Object of Interest (a single star can host
   many KOIs; Kepler-90 has 8).
-- Response shape: `{ source: 'real' | 'cached' | 'unavailable', rows: KoiRow[], fetchedAt: number, error?: string }`.
-- **Disk cache** at `<os.tmpdir()>/stellar-cache/koi-catalog.json` with
-  24h TTL (vs the lightcurve route's 7-day TTL — the KOI catalog
-  changes more often). Same atomic-write pattern (temp + rename).
-- On failure returns `{ source: 'unavailable', rows: [], error }`. The
-  client surfaces this in the HUD counter as "CATALOG UNAVAILABLE"
+- Response shape: `{ source: 'real' | 'cached' | 'unavailable', rows: KoiRow[], fetchedAt: number, stale?: boolean, error?: string }`.
+  `fetchedAt` is the REAL upstream fetch time persisted in the cache
+  file (pre-2026-07-08 the route reported `Date.now()` for cached data
+  — the age was invisible and the response misleading).
+- **Disk cache + freshness (stale-while-revalidate, 2026-07-08)**:
+  `<os.tmpdir()>/stellar-cache/koi-catalog.json` via the shared
+  `lib/catalogCache.ts` helper (persists `{fetchedAt, rows}`, atomic
+  temp+rename; legacy `{rows}`-only files read as a miss — one
+  migration refetch). **TTL = 7 days** (Kepler stopped observing in
+  2013; the cumulative table sees only occasional batch disposition
+  revisions). The TTL decides when a BACKGROUND refresh fires, not
+  whether data is available: any cached copy is served immediately
+  with its true `fetchedAt`; past-TTL copies additionally carry
+  `stale: true` and trigger a deduped background TAP refetch. This
+  also fixes the old failure mode where TTL-expiry + NASA outage =
+  "CATALOG UNAVAILABLE" despite a usable copy on disk. This is
+  catalog CONTENT freshness — deliberately a separate mechanism from
+  the lightcurve/pattern-cache SCHEMA versioning (which guards our
+  own pipeline changing, not NASA's data changing).
+- On failure with NO cache returns `{ source: 'unavailable', rows: [], error }`.
+  The client surfaces this in the HUD counter as "CATALOG UNAVAILABLE"
   rather than rendering a misleading 0.
 
 ### KOI catalog merge (`fetchKOICatalog` + `mergeKoiIntoHipparcos`)
@@ -313,9 +397,12 @@ bug.
 - **Heads-up on column names**: the user-supplied spec called the
   TIC ID column `tic_id`. The actual schema uses **`tid`**. Confirmed
   live; using `tic_id` returns `ORA-00904: invalid identifier`.
-- Same response shape and disk-cache pattern as `/api/koi`
-  (24h TTL, atomic temp+rename, separate file at
-  `<os.tmpdir()>/stellar-cache/toi-catalog.json`).
+- Same response shape and stale-while-revalidate disk-cache pattern
+  as `/api/koi` (shared `lib/catalogCache.ts`; separate file at
+  `<os.tmpdir()>/stellar-cache/toi-catalog.json`) but with **TTL =
+  24 hours** — deliberately tighter than KOI's 7 days because TESS is
+  still observing: new TOIs land continuously and TFOPWG dispositions
+  get revised (PC → CP/FP).
 
 ### TOI catalog merge (`fetchTOICatalog` + `mergeToiIntoCatalog`)
 Same algorithm as KOI: dedupe by TIC id (keeping the highest-scoring
@@ -472,8 +559,48 @@ through to the route with matching query params. `StarField.selectStar`
 sets `onDemand: !/^(KIC|TIC|EPIC)\d+$/.test(id)` and always includes
 the star's RA/Dec so the cone-search path has what it needs.
 
-### `lib/fitsReader.ts`
-- Server-side only, no dependencies; ~150 lines hand-rolled FITS BINTABLE reader.
+### `/api/centroid/[id]` (pixel-level vetting, Kepler + TESS)
+- GET with required `period` / `epoch` (BKJD/TJD) / `duration` (hours)
+  query params — the confident BLS ephemeris. `KIC{N}` → Kepler,
+  `TIC{N}` → TESS; 400 `unsupported` otherwise.
+- Discovery reuses the SAME obscore TAP query as `/api/lightcurve`.
+  Kepler TPF rows are listed directly (filter `_lpd-targ.fits.gz`,
+  never short-cadence `_spd-targ`). TESS `_tp.fits` rows are NOT in
+  obscore — URLs are DERIVED from the `-s_lc.fits` listing via
+  `deriveTessTpfUrl` (the load-bearing naming contract watched by
+  health check 6). Kepler: 6 quarters; TESS: 4 sectors (~47 MB each).
+  Bounded pool of 3, 3 attempts per segment (big TESS files drop
+  connections routinely — observed live).
+- **Saturation gate order matters**: the FIRST segment is downloaded
+  alone and its header KEPMAG/TESSMAG checked (authoritative —
+  catalog magnitudes for merged KOI/TOI entries are defaults); a
+  saturated target (Kp < 11.5 / Tmag < 6.8) is refused before the
+  remaining downloads happen.
+- Disk cache `centroid-KIC*/TIC*.json` (schema v2 — v1 entries used
+  the biased photocenter reference; 30-day TTL) ALSO keyed on the
+  ephemeris: served only when period/epoch/duration match within
+  tolerance (rel 1e-3 / 0.1 d / 25%). `insufficient` results are
+  NEVER cached — they're usually transient download artifacts and
+  would otherwise stick for the TTL.
+- Engine: `lib/centroidVet.ts` (`runCentroidVet`) — offsets measured
+  against the target's catalog position through each segment's WCS
+  (`referenceFrame: 'catalog-wcs'`; photocenter fallback only when
+  WCS keywords are absent). Calibration + gate constants documented
+  in-module (ground truth = `koi_dikco_msky`). Regression: 5 frozen
+  fixtures in `centroidRegression.test.ts` (runs in `npm run
+  test:data`); refreeze via `packages/stellar-vetting-engine/scripts/capture-centroid-fixtures.mjs`
+  (live network) + `--print` on the test before updating EXPECTED.
+
+### `lib/fitsCore.ts` / `lib/fitsReader.ts` / `lib/tpfReader.ts`
+- `fitsCore.ts` holds the shared low-level primitives (2880-byte block +
+  header parsing, HDU walking with data-size arithmetic, BINTABLE
+  column layout incl. TDIM, the TFORM type table). Extracted from
+  `fitsReader.ts` when TPF support landed — the image-cube reader
+  needed ~65 of its ~150 lines verbatim. `fitsReader` keeps the
+  scalar two-column extraction; `tpfReader.readKeplerTpf` reads the
+  Kepler `_lpd-targ.fits.gz` pixel product (gunzip + TDIM-shaped FLUX
+  array column + APERTURE bitmask image + KEPMAG/QUARTER metadata).
+- Server-side only, no dependencies.
 - Supports the types Kepler AND TESS PDC files use (`D`, `E`, `J`, `I`).
   Both mission products share the same HDU layout, the same BINTABLE
   structure, and the same `TIME` / `PDCSAP_FLUX` column names —
@@ -491,6 +618,27 @@ PDC data. Depth is intentionally uncapped within the formula so a single
 deep transit can carry the whole score on its own.
 
 - `threshold` default: **0.990** — catches sub-1% dips.
+- **High-noise guard (2026-07-07, the TOI 5523.02 fix)**: the fixed
+  0.990 threshold was calibrated for Kepler noise (σ_rob 0.03–0.6% on
+  the frozen fixtures); on a σ≈1.6% TESS 2-min curve it sat at 0.6σ and
+  produced 12,431 noise-fragment "dips". Three measures, all constants
+  in `anomalyDetector.ts`:
+  1. **Sigma-relative floor**: when `robustFluxSigma` (1.4826×MAD) >
+     `DIP_NOISE_GATE_SIGMA = 0.0075`, the effective threshold becomes
+     `min(threshold, 1 − 3·σ_rob)` — a consistent 3σ cut. The gate sits
+     between the noisiest calibrated Kepler fixture (K01725.01, 0.575%)
+     and the pathological case (1.43%), so Kepler-domain behavior is
+     bit-identical. An ungated `min(0.990, 1−3σ)` was measured and
+     REJECTED: it drifts K01725.01 (53→0 dips) and K01317.01 (461→411).
+  2. **Fragmentation merge**: runs separated by < `DIP_MERGE_GAP_DAYS =
+     0.01` merge into one dip.
+  3. **Min duration**: dips shorter than `MIN_DIP_DURATION_DAYS = 0.02`
+     are dropped. Both time guards are structural no-ops at Kepler's
+     30-min cadence (one sample spans 0.0204 d) — active only on
+     high-cadence data.
+  Detection-sensitivity calibration, not a realness claim: "dip" now
+  means the same statistical thing (≥3σ, sustained) across missions.
+  TOI 5523.02: 12,431 → 20 dips; all 7 Kepler fixtures unchanged.
 - Score formula: `depth * 3 + min(sigma / 8, 0.3) + asymmetry * 0.1`,
   clamped to `[0, 1]`. A 20% dip alone contributes 0.60 from the depth
   term (= WOW threshold). Sigma and asymmetry add headroom for clean,
@@ -1176,7 +1324,7 @@ K02357.01 at P=2.4210 d / 157 ppm, matching NASA to 5e-5).
 
 `bestFitPeriodDays` is sourced from BLS and surfaced only when the
 label is `PERIODIC_UNIFORM` (anywhere else a period would contradict
-the label). `CLASSIFIER_VERSION` (currently 2) must be bumped on any
+the label). `CLASSIFIER_VERSION` (currently 3) must be bumped on any
 change that can alter LABELS — pattern-cache entries record it, and
 the batch treats old-version entries as missing (re-classifies).
 Purely additive `CurveProfile` fields that never feed `pickPattern`
@@ -1283,7 +1431,7 @@ the readout returns null in that case.
 
 ### Data regression test (`npm run test:data`)
 `src/lib/__tests__/dataRegression.test.ts` runs `detectDips` +
-`classifyCurve` against seven frozen real-data fixtures
+`classifyCurve` against eight frozen real-data fixtures
 (`src/lib/__tests__/fixtures/*.json.gz`, gzipped MAST Kepler PDC
 curves captured 2026-07-02/03 and 2026-07-06) and compares to
 hand-verified expected values (dip count, pattern label, top-dip
@@ -1338,13 +1486,22 @@ BEFORE and AFTER touching the listed area:**
 
 | Touching | Run |
 |---|---|
-| `anomalyDetector` / `curveClassifier` / `fitsReader` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
+| `anomalyDetector` / `curveClassifier` / `fitsReader` / `fitsCore` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
+| `tpfReader` / `centroidVet` / `/api/centroid` | `npm run test:data` + `npm run test:unit` (centroid fixtures live in test:data) |
 | `selectStar` / `store` / `persistence` | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
 | `StarField` selection paths / CameraSync / disambiguation popover / HUD panels | `npm run test:e2e` |
 | anything else | `npx tsc --noEmit` + verify in the browser, as always |
 
-`npm test` = `test:unit && test:data` — the fast no-browser gate
-(~5 s total), safe to run reflexively.
+`npm test` = `test:unit && test:engine` — the fast no-browser gate,
+safe to run reflexively. `test:unit` = APP unit tests
+(`src/lib/__tests__`); `test:engine` = the engine package's full suite
+(its unit tests + both data-regression suites + the architecture
+guard, run via `npm --prefix packages/stellar-vetting-engine test`);
+`test:data` delegates to the package's data-regression suites only
+(for `--print` refreezing, run inside the package:
+`cd packages/stellar-vetting-engine && node --import ./scripts/register-ts-resolver.mjs tests/centroidRegression.test.ts --print`).
+Engine tests and the frozen fixtures LIVE in the package
+(`packages/stellar-vetting-engine/tests/`).
 
 **Layer 1 — unit (`npm run test:unit`)**: `node --test` over
 `src/lib/__tests__/*.unit.test.ts`. Zero dependencies — plain Node

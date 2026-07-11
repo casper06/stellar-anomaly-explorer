@@ -400,7 +400,46 @@ data (N/M quarters)" in the UI.
 
 ### 7.2 TOI 5523.02 — chart renders as solid blocks (12,431 dips)
 
-**Root-caused 2026-07-07** (fix still open). The original CVZ
+**FIXED 2026-07-07** (same day as the root-cause below). Fix: (1) a
+sigma-relative threshold floor — when `robustFluxSigma` (1.4826×MAD)
+exceeds `DIP_NOISE_GATE_SIGMA = 0.0075`, the in-dip cut becomes
+`min(0.990, 1 − 3σ_rob)`; the gate sits between the noisiest calibrated
+Kepler fixture (K01725.01, σ_rob 0.575%) and this star (1.43%), chosen
+by a measured sweep that showed the UNGATED form drifts two Kepler
+fixtures (K01725.01 53→0, K01317.01 461→411) — the gate preserves all 7
+bit-identically. (2) Fragmentation merge (`DIP_MERGE_GAP_DAYS = 0.01`)
+and (3) min duration (`MIN_DIP_DURATION_DAYS = 0.02`) — both structural
+no-ops at Kepler's 30-min cadence, active at TESS 2-min. Result:
+TOI 5523.02 = 12,431 → **20 dips** (≥3σ sustained excursions, deepest
+8.5%), frozen as the 8th regression fixture; the dip-marker blocks in
+the chart are gone (the white per-sector noise envelope remains — that
+part is a faithful rendering of σ=1.6% data, per the diagnosis).
+`CLASSIFIER_VERSION` bumped 2→3 (dip count feeds the SPARSE gate, so
+high-noise stars' labels can change); the pattern cache needs a
+re-batch to refresh v2 entries. Original diagnosis kept below.
+
+**v3 re-batch completed 2026-07-08**: 10,931/10,931 processed, 0
+errors, 8,759 v3 entries (18 stragglers kept at old versions — their
+refetch returned no-data/partial; next batch retries). Distribution
+v2 → v3: SPARSE 4,331→5,785 (+1,454), UNCERTAIN 2,032→904 (−1,128),
+PERIODIC_UNIFORM 1,620→1,172 (−448), IRREGULAR 370→612 (+242),
+HIGH_VARIABILITY 416→286 (−130). Direction matches the fix: noise
+dips vanish, so flicker-driven UNCERTAIN collapses into SPARSE, and
+PERIODIC_UNIFORM promotions that rested on noise "visible dips" drop
+to SPARSE (their BLS line still shows). Caveat: the v2 batch ran on
+potentially-truncated pre-concurrency-fix curves while v3 ran on
+complete ones, so the shift conflates detector calibration with data
+completeness — not decomposable without a per-star diff, which the
+overwritten v2 labels no longer allow. Operational note: the batch
+run surfaced that Next dev auto-restarts on a memory threshold
+(~every 4k stars — the lightcurve L1 Map grows unboundedly under
+batch load); a 5-min watchdog that re-POSTs on worker death carried
+the run to completion across two auto-restarts. The unbounded L1
+was FIXED 2026-07-08: it is now a 40-entry LRU (`lib/lruCache.ts`),
+bounding L1 at ~80 MB worst-case while keeping the on-demand
+repeated-access benefit.
+
+**Root-caused 2026-07-07**. The original CVZ
 hypothesis was WRONG: TIC 443616612 is an ordinary 5-sector TESS
 target near the ecliptic (Dec −3.98°), 78,198 samples at 2-min
 cadence, fetched complete (5/5). Measured diagnosis:
@@ -517,8 +556,59 @@ flowchart TD
     PANEL --> ZOO & NASA & SETI
 ```
 
+## 9. Dual-license structure: GPL app + MIT engine package (2026-07-10)
+
+The core science modules were extracted into a standalone package at
+`packages/stellar-vetting-engine` (npm-ready, NOT yet published):
+`dipDetector`, `bls`, `curveClassifier`, `oddEven`, `secondaryEclipse`,
+`fitsCore`, `fitsReader`, `tpfReader`, `centroidVet`, exported through
+`src/index.ts` and built to ESM + CJS + `.d.ts` with tsup.
+
+**Licensing decision (deliberate, same copyright holder):**
+- The **app** (everything outside `packages/`) stays
+  **GPL-3.0-or-later** — it is a product, and copyleft is the intended
+  posture for it.
+- The **engine package** is **MIT** — measurement code this general
+  should be adoptable by other researchers, pipelines, and tools without
+  copyleft friction. This is the numpy/astropy/scipy pattern: the
+  scientific commons layers under permissive licenses, applications on
+  top choose their own. Fer is the sole copyright holder of both, so the
+  relicensing of the extracted subset required no third-party consent;
+  a dependency-license audit (2026-07-10) confirmed the subset imports
+  ONLY `node:` builtins — zero third-party code is being relicensed.
+- MIT code flowing INTO the GPL app is compatible (the app consumes the
+  package); the reverse direction is the one that must stay conscious:
+  moving APP code into the PACKAGE changes its license, so it's a
+  reviewed decision, enforced culturally and by the package's
+  architecture-guard test (default-deny imports; every `src/` file
+  carries an `// SPDX-License-Identifier: MIT` header).
+
+**Mechanics:**
+- The app imports the engine through one-line shims in `src/lib/`
+  (`bls.ts`, `curveClassifier.ts`, …) that `export *` from the package
+  SOURCE (`../../packages/stellar-vetting-engine/src/…`) — call sites
+  are unchanged, Next bundles the TS directly, and there is exactly one
+  source of truth. The app does NOT consume the built `dist/`.
+- `anomalyDetector.ts` was split at extraction time: `detectDips` +
+  `Dip` + the noise-guard constants moved into the package
+  (`dipDetector.ts`); the app kept the lightcurve fetch client and the
+  dev-only synthetic generator, re-exporting the detector for existing
+  imports. This retired the architecture guard's single documented
+  exception — the guard now runs with ZERO exceptions, inside the
+  package's own test suite.
+- Engine tests + the frozen real-data fixtures moved into
+  `packages/stellar-vetting-engine/tests/` (fixtures are NOT duplicated:
+  the e2e specs and the fixture-capture script reference the package's
+  copy). Root `npm test` = app unit tests + the package's full suite;
+  root `npm run test:data` delegates to the package. The package suite
+  runs standalone (`npm test` inside the package, app not running) —
+  verified, including the built dist via both ESM and CJS entry points.
+- Publish decision deferred (possibly aligned with JOSS submission).
+  The name `stellar-vetting-engine` is provisional until an npm
+  availability check at publish time.
+
 ---
 
-*Last updated 2026-07-07. When an open issue in §7 is fixed, move it to
+*Last updated 2026-07-10. When an open issue in §7 is fixed, move it to
 the relevant "FIXED" section with its root cause, and update the K00931.01
 entry (§4) once §7.1 is resolved.*

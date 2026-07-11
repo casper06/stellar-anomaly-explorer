@@ -20,7 +20,7 @@ import { openAppWithCatalog, panelName, searchPick } from './helpers'
 
 /** @description Loads a gzipped repo fixture and wraps it as a route payload. */
 function fixturePayload(kicId: string): string {
-  const file = path.join(__dirname, '..', 'src', 'lib', '__tests__', 'fixtures', `${kicId}.json.gz`)
+  const file = path.join(__dirname, '..', 'packages', 'stellar-vetting-engine', 'tests', 'fixtures', `${kicId}.json.gz`)
   const { times, flux } = JSON.parse(zlib.gunzipSync(fs.readFileSync(file)).toString('utf8')) as {
     times: number[]
     flux: number[]

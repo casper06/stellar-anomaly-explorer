@@ -1,6 +1,6 @@
 /**
- * @description External-dependency health check. Probes the FIVE external
- * services the app relies on, using the EXACT endpoint constants and
+ * @description External-dependency health check. Probes the SIX external
+ * contracts the app relies on, using the EXACT endpoint constants and
  * URL builders the production API routes use (imported from
  * `src/lib/externalEndpoints.ts`), so a contract change at any provider —
  * an endpoint move, a renamed column, a schema change — surfaces here
@@ -8,15 +8,19 @@
  *
  * Run with `npm run test:external-health`. This hits the live network and
  * is intentionally NOT part of `npm test` (which must stay offline and
- * fast). Exit code 0 = all five healthy; 1 = one or more failed.
+ * fast). Exit code 0 = all six healthy; 1 = one or more failed.
  *
- * The five checks (one per external dependency, matching the five
- * exported endpoint groups):
+ * The six checks:
  *   1. VizieR (Hipparcos catalog)              — /api/stars
  *   2. NASA Exoplanet Archive KOI (Kepler)     — /api/koi
  *   3. NASA Exoplanet Archive TOI (TESS)       — /api/toi
- *   4. MAST VO-TAP obscore (segment discovery) — /api/lightcurve
+ *   4. MAST VO-TAP obscore (segment discovery) — /api/lightcurve, /api/centroid
  *   5. MAST archive FITS download (segment)    — /api/lightcurve
+ *   6. TESS TPF URL derivation                 — /api/centroid (TESS
+ *      path). The TPF URL is a derived naming pattern (`-s_lc.fits` →
+ *      `-s_tp.fits`), not a documented MAST contract; it was monitored
+ *      here BEFORE the TESS implementation landed and is load-bearing
+ *      now.
  *
  * Each check verifies not just "reachable" but "still shaped how we
  * parse it" — the Hipparcos required columns, the `tid` TOI column, an
@@ -32,6 +36,8 @@ import {
   mastTapQueryUrl,
   resolveSegmentDownloadUrl,
   MAST_HEALTH_PROBE_TARGET,
+  TESS_TPF_HEALTH_PROBE_TARGET,
+  deriveTessTpfUrl,
 } from '../src/lib/externalEndpoints.ts'
 
 /** @description Per-check network timeout. Some of these services are slow cold. */
@@ -172,12 +178,49 @@ async function checkMastDownload() {
 }
 
 /**
- * @description Runs all five checks in order (checks 4→5 are dependent,
+ * @description Check 6 — TESS TPF URL derivation (load-bearing for
+ * /api/centroid's TESS path). Queries the TESS collection for a
+ * known 2-min target, takes the first `-s_lc.fits` access_url, derives
+ * the `_tp.fits` URL via the shared `deriveTessTpfUrl`, and confirms the
+ * derived file EXISTS and is FITS — via a ranged GET (a full sector TPF
+ * is ~47 MB; we only need the first block's magic bytes). Handles servers
+ * that ignore Range by reading just the first chunk and cancelling.
+ */
+async function checkTessTpfDerivation() {
+  const res = await get(mastTapQueryUrl('TESS', TESS_TPF_HEALTH_PROBE_TARGET))
+  const json = await res.json()
+  const cols = (json.info ?? []).map(c => c.name)
+  const iurl = cols.indexOf('access_url')
+  if (iurl < 0) throw new Error(`TESS TAP response missing 'access_url'; columns: [${cols.join(', ')}]`)
+  const lcRow = (json.data ?? []).map(r => String(r[iurl] ?? '')).find(u => deriveTessTpfUrl(u) !== null)
+  if (!lcRow) throw new Error(`no -s_lc.fits row for TIC ${TESS_TPF_HEALTH_PROBE_TARGET} to derive from`)
+  const tpUrl = deriveTessTpfUrl(lcRow)
+  const tpRes = await fetch(tpUrl, {
+    headers: { Range: 'bytes=0-2879' },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  })
+  if (!tpRes.ok) throw new Error(`derived TPF URL → HTTP ${tpRes.status} (naming convention may have changed)`)
+  // Read only the first chunk; a 200 (Range ignored) would otherwise pull ~47 MB.
+  const reader = tpRes.body.getReader()
+  let first = Buffer.alloc(0)
+  while (first.length < 9) {
+    const { done, value } = await reader.read()
+    if (done) break
+    first = Buffer.concat([first, Buffer.from(value)])
+  }
+  await reader.cancel().catch(() => {})
+  const magic = first.subarray(0, 9).toString('ascii')
+  if (magic !== 'SIMPLE  =') throw new Error(`derived TPF is not FITS (first 9 bytes: ${JSON.stringify(magic)})`)
+  return `derivation OK (${lcRow.split('/').pop().replace(/^.*uri=/, '')} → _tp.fits exists, HTTP ${tpRes.status})`
+}
+
+/**
+ * @description Runs all six checks in order (checks 4→5 are dependent,
  * the rest independent), prints an aligned report, and exits non-zero if
  * any failed.
  */
 async function main() {
-  console.log('External dependency health check — probing 5 live services\n')
+  console.log('External dependency health check — probing 6 live contracts\n')
   const results = []
   // Independent checks first, in parallel.
   const [vizier, koi, toi] = await Promise.all([
@@ -190,6 +233,7 @@ async function main() {
   const mastTap = await runCheck('MAST VO-TAP (discovery)', checkMastTap)
   results.push(mastTap)
   results.push(await runCheck('MAST FITS download', checkMastDownload))
+  results.push(await runCheck('TESS TPF URL derivation', checkTessTpfDerivation))
 
   const nameW = Math.max(...results.map(r => r.name.length))
   for (const r of results) {
@@ -199,7 +243,7 @@ async function main() {
   const failed = results.filter(r => !r.ok)
   console.log('')
   if (failed.length === 0) {
-    console.log(`All ${results.length} external dependencies healthy.`)
+    console.log(`All ${results.length} external contracts healthy.`)
     process.exit(0)
   } else {
     console.log(`${failed.length}/${results.length} checks FAILED: ${failed.map(f => f.name).join(', ')}`)

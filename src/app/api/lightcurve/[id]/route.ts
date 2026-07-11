@@ -20,6 +20,7 @@ import {
   type SegmentResult,
   type SegmentPoolConfig,
 } from '@/lib/segmentDownloadPool'
+import { LruCache } from '@/lib/lruCache'
 
 /**
  * @description Recommended canvas-line gap-break threshold (in days) per
@@ -32,11 +33,23 @@ const GAP_DAYS_KEPLER = 5
 const GAP_DAYS_TESS = 2
 
 /**
- * @description Cache successful real fetches for the lifetime of the server
- * process. L1 cache — instant, but lost on restart. The L2 disk cache
- * below survives restarts.
+ * @description Maximum entries in the L1 in-process cache. Each entry is
+ * a full-mission curve (~1–2 MB of arrays), so 40 bounds L1 at roughly
+ * 80 MB worst-case. Sized for the on-demand path (a user flipping among
+ * recently viewed stars); the batch's linear scan just cycles the window
+ * — it never benefited from L1 anyway (each star is fetched once), and
+ * unbounded growth under batch load is what drove Next.js dev into its
+ * memory-threshold auto-restarts (KNOWLEDGE_BASE, 2026-07-08).
  */
-const cache = new Map<string, CachedCurve>()
+const L1_MAX_ENTRIES = 40
+
+/**
+ * @description Cache successful real fetches for the lifetime of the server
+ * process. L1 cache — instant, but lost on restart; bounded LRU so batch
+ * runs can't grow it without limit. The L2 disk cache below survives
+ * restarts and is the real persistence layer.
+ */
+const cache = new LruCache<CachedCurve>(L1_MAX_ENTRIES)
 
 /**
  * @description In-memory / on-disk light-curve payload plus segment

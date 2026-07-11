@@ -43,3 +43,7 @@ next-env.d.ts
 # Playwright transient output
 /test-results/
 /playwright-report/
+
+# extracted engine package (own install + build output)
+packages/*/node_modules/
+packages/*/dist/

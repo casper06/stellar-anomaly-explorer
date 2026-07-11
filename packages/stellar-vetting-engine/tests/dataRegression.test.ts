@@ -23,9 +23,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { fileURLToPath } from 'node:url'
-import { detectDips } from '../anomalyDetector.ts'
-import { classifyCurve } from '../curveClassifier.ts'
-import { BLS_SDE_THRESHOLD } from '../bls.ts'
+import { detectDips } from '../src/dipDetector.ts'
+import { classifyCurve } from '../src/curveClassifier.ts'
+import { BLS_SDE_THRESHOLD } from '../src/bls.ts'
 
 const FIXTURE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures')
 
@@ -126,6 +126,14 @@ const REL_DIFF_TOL = 1.5 // odd/even relative depth difference, percentage point
  *   odd/even instead). KIC12506351 shows the same complementarity at
  *   its extreme — secondary ≈ 99.6% of primary depth, odd/even 1.1σ,
  *   measured 2026-07-06 — but was not frozen, to keep the repo lean.
+ * - TIC443616612 (TOI 5523.02, added 2026-07-07 for the high-noise
+ *   detector calibration): the σ≈1.6% TESS 2-min pathological case that
+ *   produced 12,431 noise "dips" under the fixed threshold (see
+ *   KNOWLEDGE_BASE §7.2). With the sigma-relative floor + fragmentation
+ *   guards the count must be 20 (≥3σ sustained excursions of the red
+ *   noise, deepest 8.5%) and the label HIGH_VARIABILITY. Also pins the
+ *   guards' Kepler no-op property in reverse: this fixture drifting back
+ *   toward thousands means the noise gate broke. Times are TJD.
  * - KIC10666592 (K00002.01 = HAT-P-7b, added 2026-07-06): CONFIRMED
  *   hot Jupiter carrying MOD_SEC + PLANET_OCCULT flags — the
  *   real-planetary-occultation edge case. The check must DETECT the
@@ -247,6 +255,20 @@ const EXPECTED: Expectation[] = [
     secondaryVerdict: 'DETECTED', // PLANET_OCCULT ground truth — real planetary occultation
     secondaryDepthPpm: 59,
     secondaryDepthTolPpm: 20,
+  },
+  {
+    id: 'TIC443616612',
+    label: 'TOI 5523.02',
+    dipCount: 20, // was 12,431 pre-fix — the sigma floor + guards working
+    pattern: 'HIGH_VARIABILITY',
+    topDipLabel: 'INTERESTING',
+    topDipPeakTime: 2553.45, // TJD (TESS), not BKJD
+    topDipDepth: 0.0846,
+    bestFitPeriodDays: null,
+    blsConfident: false,
+    nasaPeriodDays: 3.4712803, // the KP planet — genuinely below detectability in this noise
+    oddEvenVerdict: null,
+    secondaryVerdict: null,
   },
 ]
 

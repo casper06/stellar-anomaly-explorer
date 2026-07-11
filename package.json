@@ -8,9 +8,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "npm run test:unit && npm run test:data",
+    "test": "npm run test:unit && npm run test:engine",
     "test:unit": "node --import ./scripts/register-ts-resolver.mjs --test src/lib/__tests__/*.unit.test.ts",
-    "test:data": "node --import ./scripts/register-ts-resolver.mjs src/lib/__tests__/dataRegression.test.ts",
+    "test:engine": "npm --prefix packages/stellar-vetting-engine test",
+    "test:data": "npm --prefix packages/stellar-vetting-engine run test:data",
     "test:external-health": "node --import ./scripts/register-ts-resolver.mjs scripts/external-health.mjs",
     "test:e2e": "playwright test"
   },

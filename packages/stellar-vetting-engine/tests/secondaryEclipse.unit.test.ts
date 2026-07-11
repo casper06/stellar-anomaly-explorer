@@ -16,8 +16,8 @@ import {
   measureSecondaryEclipse,
   SECONDARY_SIGMA_THRESHOLD,
   MIN_CYCLES,
-} from '../secondaryEclipse.ts'
-import type { BlsResult } from '../bls.ts'
+} from '../src/secondaryEclipse.ts'
+import type { BlsResult } from '../src/bls.ts'
 
 /**
  * @description Deterministic PRNG (mulberry32) so test data is stable

@@ -1,120 +1,20 @@
 /**
- * @description One detected dip in a light curve, with everything needed to render it on
- * the curve chart and to summarize it in the side panel. Index fields point
- * into the original flux/times arrays; time fields are precomputed for
- * convenience.
+ * @description App-side lightcurve CLIENT: fetches curves from our
+ * `/api/lightcurve/[id]` route, carries the provenance labels, and holds
+ * the dev-only synthetic generator. The dip DETECTOR itself (detectDips,
+ * Dip, the noise-guard constants) lives in the extracted MIT engine
+ * package (`packages/stellar-vetting-engine`, via the `./dipDetector`
+ * shim) — this module re-exports it so existing app imports keep working.
  */
-export interface Dip {
-  startIdx: number
-  endIdx: number
-  minIdx: number
-  startTime: number
-  endTime: number
-  peakTime: number
-  minFlux: number
-  depth: number
-  duration: number
-  asymmetry: number
-  score: number
-  label: 'NORMAL' | 'NOTABLE' | 'INTERESTING' | 'WOW'
-}
-
-/**
- * @description Scans a normalized flux time series for dips (sustained drops below a
- * fraction of mean flux) and scores each one by depth, sigma above noise,
- * asymmetry between pre/post baselines, and duration. Returns dips sorted
- * by score (highest first) so the panel can show the most notable events
- * up top.
- *
- * Weights and label thresholds were recalibrated against real Kepler PDC
- * data — the prior tuning was set for the noisier synthetic generator and
- * under-scored truly anomalous events (a 20% dip in Tabby's Star scored
- * NOTABLE instead of WOW). The new tuning weights depth more heavily and
- * shifts the label cutoffs down so real-world dips land in the right bin.
- * @param flux Sampled flux values. NaN/null entries are skipped silently.
- * @param times Timestamps matched 1:1 with `flux` (typically BKJD).
- * @param threshold Normalized-flux cutoff that defines "in a dip" (default 0.990 = 1.0% below mean).
- * @returns Detected dips sorted by descending score.
- */
-export function detectDips(flux: number[], times: number[], threshold = 0.990): Dip[] {
-  if (!flux || flux.length === 0) return []
-
-  const validFlux = flux.filter(f => !isNaN(f) && f !== null)
-  const avgFlux = validFlux.reduce((a, b) => a + b, 0) / validFlux.length
-  const variance = validFlux.reduce((a, b) => a + (b - avgFlux) ** 2, 0) / validFlux.length
-  const stdFlux = Math.sqrt(variance)
-
-  const dips: Dip[] = []
-  let inDip = false
-  let dipStart = 0
-  let dipMin = avgFlux
-  let dipMinIdx = 0
-
-  for (let i = 0; i < flux.length; i++) {
-    if (flux[i] === null || isNaN(flux[i])) continue
-    const norm = flux[i] / avgFlux
-
-    if (norm < threshold && !inDip) {
-      inDip = true
-      dipStart = i
-      dipMin = flux[i]
-      dipMinIdx = i
-    } else if (inDip) {
-      if (flux[i] < dipMin) { dipMin = flux[i]; dipMinIdx = i }
-      if (norm >= threshold || i === flux.length - 1) {
-        const dipEnd = i
-        const duration = times[dipEnd] - times[dipStart]
-        const fluxBefore = flux
-          .slice(Math.max(0, dipStart - 5), dipStart)
-          .filter(f => f !== null && !isNaN(f))
-        const fluxAfter = flux
-          .slice(dipEnd, Math.min(flux.length, dipEnd + 5))
-          .filter(f => f !== null && !isNaN(f))
-        const avgBefore = fluxBefore.length
-          ? fluxBefore.reduce((a, b) => a + b, 0) / fluxBefore.length
-          : avgFlux
-        const avgAfter = fluxAfter.length
-          ? fluxAfter.reduce((a, b) => a + b, 0) / fluxAfter.length
-          : avgFlux
-        const asymmetry = Math.abs(avgBefore - avgAfter) / avgFlux
-        const depth = (avgFlux - dipMin) / avgFlux
-        const sigma = (avgFlux - dipMin) / (stdFlux || 1)
-        // Depth is no longer pre-weighted to <1; a 20% dip alone (depth=0.20)
-        // contributes 0.60 to the raw score, which on its own is enough to
-        // land at WOW. Sigma and asymmetry add headroom for cases where the
-        // dip is also statistically clean / unusually asymmetric. Final
-        // score is clamped to 1 by `Math.min` below.
-        const rawScore =
-          depth * 3 +
-          Math.min(sigma / 8, 0.3) +
-          asymmetry * 0.1
-        const score = Math.min(rawScore, 1)
-        const label =
-          score >= 0.60 ? 'WOW'
-          : score >= 0.40 ? 'INTERESTING'
-          : score >= 0.20 ? 'NOTABLE'
-          : 'NORMAL'
-
-        dips.push({
-          startIdx: dipStart,
-          endIdx: dipEnd,
-          minIdx: dipMinIdx,
-          startTime: times[dipStart],
-          endTime: times[dipEnd],
-          peakTime: times[dipMinIdx],
-          minFlux: dipMin,
-          depth,
-          duration,
-          asymmetry,
-          score,
-          label,
-        })
-        inDip = false
-      }
-    }
-  }
-  return dips.sort((a, b) => b.score - a.score)
-}
+export {
+  detectDips,
+  robustFluxSigma,
+  DIP_NOISE_SIGMA_K,
+  DIP_NOISE_GATE_SIGMA,
+  DIP_MERGE_GAP_DAYS,
+  MIN_DIP_DURATION_DAYS,
+  type Dip,
+} from './dipDetector'
 
 /**
  * @description Provenance of a fetched light curve.
