@@ -11,15 +11,18 @@ Navigate freely through a WebGL sky built from real astronomical catalogs. The s
 
 ## What it does
 
-- **Real star field** — ~8,000 stars from the Hipparcos catalog, rendered as GPU points with true B–V colors (blue = hot, red = cool).
+- **Real star field** — the full ~118,000-star Hipparcos main catalog (all-sky, no magnitude ceiling), rendered as a single GPU point cloud with true B–V colors (blue = hot, red = cool) and magnitude-driven size and brightness.
 - **Anomaly markers from two missions** — ~9,500 Kepler Objects of Interest and TESS Objects of Interest plotted with per-mission color themes, plus 11 hand-curated famous anomalies (Tabby's Star, the disintegrating-planet candidate KIC 12557548, …).
 - **On-demand light curves from MAST** — click any star and the app fetches its actual Kepler quarters or TESS sectors, stitches them, and runs dip detection. Works even for background stars via positional cone search: real data or an honest "not observed", never a fake curve.
 - **Interactive light curve viewer** — fullscreen chart with zoom/pan, dip inspection, LTTB downsampling of ~60k-sample curves, cosmic-ray filtering that never clips real transits, and per-dip provenance ("Source: NASA/MAST · Kepler · PDCSAP flux").
 - **Curve classification** — measures periodicity, depth consistency, dip shape, and baseline noise, then labels the *pattern* (PERIODIC_UNIFORM / IRREGULAR / HIGH_VARIABILITY / …). It describes what the data looks like; it never claims what causes it.
 - **Quadrant navigation & progress** — a 6×6 grid over the Kepler field with per-quadrant anomaly/visited/flagged counts, persistent bookmarks, and a global "explored" progress bar.
 - **Sky radar** — a background batch classifier pre-computes pattern labels for the whole catalog and tints the markers, so you can see at a glance which stars are worth a closer look before opening a single curve.
+- **Pixel-level vetting** — for confident transit signals, an opt-in difference-image centroid check downloads the raw target-pixel data and measures whether the dimming is centered on the target star or a nearby contaminant, following NASA's centroid-offset convention.
+- **Celestial orientation** — the HUD names the constellation you're pointing at ("…you're looking at Cygnus"), and each selected star shows its constellation plus a hemisphere-visibility line ("visible north of −46°, best viewed around July").
+- **In-app tutorial** — a guided walkthrough of the two datasets, the mission counters, the data-source badges, navigation, and the citizen-science hand-off, separate from the first-run onboarding overlay.
 
-Planned (not yet implemented): constellation identification ("you're looking at Cygnus"), hemisphere-visibility info, an in-app tutorial, and more curated anomaly seeds. See `CLAUDE.md → Next features` for the working list.
+Planned (not yet implemented): constellation boundary outlines on the minimap and more curated anomaly seeds. See `CLAUDE.md → Next features` for the working list.
 
 ## Tech stack
 
