@@ -142,8 +142,10 @@ export function detectDips(flux: number[], times: number[], threshold = 0.990): 
   const runs: Array<{ startIdx: number; endIdx: number }> = []
   let inDip = false
   let dipStart = 0
+  let lastValidIdx = -1
   for (let i = 0; i < flux.length; i++) {
     if (flux[i] === null || isNaN(flux[i])) continue
+    lastValidIdx = i
     const norm = flux[i] / avgFlux
     if (norm < effThreshold && !inDip) {
       inDip = true
@@ -152,6 +154,14 @@ export function detectDips(flux: number[], times: number[], threshold = 0.990): 
       runs.push({ startIdx: dipStart, endIdx: i })
       inDip = false
     }
+  }
+  // Force-close a run still open when the loop ends. The in-loop
+  // `i === flux.length - 1` closure only fires when the LAST sample is
+  // finite — a null/NaN at the final index is skipped by the `continue`
+  // above, so a dip still in progress when the curve ends in invalid data
+  // would otherwise be silently dropped. Close it at the last valid index.
+  if (inDip && lastValidIdx >= dipStart) {
+    runs.push({ startIdx: dipStart, endIdx: lastValidIdx })
   }
 
   // Pass 2 — merge runs separated by a short above-threshold gap.

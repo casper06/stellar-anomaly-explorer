@@ -20,6 +20,7 @@ export { runBls, BLS_SDE_THRESHOLD, type BlsResult } from './bls'
 
 export {
   classifyCurve,
+  pickPattern,
   CLASSIFIER_VERSION,
   type CurveProfile,
   type CurvePattern,
