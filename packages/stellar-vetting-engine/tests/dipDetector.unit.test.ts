@@ -141,6 +141,33 @@ describe('detectDips high-noise calibration', () => {
     assert.ok(Math.abs(dips[0].depth - 0.05) < 0.01, `depth ${dips[0].depth.toFixed(3)} ≈ 5%`)
   })
 
+  it('does not drop a dip still open when the curve ends in trailing NaN/null samples', () => {
+    // A real ~5-hour dip in progress at the end of the series, followed by
+    // trailing invalid samples. Kepler 30-min cadence so the min-duration
+    // and merge guards are structural no-ops. The bug: the only forced
+    // closure keyed on `i === flux.length - 1`, which the `continue` on a
+    // trailing null/NaN skips — silently losing the dip.
+    const times: number[] = []
+    const flux: (number | null)[] = []
+    let i = 0
+    for (; i < 300; i++) { times.push(100 + i * KEPLER_CADENCE); flux.push(1.0) } // baseline
+    const dipStartIdx = i
+    for (; i < 310; i++) { times.push(100 + i * KEPLER_CADENCE); flux.push(0.95) } // ~5% dip, still open at series end
+    const dipEndIdx = i - 1 // last valid (in-dip) sample
+    // Trailing invalid samples — the exact condition the in-loop closure misses.
+    for (; i < 315; i++) { times.push(100 + i * KEPLER_CADENCE); flux.push(i % 2 === 0 ? null : NaN) }
+
+    const dips = detectDips(flux as number[], times)
+    assert.equal(dips.length, 1, `the trailing dip must survive (got ${dips.length})`)
+    assert.equal(dips[0].startIdx, dipStartIdx, 'start boundary is the first in-dip sample')
+    assert.equal(
+      dips[0].endIdx,
+      dipEndIdx,
+      `end boundary is the last VALID sample (${dipEndIdx}), not a trailing NaN — got ${dips[0].endIdx}`,
+    )
+    assert.ok(Math.abs(dips[0].depth - 0.05) < 0.01, `depth ${dips[0].depth.toFixed(3)} ≈ 5%`)
+  })
+
   it('min-duration is cadence-aware: a single-sample blip drops at 2-min cadence, survives at 30-min', () => {
     for (const [cadence, expected] of [
       [TESS_CADENCE, 0],

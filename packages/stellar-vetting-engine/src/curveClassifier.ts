@@ -307,7 +307,7 @@ export function classifyCurve(times: number[], flux: number[], dips: Dip[]): Cur
  * @param scores Measured scalars plus the BLS confidence flag.
  * @returns The CurvePattern label.
  */
-function pickPattern({
+export function pickPattern({
   periodicity,
   depthConsistency,
   baselineRMS,
