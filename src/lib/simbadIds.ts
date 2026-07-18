@@ -112,6 +112,65 @@ export function parseSimbadIdsString(
 }
 
 /**
+ * @description Alternate designations worth showing the user for one
+ * star, already filtered against what the UI is displaying elsewhere.
+ * Empty `names` means there is nothing to show — the caller renders
+ * nothing at all rather than an empty block.
+ */
+export interface IdentityDisplayNames {
+  /** Common names in SIMBAD order, minus anything the panel already shows. */
+  names: string[]
+  /**
+   * @description SIMBAD's canonical designation, or null when it would be
+   * redundant. Included only when it adds information: `main_id` is often
+   * an obscure catalog entry (Tabby's Star is `TYC 3162-665-1`), which is
+   * genuinely useful cross-reference context, but repeating a name
+   * already in `names` or already in the panel header would be noise.
+   */
+  mainId: string | null
+}
+
+/**
+ * @description Picks the alternate designations to display for a star,
+ * suppressing anything the panel already shows under a different label.
+ *
+ * Pure and offline-testable, and deliberately here rather than in the
+ * component: it is identifier string munging (this module's stated
+ * scope), and the "is this name redundant?" comparison is exactly the
+ * whitespace/case-insensitive matching the rest of this file owns.
+ *
+ * Matching is case- and whitespace-insensitive so `Boyajian's star`,
+ * `BOYAJIAN'S STAR`, and `Boyajian's  Star` all count as the same name
+ * as the displayed one.
+ * @param identity Resolved SIMBAD identity.
+ * @param displayed Strings the panel already shows for this star (its
+ * catalog name and id) — these are filtered out of the result.
+ * @returns Names + optional mainId to render; `names: []` and
+ * `mainId: null` when everything was redundant.
+ */
+export function selectDisplayNames(
+  identity: SimbadIdentity,
+  displayed: string[],
+): IdentityDisplayNames {
+  const key = (s: string): string => s.replace(/\s+/g, ' ').trim().toLowerCase()
+  const taken = new Set(displayed.map(key))
+
+  const names: string[] = []
+  for (const name of identity.commonNames) {
+    const k = key(name)
+    if (taken.has(k)) continue
+    taken.add(k)
+    names.push(name)
+  }
+
+  // mainId earns its row only if it is not already shown and is not one
+  // of the common names we are about to list.
+  const mainId = taken.has(key(identity.mainId)) ? null : identity.mainId
+
+  return { names, mainId }
+}
+
+/**
  * @description Parses a full SIMBAD TAP JSON response body into a
  * `SimbadIdentity`. Locates columns by NAME from `metadata` and throws
  * on a missing column or malformed envelope (contract-change detection,

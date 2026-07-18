@@ -612,8 +612,9 @@ The core science modules were extracted into a standalone package at
 Phase B1 (investigation, 2026-07-17) measured the CDS SIMBAD TAP
 service against real queries before any code; phase B2 (2026-07-18)
 shipped the server side: `/api/identity/[id]` + `lib/simbadIds.ts` +
-health check #7 + four frozen fixtures. Everything below was MEASURED,
-not assumed from documentation.
+health check #7 + four frozen fixtures; phase B3 (2026-07-18) shipped
+the UI, mechanism (a) only (see the B3 subsection at the end of this
+§). Everything below was MEASURED, not assumed from documentation.
 
 **Service contract (all verified live):**
 - Endpoint `https://simbad.cds.unistra.fr/simbad/sim-tap/sync`, same
@@ -669,11 +670,66 @@ not assumed from documentation.
   capture provenance (date + exact URL) embedded in each file.
   Refreeze: `scripts/capture-simbad-fixtures.mjs` (throttled 1 q/s).
 
-Phase B3 (UI: alternate names in the panel, search-by-common-name) is
-designed but NOT implemented — see CLAUDE.md "Next features".
+**Phase B3 — UI integration, mechanism (a) (2026-07-18):**
+
+Shipped: the AnomalyPanel's "ALSO KNOWN AS" block and
+search-by-already-resolved-common-name. Mechanism (b) — an explicit
+press-Enter-to-ask-SIMBAD escape hatch for stars never opened — was
+deliberately deferred and remains unbuilt.
+
+- **Absence renders as nothing, not as an error.** A SIMBAD miss is
+  the COMMON case (most faint KOI hosts aren't indexed), so a
+  "not found" row would fire constantly while telling the user
+  something unactionable. Miss, route failure, and
+  everything-was-redundant all collapse to the same output: no
+  block. `identityClient.fetchIdentity` flattens the route's
+  miss-vs-outage distinction for exactly this reason — the
+  distinction is real and matters SERVER-side (a confirmed miss is
+  cached, an outage is not), but it buys the UI nothing.
+- **The 400 ms placeholder gate is a measured fix, not a guess.**
+  Warm disk-cache hits return in single-digit ms; without the delay
+  every revisit flashed a one-frame "RESOLVING IDENTITY…" that read
+  as a rendering glitch. Verified in-browser: the placeholder does
+  NOT appear on a warm re-select.
+- **Identity resolves CONCURRENTLY with the light curve.** SIMBAD is
+  ~0.3–2.4 s; a MAST cold path is ~60 s. Awaiting identity inside
+  the curve path would hide the names behind the slowest thing on
+  screen for no reason — they share nothing.
+- **The generation guard is narrower for identity than for the
+  curve, and the difference is load-bearing.** A superseded curve is
+  discarded wholesale (writing it would pair star A's header with
+  star B's data). A superseded IDENTITY is kept out of the panel
+  slot but still written to the search index via `indexIdentity`:
+  the index is keyed by star id, so it cannot mislabel the current
+  selection, and dropping it would discard a SIMBAD query already
+  spent. This asymmetry was caught by a unit test written on the
+  wrong assumption (that the curve's discard-everything rule should
+  apply verbatim) — the test failed, and the failure was the
+  correct signal. Both behaviors are now pinned:
+  `resolvedIdentities` gains the stale star, `identity` does not.
+- **Search coverage is visited-stars-only BY DESIGN.** Folding
+  resolved identities into the local match set is free and instant.
+  Universal common-name search would require a SIMBAD query per
+  keystroke, which the B1 rate posture (~5–10 q/s ⇒ blacklist)
+  rules out categorically. The empty-state copy states the limit
+  explicitly rather than letting users infer universal coverage and
+  conclude the search is broken. Alias hits rank BELOW the
+  equivalent catalog hit, and matched rows show `↳ <alias>` so a row
+  whose visible text lacks the query explains itself.
+- **`selectDisplayNames` lives in `lib/simbadIds.ts`, not the
+  component** — it is identifier string munging (that module's
+  stated scope) and the redundancy check is the same
+  whitespace/case-insensitive matching the file already owns. Keeps
+  it pure and offline-testable against the frozen fixtures.
+
+Open question for mechanism (b): what to do with a SIMBAD hit that
+resolves to a star the app doesn't render at all (SIMBAD indexes
+millions of objects outside the Kepler/TESS/Hipparcos merge). Flying
+to empty sky would be worse than saying nothing.
 
 ---
 
-*Last updated 2026-07-18. When an open issue in §7 is fixed, move it to
+*Last updated 2026-07-18 (§10 extended with phase B3 mechanism (a)).
+When an open issue in §7 is fixed, move it to
 the relevant "FIXED" section with its root cause, and update the K00931.01
 entry (§4) once §7.1 is resolved.*

@@ -28,6 +28,7 @@ import {
   normalizeSimbadId,
   parseSimbadIdsString,
   parseSimbadIdentityResponse,
+  selectDisplayNames,
 } from '../simbadIds.ts'
 import { simbadIdsQueryUrl } from '../externalEndpoints.ts'
 
@@ -144,6 +145,58 @@ describe('parseSimbadIdsString / normalizeSimbadId', () => {
     assert.equal(parsed.tic, null)
     assert.equal(parsed.gaiaDr3, null, 'DR2 is not DR3')
     assert.deepEqual(parsed.commonNames, [], 'WASP-12 b (planet) is not a star common name')
+  })
+})
+
+describe('selectDisplayNames — panel "ALSO KNOWN AS" filtering', () => {
+  it('KIC8462852: surfaces Boyajian’s Star and the non-obvious main_id', () => {
+    const identity = parseSimbadIdentityResponse(fixture('KIC8462852'))!
+    // What the panel already shows for this star.
+    const picked = selectDisplayNames(identity, ["Tabby's Star", 'KIC8462852'])
+    assert.deepEqual(picked.names, ["Boyajian's Star"])
+    // main_id is a Tycho designation the user would never guess — the
+    // whole reason it earns a row.
+    assert.equal(picked.mainId, 'TYC 3162-665-1')
+  })
+
+  it('KIC10666592: lists all four survey designations', () => {
+    const identity = parseSimbadIdentityResponse(fixture('KIC10666592'))!
+    const picked = selectDisplayNames(identity, ['K00002.01', 'KIC10666592'])
+    assert.ok(picked.names.includes('HAT-P-7'), `got: ${picked.names.join(', ')}`)
+    assert.ok(picked.names.includes('Kepler-2'))
+    assert.ok(picked.names.includes('KOI-2'))
+    assert.ok(picked.names.includes('TOI-1265'))
+  })
+
+  it('suppresses a name the panel already displays (case/space-insensitive)', () => {
+    const identity = parseSimbadIdentityResponse(fixture('KIC8462852'))!
+    const picked = selectDisplayNames(identity, ["boyajian's   STAR", 'KIC8462852'])
+    assert.deepEqual(picked.names, [], 'already-displayed name must not echo back')
+  })
+
+  it('drops main_id when it duplicates a listed common name', () => {
+    const identity = {
+      ...parseSimbadIdentityResponse(fixture('KIC8462852'))!,
+      mainId: "Boyajian's Star",
+    }
+    const picked = selectDisplayNames(identity, ['KIC8462852'])
+    assert.deepEqual(picked.names, ["Boyajian's Star"])
+    assert.equal(picked.mainId, null, 'main_id already listed as a common name')
+  })
+
+  it('reports nothing to show when every name is redundant', () => {
+    const identity = parseSimbadIdentityResponse(fixture('KIC8462852'))!
+    const picked = selectDisplayNames(identity, ["Boyajian's Star", 'TYC 3162-665-1'])
+    // The caller renders nothing at all on this — absence is not news.
+    assert.deepEqual(picked.names, [])
+    assert.equal(picked.mainId, null)
+  })
+
+  it('dedupes within commonNames without mutating the identity', () => {
+    const identity = parseSimbadIdentityResponse(fixture('KIC8462852'))!
+    const before = [...identity.commonNames]
+    selectDisplayNames(identity, [])
+    assert.deepEqual(identity.commonNames, before, 'input must not be mutated')
   })
 })
 

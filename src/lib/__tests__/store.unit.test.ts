@@ -10,6 +10,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { useStore, type Star } from '../store.ts'
+import type { SimbadIdentity } from '../simbadIds.ts'
 
 /** @description In-memory localStorage shim recording writes. */
 class LocalStorageShim {
@@ -32,6 +33,9 @@ beforeEach(() => {
     anomalyStars: [],
     nextAnomalyCursor: -1,
     flyTo: null,
+    identity: null,
+    identityLoading: false,
+    resolvedIdentities: new Map(),
   })
 })
 
@@ -115,5 +119,55 @@ describe('selection / navigation contracts', () => {
     const changed = useStore.getState().classifiedPatterns
     assert.notEqual(changed, ref)
     assert.equal(changed.get('KIC5'), 'SPARSE')
+  })
+})
+
+describe('identity slot contracts (phase B3)', () => {
+  /** @description Minimal SimbadIdentity stub; only the fields the store touches matter. */
+  function identityStub(mainId: string, commonNames: string[]): SimbadIdentity {
+    return {
+      mainId,
+      otype: '*',
+      ra: 301.5,
+      dec: 44.4,
+      kic: null, tic: null, epic: null, hip: null,
+      gaiaDr3: null, twoMass: null, tycho: null,
+      commonNames,
+      allIds: [mainId, ...commonNames],
+    }
+  }
+
+  it('setIdentity records a resolved identity into the search index', () => {
+    const id = identityStub('TYC 3162-665-1', ["Boyajian's Star"])
+    useStore.getState().setIdentity('KIC8462852', id)
+    assert.equal(useStore.getState().identity, id)
+    assert.equal(useStore.getState().resolvedIdentities.get('KIC8462852'), id)
+  })
+
+  it('a miss clears the panel slot WITHOUT touching the search index', () => {
+    const id = identityStub('TYC 3162-665-1', ["Boyajian's Star"])
+    useStore.getState().setIdentity('KIC8462852', id)
+    const indexRef = useStore.getState().resolvedIdentities
+
+    // Selecting a star SIMBAD doesn't know must not evict names already
+    // resolved for other stars — those stay searchable all session.
+    useStore.getState().setIdentity('KIC99999', null)
+    assert.equal(useStore.getState().identity, null, 'panel slot cleared')
+    assert.equal(useStore.getState().resolvedIdentities, indexRef, 'index reference unchanged')
+    assert.ok(useStore.getState().resolvedIdentities.has('KIC8462852'), 'prior names still searchable')
+  })
+
+  it('creates a NEW Map reference on insert so search recomputes', () => {
+    const before = useStore.getState().resolvedIdentities
+    useStore.getState().setIdentity('KIC1', identityStub('X', ['Alpha']))
+    assert.notEqual(useStore.getState().resolvedIdentities, before)
+  })
+
+  it('re-selecting the same star does not churn the Map reference', () => {
+    const id = identityStub('X', ['Alpha'])
+    useStore.getState().setIdentity('KIC1', id)
+    const ref = useStore.getState().resolvedIdentities
+    useStore.getState().setIdentity('KIC1', id)
+    assert.equal(useStore.getState().resolvedIdentities, ref, 'same identity → no referential churn')
   })
 })

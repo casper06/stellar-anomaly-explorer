@@ -40,22 +40,59 @@ function normalize(s: string): string {
 }
 
 /**
+ * @description One dropdown entry: the matched star plus, when the match
+ * came from a resolved SIMBAD alias rather than the catalog id/name, the
+ * alias that matched — so the row can show WHY it appeared for a query
+ * that doesn't visibly occur anywhere in it.
+ */
+interface Suggestion {
+  star: Star
+  via: string | null
+}
+
+/**
  * @description Ranks a matched star against the normalized query. Lower
  * is better. Exact matches on id or name come first, then prefix
  * matches, then substring matches. Within the same tier the shorter
  * match string ranks higher — "K02357.01" beats "K02357.02" for the
  * query "k02357" only when the shorter one appears first, but both
  * appear together and sorting keeps them in catalog order otherwise.
+ *
+ * `aliases` are SIMBAD common names already resolved for this star (see
+ * `resolvedIdentities` in the store). They match one tier BELOW the
+ * equivalent catalog match, so a query that hits both a catalog id and
+ * someone else's alias still ranks the catalog hit first.
  * @param star Candidate star from the catalog.
  * @param normQuery Normalized query key.
- * @returns Integer priority; lower is better; -1 for no match.
+ * @param aliases Resolved SIMBAD common names for this star, if any.
+ * @returns Rank + the alias that matched (when the hit came from one);
+ * rank -1 means no match.
  */
-function rank(star: Star, normQuery: string): number {
+function rank(
+  star: Star,
+  normQuery: string,
+  aliases: readonly string[] = [],
+): { rank: number; via: string | null } {
   const idKey = normalize(star.id)
   const nameKey = normalize(star.name)
-  if (idKey === normQuery || nameKey === normQuery) return 0
-  if (idKey.startsWith(normQuery) || nameKey.startsWith(normQuery)) return 1
-  if (idKey.includes(normQuery) || nameKey.includes(normQuery)) return 2
+  if (idKey === normQuery || nameKey === normQuery) return { rank: 0, via: null }
+  if (idKey.startsWith(normQuery) || nameKey.startsWith(normQuery)) return { rank: 1, via: null }
+
+  // Alias exact/prefix beat a catalog SUBSTRING hit: someone typing
+  // "boyajian" means Boyajian's Star, not a coincidental id substring.
+  for (const alias of aliases) {
+    const k = normalize(alias)
+    if (k === normQuery) return { rank: 1.5, via: alias }
+  }
+
+  if (idKey.includes(normQuery) || nameKey.includes(normQuery)) return { rank: 2, via: null }
+
+  for (const alias of aliases) {
+    const k = normalize(alias)
+    if (k.startsWith(normQuery)) return { rank: 2.5, via: alias }
+    if (k.includes(normQuery)) return { rank: 2.75, via: alias }
+  }
+
   // KOI stem match: user typed "K02357.02" but the catalog only stores
   // "K02357.01" (one KOI-per-KIC after dedupe). Strip anything after the
   // first "." off both sides — this makes the sibling planet designation
@@ -64,9 +101,9 @@ function rank(star: Star, normQuery: string): number {
   if (normQuery.includes('.')) {
     const stemQuery = normQuery.split('.')[0]
     const stemName = nameKey.split('.')[0]
-    if (stemQuery.length >= MIN_QUERY_LEN && stemQuery === stemName) return 3
+    if (stemQuery.length >= MIN_QUERY_LEN && stemQuery === stemName) return { rank: 3, via: null }
   }
-  return -1
+  return { rank: -1, via: null }
 }
 
 /**
@@ -89,6 +126,10 @@ function rank(star: Star, normQuery: string): number {
 export default function StarSearch() {
   const anomalyStars = useStore(s => s.anomalyStars)
   const requestFlyTo = useStore(s => s.requestFlyTo)
+  // SIMBAD common names resolved so far this session (phase B3
+  // mechanism (a)) — folded into the match set for free. Coverage is
+  // visited-stars-only by design; see the empty-state copy below.
+  const resolvedIdentities = useStore(s => s.resolvedIdentities)
 
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
@@ -125,22 +166,23 @@ export default function StarSearch() {
   // Compute suggestions from the debounced query. Runs on catalog and
   // query changes only; typing does NOT recompute until the debounce
   // fires.
-  const suggestions = useMemo<Star[]>(() => {
+  const suggestions = useMemo<Suggestion[]>(() => {
     const normQuery = normalize(debouncedQuery)
     if (normQuery.length < MIN_QUERY_LEN) return []
-    const scored: { star: Star; rank: number }[] = []
+    const scored: { star: Star; rank: number; via: string | null }[] = []
     for (const star of anomalyStars) {
-      const r = rank(star, normQuery)
-      if (r < 0) continue
-      scored.push({ star, rank: r })
+      const aliases = resolvedIdentities.get(star.id)?.commonNames
+      const r = rank(star, normQuery, aliases)
+      if (r.rank < 0) continue
+      scored.push({ star, rank: r.rank, via: r.via })
       // Early exit: once we've seen a lot more than MAX_SUGGESTIONS we
       // can stop scanning. Rank 0/1 hits are rare enough that this
       // rarely leaves better candidates on the table.
       if (scored.length >= MAX_SUGGESTIONS * 4) break
     }
     scored.sort((a, b) => a.rank - b.rank)
-    return scored.slice(0, MAX_SUGGESTIONS).map(x => x.star)
-  }, [anomalyStars, debouncedQuery])
+    return scored.slice(0, MAX_SUGGESTIONS).map(x => ({ star: x.star, via: x.via }))
+  }, [anomalyStars, debouncedQuery, resolvedIdentities])
 
   const normQueryLen = normalize(debouncedQuery).length
   const showDropdown = isFocused && normQueryLen >= MIN_QUERY_LEN
@@ -170,7 +212,7 @@ export default function StarSearch() {
     } else if (e.key === 'Enter') {
       e.preventDefault()
       const target = suggestions[highlight]
-      if (target) pick(target)
+      if (target) pick(target.star)
     }
   }
 
@@ -226,13 +268,34 @@ export default function StarSearch() {
                 letterSpacing: 1,
               }}
             >
-              No star found matching &quot;{debouncedQuery}&quot;
+              <div>No star found matching &quot;{debouncedQuery}&quot;</div>
+              {/* Sets expectations honestly: alternate names are searchable
+                  only for stars already opened this session (or still in the
+                  server cache), because that is when SIMBAD was consulted.
+                  Universal common-name search needs a query per keystroke,
+                  which CDS's rate policy rules out — that is the separate
+                  press-Enter-to-ask escape hatch, not built yet. Do not
+                  reword this into a promise of universal name search. */}
+              <div
+                style={{
+                  marginTop: 6,
+                  fontSize: 9,
+                  color: 'rgba(255,255,255,0.3)',
+                  letterSpacing: 0.3,
+                  lineHeight: 1.5,
+                }}
+              >
+                Catalog ids (KIC, KOI, TOI) always work. Common names such as
+                &quot;Boyajian&apos;s Star&quot; are searchable only for stars
+                you have already opened.
+              </div>
             </div>
           ) : (
-            suggestions.map((star, i) => (
+            suggestions.map(({ star, via }, i) => (
               <SuggestionRow
                 key={star.id}
                 star={star}
+                via={via}
                 highlighted={i === highlight}
                 onHover={() => setHighlight(i)}
                 onClick={() => pick(star)}
@@ -251,6 +314,9 @@ export default function StarSearch() {
  * a second line. Highlighting is prop-driven so keyboard navigation
  * and mouse hover use the same visual state.
  * @param star The suggestion.
+ * @param via The SIMBAD alias that produced this match, when the query
+ * matched neither the id nor the catalog name — shown so a row whose
+ * visible text doesn't contain the query still explains itself.
  * @param highlighted True when this row is the active keyboard target.
  * @param onHover Called when the mouse enters — moves the highlight.
  * @param onClick Called when the row is clicked — picks the star.
@@ -258,11 +324,13 @@ export default function StarSearch() {
  */
 function SuggestionRow({
   star,
+  via,
   highlighted,
   onHover,
   onClick,
 }: {
   star: Star
+  via?: string | null
   highlighted: boolean
   onHover: () => void
   onClick: () => void
@@ -289,6 +357,11 @@ function SuggestionRow({
           {star.id}
         </span>
       </div>
+      {via && (
+        <div style={{ fontSize: 9, color: 'rgba(76,201,240,0.75)', letterSpacing: 0.3 }}>
+          ↳ {via}
+        </div>
+      )}
       <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', letterSpacing: 1 }}>
         MAG {star.magnitude.toFixed(1)}
         {star.quadrant ? <> · QUAD {star.quadrant}</> : null}

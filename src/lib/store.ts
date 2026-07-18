@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { FLAGGED_KEY, VISITED_KEY, loadIdSet, saveIdSet } from './persistence'
 import type { CurveProfile, CurvePattern } from './curveClassifier'
+import type { SimbadIdentity } from './simbadIds'
 
 /**
  * @description Catalog of origin for a star. Used by the renderer to pick
@@ -138,6 +139,43 @@ interface AppState {
    * of stale data from the previously-selected star.
    */
   lightcurveLoading: boolean
+  /**
+   * @description SIMBAD cross-identifier record for the currently-selected
+   * star, or null when the star has no SIMBAD entry, the lookup failed, or
+   * none has been fetched yet. Follows the `lightcurve` pattern (nullable
+   * data + a sibling loading flag) rather than a discriminated union: the
+   * panel treats miss / outage / not-yet-asked identically (render
+   * nothing), so a richer state machine would buy no UI behavior.
+   */
+  identity: SimbadIdentity | null
+  /**
+   * @description True while a `fetchIdentity` call for the currently-
+   * selected star is in flight. Distinguishes "still asking" from
+   * "asked, nothing to show" so the panel can hold a slim placeholder
+   * instead of popping the block in late. Cache hits resolve in a few
+   * ms, so the panel gates the placeholder behind a short delay — see
+   * `IDENTITY_PLACEHOLDER_DELAY_MS` in AnomalyPanel.
+   */
+  identityLoading: boolean
+  /**
+   * @description Every SIMBAD identity resolved this session, keyed by
+   * app-form star id. Accumulates as the user selects stars; entries are
+   * never evicted (a few hundred bytes each, bounded by how many stars
+   * one session visits).
+   *
+   * This is the backing index for search-by-common-name (phase B3
+   * mechanism (a)): once a star's identity has been resolved, its
+   * common names become searchable for free, with no new SIMBAD query.
+   * Coverage is therefore visited-stars-only BY DESIGN — universal
+   * common-name search would need a per-keystroke SIMBAD query, which
+   * the B1 rate posture rules out; that is mechanism (b), a separate
+   * explicit press-Enter-to-ask escape hatch, not built here.
+   *
+   * Stars confirmed ABSENT from SIMBAD are intentionally not recorded:
+   * they contribute no searchable names, and the route already caches
+   * the miss so re-selecting them costs no query.
+   */
+  resolvedIdentities: Map<string, SimbadIdentity>
   loading: boolean
   flyTo: FlyToCommand | null
   /**
@@ -216,6 +254,27 @@ interface AppState {
   setMode: (mode: 'explore' | 'analyze' | 'report') => void
   setLightcurve: (data: LightcurveData | null) => void
   setLightcurveLoading: (loading: boolean) => void
+  /**
+   * @description Sets the selected star's identity. Passing a non-null
+   * identity ALSO records it into `resolvedIdentities` under `starId`,
+   * so the search index grows as a side effect of ordinary selection —
+   * callers never maintain the two separately.
+   * @param starId App-form id the identity was resolved for.
+   * @param identity The resolved identity, or null for a miss/failure.
+   */
+  setIdentity: (starId: string, identity: SimbadIdentity | null) => void
+  /**
+   * @description Records an identity into the search index WITHOUT
+   * touching the panel slot. Used when a lookup resolves after its
+   * selection was superseded: the result can't be displayed (a newer
+   * star owns the panel), but it is still a valid resolution of
+   * `starId`, and the index is keyed by id so storing it cannot
+   * mislabel the current selection.
+   * @param starId App-form id the identity was resolved for.
+   * @param identity The resolved identity.
+   */
+  indexIdentity: (starId: string, identity: SimbadIdentity) => void
+  setIdentityLoading: (loading: boolean) => void
   setLoading: (loading: boolean) => void
   setKoiCount: (n: number) => void
   setKoiError: (err: string | null) => void
@@ -277,6 +336,9 @@ export const useStore = create<AppState>((set) => ({
   mode: 'explore',
   lightcurve: null,
   lightcurveLoading: false,
+  identity: null,
+  identityLoading: false,
+  resolvedIdentities: new Map<string, SimbadIdentity>(),
   loading: false,
   flyTo: null,
   koiCount: 0,
@@ -301,6 +363,24 @@ export const useStore = create<AppState>((set) => ({
   setMode: (mode) => set({ mode }),
   setLightcurve: (data) => set({ lightcurve: data }),
   setLightcurveLoading: (loading) => set({ lightcurveLoading: loading }),
+  setIdentity: (starId, identity) => set(state => {
+    // A miss/failure only clears the panel slot — nothing to index, and
+    // no reason to churn the Map reference.
+    if (!identity) return { identity: null }
+    // Re-selecting a star already in the index: keep the existing Map
+    // reference so search-index consumers don't recompute needlessly.
+    if (state.resolvedIdentities.get(starId) === identity) return { identity }
+    const next = new Map(state.resolvedIdentities)
+    next.set(starId, identity)
+    return { identity, resolvedIdentities: next }
+  }),
+  indexIdentity: (starId, identity) => set(state => {
+    if (state.resolvedIdentities.get(starId) === identity) return state
+    const next = new Map(state.resolvedIdentities)
+    next.set(starId, identity)
+    return { resolvedIdentities: next }
+  }),
+  setIdentityLoading: (loading) => set({ identityLoading: loading }),
   setLoading: (loading) => set({ loading }),
   setKoiCount: (n) => set({ koiCount: n }),
   setKoiError: (err) => set({ koiError: err }),

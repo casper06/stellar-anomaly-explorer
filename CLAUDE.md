@@ -64,7 +64,10 @@ src/
     batchClassifier.ts    # Shared runtime state + worker for the batch classify job
     selectStar.ts         # Shared "select + fly + fetch curve" flow used by clicks and search
     externalEndpoints.ts  # Single source of truth for all external URLs (routes + health check import it)
-    simbadIds.ts          # Pure SIMBAD TAP response → SimbadIdentity parser (app-side, NOT engine)
+    simbadIds.ts          # Pure SIMBAD TAP response → SimbadIdentity parser +
+                          # selectDisplayNames (panel "also known as" filtering);
+                          # app-side, NOT engine
+    identityClient.ts     # Browser fetch wrapper for /api/identity (never throws; null on any failure)
 packages/
   stellar-vetting-engine/ # MIT-licensed extracted science engine (app is GPL;
                           # see KNOWLEDGE_BASE §9). src/ = the 9 engine modules
@@ -216,15 +219,57 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   (transient artifact, observed live). Strictly on-demand: never
   batch, never auto-run. See docs/DESIGN_tpf-centroid-analysis.md.
 
-- **SIMBAD identity resolver — server side** (phase B2, 2026-07-18):
-  `/api/identity/[id]` resolves any star's SIMBAD cross-identifier
-  record on demand (KIC/TIC/EPIC/HIP/Gaia DR3/2MASS/Tycho + common
-  names like "Boyajian's Star", HAT-P-7, K2-22) with a 30-day
-  schema-versioned per-star disk cache, expired-cache-on-outage
+- **SIMBAD identity resolver** (phase B2 server-side + phase B3 UI,
+  2026-07-18): `/api/identity/[id]` resolves any star's SIMBAD
+  cross-identifier record on demand (KIC/TIC/EPIC/HIP/Gaia DR3/2MASS/
+  Tycho + common names like "Boyajian's Star", HAT-P-7, K2-22) with a
+  30-day schema-versioned per-star disk cache, expired-cache-on-outage
   fallback, and cached misses. Pure parser in `lib/simbadIds.ts`
   (app-side, NOT the engine package), 4 frozen real-response
-  fixtures, health check #7. NO UI yet — that's phase B3 (see Next
-  features). See the `/api/identity/[id]` section below.
+  fixtures, health check #7. See the `/api/identity/[id]` section
+  below.
+
+  **B3 UI** (mechanism (a) only — the explicit press-Enter-to-ask
+  SIMBAD escape hatch is mechanism (b), still NOT built):
+  - **"ALSO KNOWN AS" block** in the AnomalyPanel, between the
+    visibility copy and the dips list: common-name chips + SIMBAD's
+    `main_id` when it adds information (Tabby's reads
+    `TYC 3162-665-1`) + a "via SIMBAD (CDS)" attribution line.
+    Resolved via `selectDisplayNames` in `lib/simbadIds.ts`, which
+    drops any name the panel already shows (case/whitespace-
+    insensitive) so the block never echoes the header back.
+  - **Absence is not news**: on a SIMBAD miss, a route failure, or
+    when every name was redundant, the block renders NOTHING — no
+    error state, no "not found" row. Most faint KOI hosts are simply
+    not in SIMBAD; that is a normal answer, and this is bonus
+    context, not a core feature. Do not "improve" this into an error
+    message.
+  - **Loading**: `identityLoading` in the store, but the placeholder
+    is gated behind `IDENTITY_PLACEHOLDER_DELAY_MS = 400` in
+    AnomalyPanel — a warm disk-cache hit returns in a few ms, and
+    without the delay every revisit flashed a one-frame
+    "RESOLVING IDENTITY…" that read as a glitch.
+  - **Concurrency**: the identity fetch runs CONCURRENTLY with the
+    light curve (`resolveIdentityFor` in `selectStar.ts`, not
+    awaited inline) — SIMBAD answers in ~0.3–2.4 s while a MAST cold
+    path can take ~60 s, so serializing would hide the names behind
+    the slowest thing on screen.
+  - **Generation guard, deliberately narrower than the curve's**: a
+    superseded response must not take the PANEL slot, but it IS
+    still indexed into `resolvedIdentities` via `indexIdentity`. The
+    index is keyed by star id, so storing it cannot mislabel the
+    current selection, and discarding it would throw away a SIMBAD
+    query already spent.
+  - **Search by common name**: `resolvedIdentities` (session Map,
+    id → identity) folds into `StarSearch`'s match set, so
+    "boyajian" finds Tabby's Star once that star has been opened.
+    Alias hits rank BELOW the equivalent catalog hit and the
+    dropdown row shows `↳ <alias>` so a row whose visible text
+    lacks the query explains itself. **Coverage is visited-stars-
+    only BY DESIGN** — universal common-name search needs a query
+    per keystroke, which CDS's rate policy rules out. The
+    empty-state copy says so explicitly; do not reword it into a
+    promise of universal name search.
 
 ### Known bugs / pending 🐛
 - (none currently tracked)
@@ -246,14 +291,21 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   cross-check on the segment-scatter error bar; (c) TESS validation
   if a public per-TOI centroid table ever appears. Future ideas — not
   being implemented now.
-- **SIMBAD identity phase B3 — UI integration**: B2 (route + parser +
-  cache + health check + fixtures) shipped 2026-07-18 server-side
-  only. B3 = "ALSO KNOWN AS" block in the AnomalyPanel (fed by
-  `/api/identity`) and search-by-common-name (fold resolved names
-  into the local search index; optionally an explicit
-  press-Enter-to-ask-SIMBAD escape hatch — NEVER per-keystroke
-  queries, see the rate posture in the `/api/identity` section).
-  Awaiting a separate greenlight — not being implemented now.
+- **SIMBAD identity phase B3 mechanism (b) — ask-SIMBAD escape
+  hatch**: B2 (route + parser + cache + health check + fixtures) and
+  B3 mechanism (a) (ALSO KNOWN AS block + search over
+  already-resolved identities) both shipped 2026-07-18 (see "What
+  works"). Mechanism (b) is the remaining piece: an EXPLICIT
+  press-Enter-to-ask-SIMBAD action in the search box, so a common
+  name for a star the user has never opened can still resolve. Must
+  stay explicit and one-shot — **NEVER per-keystroke queries**; CDS
+  blacklists IPs above ~5–10 queries/second (see the rate posture in
+  the `/api/identity` section). Open design questions: what the
+  resolver does with a hit that isn't in the local catalog at all
+  (SIMBAD knows millions of stars the app doesn't render), and
+  whether to surface "asking SIMBAD…" as a dropdown row or a
+  separate affordance. Awaiting a separate greenlight — not being
+  implemented now.
 
 ## Real-data integration
 
@@ -621,8 +673,11 @@ the star's RA/Dec so the cone-search path has what it needs.
   `otype`, ICRS position, bare KIC/TIC/EPIC/HIP/Gaia DR3/2MASS/Tycho
   ids, common names (`NAME …` entries + HAT-P/WASP/Kepler/KOI/K2/TOI
   survey designations), and the full normalized identifier list
-  (`allIds`). Server-side only as of B2 — UI integration (alternate
-  names in the panel, search-by-common-name) is phase B3, not shipped.
+  (`allIds`). Consumed by the panel's ALSO KNOWN AS block and the
+  session search index (phase B3 mechanism (a), shipped — see "What
+  works"); the browser calls it through `lib/identityClient.ts`, never
+  directly. Mechanism (b), the explicit ask-SIMBAD escape hatch for
+  never-opened stars, is still unbuilt (see "Next features").
 - Queries the CDS SIMBAD TAP sync service via `simbadIdsQueryUrl` in
   `externalEndpoints.ts` (ADQL over `basic` ⋈ `ids` ⋈ `ident`; the
   `ident` join matches ANY alias). **Measured facts (2026-07-17/18)**:
@@ -1558,7 +1613,8 @@ BEFORE and AFTER touching the listed area:**
 | `anomalyDetector` / `curveClassifier` / `fitsReader` / `fitsCore` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
 | `tpfReader` / `centroidVet` / `/api/centroid` | `npm run test:data` + `npm run test:unit` (centroid fixtures live in test:data) |
 | `selectStar` / `store` / `persistence` | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
-| `simbadIds` / `/api/identity` | `npm run test:unit` + `npm run test:routes` (frozen SIMBAD fixtures live in `src/lib/__tests__/fixtures/simbad/`) |
+| `simbadIds` / `/api/identity` / `identityClient` | `npm run test:unit` + `npm run test:routes` (frozen SIMBAD fixtures live in `src/lib/__tests__/fixtures/simbad/`) |
+| `AlsoKnownAs` panel block / identity store slot / `StarSearch` alias ranking | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
 | `StarField` selection paths / CameraSync / disambiguation popover / HUD panels | `npm run test:e2e` |
 | anything else | `npx tsc --noEmit` + verify in the browser, as always |
 
