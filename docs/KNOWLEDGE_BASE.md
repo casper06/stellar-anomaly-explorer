@@ -607,8 +607,73 @@ The core science modules were extracted into a standalone package at
   The name `stellar-vetting-engine` is provisional until an npm
   availability check at publish time.
 
+## 10. SIMBAD TAP identity resolution — measured contract (2026-07-17/18)
+
+Phase B1 (investigation, 2026-07-17) measured the CDS SIMBAD TAP
+service against real queries before any code; phase B2 (2026-07-18)
+shipped the server side: `/api/identity/[id]` + `lib/simbadIds.ts` +
+health check #7 + four frozen fixtures. Everything below was MEASURED,
+not assumed from documentation.
+
+**Service contract (all verified live):**
+- Endpoint `https://simbad.cds.unistra.fr/simbad/sim-tap/sync`, same
+  ADQL/TAP GET pattern as MAST (`REQUEST=doQuery&LANG=ADQL&FORMAT=json`).
+  No auth.
+- Query shape: `basic ⋈ ids ⋈ ident WHERE ident.id = '<alias>'` —
+  the `ident` join matches ANY known alias; `ids.ids` returns every
+  identifier pipe-concatenated in one row.
+- **Identifier matching is whitespace-normalized**: `KIC8462852`
+  (app form) resolves identically to `KIC 8462852`. Verified for
+  KIC/TIC/EPIC/HIP prefixes. App ids are sent verbatim.
+- **Latency**: warm ~0.3–1.6 s (median ~0.8 s), cold ~2.4 s.
+  Payloads ~0.5–1 KB.
+- **Miss** = HTTP 200 with empty `data` (expected for most faint KOI
+  hosts — SIMBAD indexes studied objects, not all of Kepler's field).
+- **Query error** = VOTable XML envelope (`QUERY_STATUS=ERROR`) even
+  with `FORMAT=json`. JSON parse failure must be treated as an
+  upstream/query error, never as data.
+- **JSON shape gotcha**: columns are listed under `metadata`, NOT
+  `info` as MAST's TAP uses. The parser locates columns BY NAME and
+  throws on a missing one (the VizieR column-rename lesson).
+- **Rate policy** (CDS, quoted in astroquery docs; not on the TAP
+  pages themselves): > ~5–10 queries/second ⇒ IP blacklisted up to an
+  hour. On-demand per-click use is orders of magnitude below. Any
+  future batch resolution must throttle to ≲2 concurrent with delays
+  — do NOT reuse the batch classifier's MAX_CONCURRENCY=5 pattern.
+
+**Identity payoffs found during measurement:**
+- EPIC 201637175 (one of the 11 seeds) is **K2-22** — the famous
+  disintegrating-planet host. The seed table never knew this.
+- HAT-P-7 (KIC 10666592) pins the **Gaia DR1 ≠ DR2/DR3 source_id**
+  subtlety (DR1 …0911665920 vs DR2/DR3 …5211984000) — parsers must
+  key on `Gaia DR3` specifically, never "Gaia".
+- SIMBAD's `main_id` is often NOT the queried id (Tabby's is
+  `TYC 3162-665-1`; HAT-P-7's was served as `BD+47  2846` — note the
+  catalog-native double space, which is why normalization collapses
+  whitespace runs).
+
+**Design decisions (B1, approved 2026-07-18):**
+- On-demand resolution with a 30-day schema-versioned per-star disk
+  cache — SIMBAD is a living compilation, but identifier data is
+  nearly append-only (ids arrive with major catalog releases), so
+  30 days bounds staleness without churn. Expired same-version
+  entries are served `stale: true` when the refetch fails; misses
+  are cached as `identity: null`.
+- Parsing is pure and offline-testable but deliberately APP-SIDE
+  (`lib/simbadIds.ts`), not in the MIT engine package: identifier
+  string munging is catalog plumbing, not vetting science — putting
+  it in the package would dilute its scope (JOSS framing) even
+  though it would technically pass the architecture guard.
+- Fixtures are the four REAL captured responses (Tabby, HAT-P-7,
+  WASP-126, K2-22) under `src/lib/__tests__/fixtures/simbad/`, with
+  capture provenance (date + exact URL) embedded in each file.
+  Refreeze: `scripts/capture-simbad-fixtures.mjs` (throttled 1 q/s).
+
+Phase B3 (UI: alternate names in the panel, search-by-common-name) is
+designed but NOT implemented — see CLAUDE.md "Next features".
+
 ---
 
-*Last updated 2026-07-10. When an open issue in §7 is fixed, move it to
+*Last updated 2026-07-18. When an open issue in §7 is fixed, move it to
 the relevant "FIXED" section with its root cause, and update the K00931.01
 entry (§4) once §7.1 is resolved.*

@@ -1,0 +1,57 @@
+{
+  "capturedAt": "2026-07-18T13:58:12.427Z",
+  "identifier": "TIC25155310",
+  "url": "https://simbad.cds.unistra.fr/simbad/sim-tap/sync?REQUEST=doQuery&LANG=ADQL&FORMAT=json&QUERY=SELECT+b.main_id%2C+b.otype%2C+b.ra%2C+b.dec%2C+ids.ids+FROM+basic+AS+b+JOIN+ids+ON+ids.oidref+%3D+b.oid+JOIN+ident+ON+ident.oidref+%3D+b.oid+WHERE+ident.id+%3D+%27TIC25155310%27",
+  "response": {
+    "metadata": [
+      {
+        "name": "main_id",
+        "description": "Main identifier for an object",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "meta.id;meta.main",
+        "utype": "mango:MangoObject.identifier"
+      },
+      {
+        "name": "otype",
+        "description": "Object type",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "src.class",
+        "utype": "mango:Label.text[CT.vocabulary=https://www.ivoa.net/rdf/uat#classification]"
+      },
+      {
+        "name": "ra",
+        "description": "Right ascension",
+        "datatype": "DOUBLE",
+        "unit": "deg",
+        "ucd": "pos.eq.ra;meta.main",
+        "utype": "mango:EpochPosition.longitude[CS.spaceSys=ICRS CT.epoch=J2000]"
+      },
+      {
+        "name": "dec",
+        "description": "Declination",
+        "datatype": "DOUBLE",
+        "unit": "deg",
+        "ucd": "pos.eq.dec;meta.main",
+        "utype": "mango:EpochPosition.latitude[CS.spaceSys=ICRS CT.epoch=J2000]"
+      },
+      {
+        "name": "ids",
+        "description": "List of all identifiers concatenated with pipe",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "meta.id"
+      }
+    ],
+    "data": [
+      [
+        "WASP-126",
+        "PM*",
+        63.37393811476,
+        -69.22682267111,
+        "TOI-114|GALAH 161217001601159|Gaia DR3 4666498154837086208|AP J04132972-6913365|2MASS J04132972-6913365|GSC 09153-00833|TYC 9153-833-1|Gaia DR2 4666498154837086208|RAVE J041329.7-691337|TIC 25155310|1SWASP J041329.75-691336.6|WASP-126|Gaia DR1 4666498150540773504|DTARPS-S  33"
+      ]
+    ]
+  }
+}

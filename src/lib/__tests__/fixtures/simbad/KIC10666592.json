@@ -1,0 +1,57 @@
+{
+  "capturedAt": "2026-07-18T13:58:11.142Z",
+  "identifier": "KIC10666592",
+  "url": "https://simbad.cds.unistra.fr/simbad/sim-tap/sync?REQUEST=doQuery&LANG=ADQL&FORMAT=json&QUERY=SELECT+b.main_id%2C+b.otype%2C+b.ra%2C+b.dec%2C+ids.ids+FROM+basic+AS+b+JOIN+ids+ON+ids.oidref+%3D+b.oid+JOIN+ident+ON+ident.oidref+%3D+b.oid+WHERE+ident.id+%3D+%27KIC10666592%27",
+  "response": {
+    "metadata": [
+      {
+        "name": "main_id",
+        "description": "Main identifier for an object",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "meta.id;meta.main",
+        "utype": "mango:MangoObject.identifier"
+      },
+      {
+        "name": "otype",
+        "description": "Object type",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "src.class",
+        "utype": "mango:Label.text[CT.vocabulary=https://www.ivoa.net/rdf/uat#classification]"
+      },
+      {
+        "name": "ra",
+        "description": "Right ascension",
+        "datatype": "DOUBLE",
+        "unit": "deg",
+        "ucd": "pos.eq.ra;meta.main",
+        "utype": "mango:EpochPosition.longitude[CS.spaceSys=ICRS CT.epoch=J2000]"
+      },
+      {
+        "name": "dec",
+        "description": "Declination",
+        "datatype": "DOUBLE",
+        "unit": "deg",
+        "ucd": "pos.eq.dec;meta.main",
+        "utype": "mango:EpochPosition.latitude[CS.spaceSys=ICRS CT.epoch=J2000]"
+      },
+      {
+        "name": "ids",
+        "description": "List of all identifiers concatenated with pipe",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "meta.id"
+      }
+    ],
+    "data": [
+      [
+        "BD+47  2846",
+        "Em*",
+        292.24730784422,
+        47.96950472439,
+        "TIC 424865156|AP J19285935+4758102|LAMOST J192859.76+475810.2|Gaia DR3 2129256395211984000|HAT-P-7|AG+47 1439|BD+47  2846|SPOCS 4118|GSC 03547-01402|TOI-1265|PPM  58383|TYC 3547-1402-1|Gaia DR2 2129256395211984000|2MASS J19285935+4758102|Kepler-2|KOI-2|Gaia DR1 2129256390911665920|KIC 10666592"
+      ]
+    ]
+  }
+}

@@ -40,6 +40,7 @@ src/
       pattern-cache/route.ts         # GET/POST sky-radar precomputed pattern cache
       batch-classify/route.ts        # POST start / stop the batch classifier
       batch-classify/status/route.ts # GET live progress of the batch job
+      identity/[id]/route.ts         # On-demand SIMBAD cross-identifier resolution (30-day cache)
   components/
     StarField.tsx         # 3D sky with Three.js — THE MAIN COMPONENT
     HUD.tsx               # Overlay UI (header, crosshair, counter, minimap, onboarding)
@@ -63,6 +64,7 @@ src/
     batchClassifier.ts    # Shared runtime state + worker for the batch classify job
     selectStar.ts         # Shared "select + fly + fetch curve" flow used by clicks and search
     externalEndpoints.ts  # Single source of truth for all external URLs (routes + health check import it)
+    simbadIds.ts          # Pure SIMBAD TAP response → SimbadIdentity parser (app-side, NOT engine)
 packages/
   stellar-vetting-engine/ # MIT-licensed extracted science engine (app is GPL;
                           # see KNOWLEDGE_BASE §9). src/ = the 9 engine modules
@@ -72,7 +74,8 @@ packages/
                           # package.json (tsup build → ESM+CJS+d.ts, own
                           # npm install). NOT published to npm yet.
 scripts/
-    external-health.mjs   # npm run test:external-health — live probe of the 6 external contracts
+    external-health.mjs   # npm run test:external-health — live probe of the 7 external contracts
+    capture-simbad-fixtures.mjs # Refreezes the 4 SIMBAD identity fixtures (live network)
 docs/
     KNOWLEDGE_BASE.md     # Permanent record of confirmed findings + design decisions
     DESIGN_tpf-centroid-analysis.md # TPF Phase-0 audit (measured) + phase-1 design record
@@ -213,6 +216,16 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   (transient artifact, observed live). Strictly on-demand: never
   batch, never auto-run. See docs/DESIGN_tpf-centroid-analysis.md.
 
+- **SIMBAD identity resolver — server side** (phase B2, 2026-07-18):
+  `/api/identity/[id]` resolves any star's SIMBAD cross-identifier
+  record on demand (KIC/TIC/EPIC/HIP/Gaia DR3/2MASS/Tycho + common
+  names like "Boyajian's Star", HAT-P-7, K2-22) with a 30-day
+  schema-versioned per-star disk cache, expired-cache-on-outage
+  fallback, and cached misses. Pure parser in `lib/simbadIds.ts`
+  (app-side, NOT the engine package), 4 frozen real-response
+  fixtures, health check #7. NO UI yet — that's phase B3 (see Next
+  features). See the `/api/identity/[id]` section below.
+
 ### Known bugs / pending 🐛
 - (none currently tracked)
 
@@ -233,6 +246,14 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   cross-check on the segment-scatter error bar; (c) TESS validation
   if a public per-TOI centroid table ever appears. Future ideas — not
   being implemented now.
+- **SIMBAD identity phase B3 — UI integration**: B2 (route + parser +
+  cache + health check + fixtures) shipped 2026-07-18 server-side
+  only. B3 = "ALSO KNOWN AS" block in the AnomalyPanel (fed by
+  `/api/identity`) and search-by-common-name (fold resolved names
+  into the local search index; optionally an explicit
+  press-Enter-to-ask-SIMBAD escape hatch — NEVER per-keystroke
+  queries, see the rate posture in the `/api/identity` section).
+  Awaiting a separate greenlight — not being implemented now.
 
 ## Real-data integration
 
@@ -287,27 +308,31 @@ so the browser never talks to external archives directly (CORS).
 
 ### External endpoint constants (`src/lib/externalEndpoints.ts`)
 Single source of truth for every EXTERNAL data URL the app hits
-(VizieR, NASA KOI/TOI TAP, MAST VO-TAP, MAST FITS download). Both the
-API routes AND the external-health check import from here, so a probe
-can never test a different URL than production sends. Dependency-free
-(no `next/*`) so the plain-Node health harness can import it. The
-lightcurve route's `mastTapQueryUrl` / `mastConeSearchUrl` /
-`resolveSegmentDownloadUrl` moved here; the KOI/TOI/stars routes import
-their TAP/VizieR URLs from here.
+(VizieR, NASA KOI/TOI TAP, MAST VO-TAP, MAST FITS download, SIMBAD
+TAP). Both the API routes AND the external-health check import from
+here, so a probe can never test a different URL than production sends.
+Dependency-free (no `next/*`) so the plain-Node health harness can
+import it. The lightcurve route's `mastTapQueryUrl` /
+`mastConeSearchUrl` / `resolveSegmentDownloadUrl` moved here; the
+KOI/TOI/stars routes import their TAP/VizieR URLs from here; the
+identity route imports `simbadIdsQueryUrl` from here.
 
 ### External-dependency health check (`npm run test:external-health`)
-Live-network probe of the 6 external contracts, using the exact
+Live-network probe of the 7 external contracts, using the exact
 `externalEndpoints.ts` constants. NOT part of `npm test` (which stays
 offline/fast). Each check verifies the CONTRACT, not just reachability:
 Hipparcos required columns present; KOI schema; TOI `tid` column
 present (the historical `tic_id` mistake); MAST TAP returns
 `access_url` rows; a MAST segment actually downloads as valid FITS
-(`SIMPLE  =` magic); and the **TESS TPF URL derivation** — an
+(`SIMPLE  =` magic); the **TESS TPF URL derivation** — an
 UNSHIPPED contract (`-s_lc.fits` → `-s_tp.fits` naming pattern, not a
 documented MAST interface) monitored from day one so a future TESS
 pixel-vetting implementation never builds on an unwatched assumption
 (ranged GET, first FITS block magic only — never the ~47 MB sector
-file). Exit 0 = all healthy, 1 = any failure. Designed
+file); and **SIMBAD TAP identity resolution** — JSON envelope (vs the
+VOTable XML error envelope), `main_id`/`ids` columns by name, and
+Tabby's Star still resolving with its KIC + a TIC cross-id. Exit 0 =
+all healthy, 1 = any failure. Designed
 to catch the class of silent contract change (VizieR column rename,
 endpoint move) that degraded the app to a fallback undetected. It
 distinguishes a VizieR upstream outage ("service degraded") from a
@@ -590,6 +615,50 @@ the star's RA/Dec so the cone-search path has what it needs.
   fixtures in `centroidRegression.test.ts` (runs in `npm run
   test:data`); refreeze via `packages/stellar-vetting-engine/scripts/capture-centroid-fixtures.mjs`
   (live network) + `--print` on the test before updating EXPECTED.
+
+### `/api/identity/[id]` (SIMBAD cross-identifier resolution, 2026-07-18)
+- On-demand resolution of a star's SIMBAD identity record: `main_id`,
+  `otype`, ICRS position, bare KIC/TIC/EPIC/HIP/Gaia DR3/2MASS/Tycho
+  ids, common names (`NAME …` entries + HAT-P/WASP/Kepler/KOI/K2/TOI
+  survey designations), and the full normalized identifier list
+  (`allIds`). Server-side only as of B2 — UI integration (alternate
+  names in the panel, search-by-common-name) is phase B3, not shipped.
+- Queries the CDS SIMBAD TAP sync service via `simbadIdsQueryUrl` in
+  `externalEndpoints.ts` (ADQL over `basic` ⋈ `ids` ⋈ `ident`; the
+  `ident` join matches ANY alias). **Measured facts (2026-07-17/18)**:
+  identifier matching is whitespace-normalized, so app-form un-spaced
+  ids (`KIC8462852`) are sent verbatim; warm latency ~0.3–1.6 s, cold
+  ~2.4 s; a miss is HTTP 200 + empty `data`; a query error is a
+  VOTable XML envelope EVEN with `FORMAT=json` (JSON parse failure ⇒
+  error, never data); the column list lives under `metadata`, NOT
+  `info` as MAST's TAP uses. Parsing locates columns BY NAME and
+  throws on a missing column (contract-change detection, the VizieR
+  lesson).
+- **Rate posture**: CDS blacklists IPs above ~5–10 queries/second (up
+  to an hour). One query per click is far below; NEVER point a batch
+  at this route without throttling (≲2 concurrent + delays).
+- **Per-star disk cache** `<os.tmpdir()>/stellar-cache/identity-<id>.json`,
+  schema-versioned (`CACHE_SCHEMA_VERSION`, bump on any query/shape/
+  parsing change — mismatched entries are refetched, never served),
+  **30-day TTL** (SIMBAD is a living compilation but identifier data
+  is nearly append-only — ids arrive with major catalog releases).
+  Two deliberate behaviors: an EXPIRED same-version entry is served
+  with `stale: true` when the live refetch fails (KOI-outage lesson),
+  and MISSES are cached as `identity: null` (most faint KOI hosts are
+  not in SIMBAD; without this every click re-queries).
+- Response: `{ source: 'real'|'cached'|'unavailable', identity:
+  SimbadIdentity|null, fetchedAt, stale?, error? }`. `identity: null`
+  with source real/cached = "SIMBAD consulted, object unknown" —
+  distinct from `unavailable` (couldn't ask).
+- Parsing lives in `lib/simbadIds.ts` — pure, dependency-free,
+  deliberately app-side (catalog-identifier plumbing, not vetting
+  science; kept OUT of the MIT engine package). Unit-tested against
+  four frozen REAL responses in `src/lib/__tests__/fixtures/simbad/`
+  (KIC8462852 Tabby, KIC10666592 HAT-P-7, TIC25155310 WASP-126,
+  EPIC201637175 = K2-22 — captured 2026-07-18); refreeze via
+  `node --import ./scripts/register-ts-resolver.mjs scripts/capture-simbad-fixtures.mjs`
+  and hand-verify before updating expectations. Route-level cache/TTL
+  wiring is pinned in `src/app/api/__tests__/identityRoute.route.test.ts`.
 
 ### `lib/fitsCore.ts` / `lib/fitsReader.ts` / `lib/tpfReader.ts`
 - `fitsCore.ts` holds the shared low-level primitives (2880-byte block +
@@ -1489,12 +1558,16 @@ BEFORE and AFTER touching the listed area:**
 | `anomalyDetector` / `curveClassifier` / `fitsReader` / `fitsCore` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
 | `tpfReader` / `centroidVet` / `/api/centroid` | `npm run test:data` + `npm run test:unit` (centroid fixtures live in test:data) |
 | `selectStar` / `store` / `persistence` | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
+| `simbadIds` / `/api/identity` | `npm run test:unit` + `npm run test:routes` (frozen SIMBAD fixtures live in `src/lib/__tests__/fixtures/simbad/`) |
 | `StarField` selection paths / CameraSync / disambiguation popover / HUD panels | `npm run test:e2e` |
 | anything else | `npx tsc --noEmit` + verify in the browser, as always |
 
-`npm test` = `test:unit && test:engine` — the fast no-browser gate,
-safe to run reflexively. `test:unit` = APP unit tests
-(`src/lib/__tests__`); `test:engine` = the engine package's full suite
+`npm test` = `test:unit && test:routes && test:engine` — the fast
+no-browser gate, safe to run reflexively. `test:unit` = APP unit tests
+(`src/lib/__tests__`); `test:routes` = API route handlers run directly
+under `node --test` (`src/app/api/__tests__/*.route.test.ts`, via the
+route-test resolver that maps `@/…` and shims `next/server`);
+`test:engine` = the engine package's full suite
 (its unit tests + both data-regression suites + the architecture
 guard, run via `npm --prefix packages/stellar-vetting-engine test`);
 `test:data` delegates to the package's data-regression suites only

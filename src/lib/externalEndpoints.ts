@@ -10,7 +10,7 @@
  * the plain-Node health-check harness can import it without pulling in the
  * Next.js server bundle.
  *
- * Six external contracts are represented, matching the six health
+ * Seven external contracts are represented, matching the seven health
  * checks:
  *   1. VizieR (Hipparcos catalog)                → `VIZIER_HIP_URL`
  *   2. NASA Exoplanet Archive KOI (Kepler)       → `KOI_TAP_URL`
@@ -22,6 +22,8 @@
  *      `_tp.fits`; the URL is derived from the `-s_lc.fits` listing).
  *      Monitored since BEFORE the TESS path shipped, per the
  *      never-build-on-an-unwatched-assumption rule.
+ *   7. SIMBAD TAP identity resolution            → `simbadIdsQueryUrl()`
+ *      — used by /api/identity's cross-identifier lookup.
  */
 
 /**
@@ -208,3 +210,55 @@ export function deriveTessTpfUrl(accessUrl: string): string | null {
   const tpUri = inner.replace(/-s_lc\.fits$/, '-s_tp.fits')
   return `https://mast.stsci.edu/api/v0.1/Download/file?uri=${encodeURIComponent(tpUri)}`
 }
+
+/** @description Base of the CDS SIMBAD synchronous TAP query service. */
+export const SIMBAD_TAP_SYNC_URL = 'https://simbad.cds.unistra.fr/simbad/sim-tap/sync'
+
+/**
+ * @description Builds the SIMBAD TAP query URL that resolves one
+ * identifier to the object's full cross-identification record: `main_id`
+ * + `otype` + ICRS position from the `basic` table, and every known
+ * identifier pipe-concatenated in the `ids` column. The `ident` join
+ * matches ANY alias of the object, and SIMBAD's identifier matching is
+ * whitespace-normalized (measured 2026-07-17: `KIC8462852` resolves
+ * identically to `KIC 8462852`), so the app's un-spaced star ids are
+ * passed verbatim. Shared by /api/identity (production) and the
+ * external-health check (probe) so the two can never drift.
+ *
+ * A miss (object not in SIMBAD) is HTTP 200 with an empty `data` array.
+ * A malformed query returns a VOTable XML error envelope
+ * (`QUERY_STATUS=ERROR`) even with `FORMAT=json` — callers must treat a
+ * JSON parse failure as an upstream/query error, not as data.
+ *
+ * Fair use (CDS policy, quoted in astroquery's SIMBAD docs): more than
+ * ~5–10 queries/second gets the IP blacklisted for up to an hour. The
+ * on-demand one-query-per-click pattern is far below this; any future
+ * BATCH resolution must throttle to ≲2 concurrent with delays.
+ * @param identifier Any SIMBAD-known identifier (e.g. `KIC8462852`,
+ * `TIC 25155310`, `HIP 11767`). Single quotes are ADQL-escaped.
+ * @returns Fully-formed GET URL against `SIMBAD_TAP_SYNC_URL`.
+ */
+export function simbadIdsQueryUrl(identifier: string): string {
+  const escaped = identifier.replace(/'/g, "''")
+  const adql =
+    'SELECT b.main_id, b.otype, b.ra, b.dec, ids.ids ' +
+    'FROM basic AS b ' +
+    'JOIN ids ON ids.oidref = b.oid ' +
+    'JOIN ident ON ident.oidref = b.oid ' +
+    `WHERE ident.id = '${escaped}'`
+  const params = new URLSearchParams({
+    REQUEST: 'doQuery',
+    LANG: 'ADQL',
+    FORMAT: 'json',
+    QUERY: adql,
+  })
+  return `${SIMBAD_TAP_SYNC_URL}?${params.toString()}`
+}
+
+/**
+ * @description Identifier used by the health check's SIMBAD probe —
+ * Tabby's Star in the app's own un-spaced id form, i.e. exactly what
+ * /api/identity sends in production. Guaranteed present in SIMBAD with
+ * a rich cross-id record (13 identifiers as of 2026-07-17).
+ */
+export const SIMBAD_HEALTH_PROBE_IDENTIFIER = 'KIC8462852'
