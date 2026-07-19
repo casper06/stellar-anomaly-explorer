@@ -47,3 +47,7 @@ next-env.d.ts
 # extracted engine package (own install + build output)
 packages/*/node_modules/
 packages/*/dist/
+
+# Claude Code local config (model preference + machine-specific permission
+# allowlist with absolute paths) — personal, not shared project config
+.claude/

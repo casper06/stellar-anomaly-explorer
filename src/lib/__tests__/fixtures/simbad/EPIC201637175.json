@@ -1,0 +1,57 @@
+{
+  "capturedAt": "2026-07-18T13:58:13.724Z",
+  "identifier": "EPIC201637175",
+  "url": "https://simbad.cds.unistra.fr/simbad/sim-tap/sync?REQUEST=doQuery&LANG=ADQL&FORMAT=json&QUERY=SELECT+b.main_id%2C+b.otype%2C+b.ra%2C+b.dec%2C+ids.ids+FROM+basic+AS+b+JOIN+ids+ON+ids.oidref+%3D+b.oid+JOIN+ident+ON+ident.oidref+%3D+b.oid+WHERE+ident.id+%3D+%27EPIC201637175%27",
+  "response": {
+    "metadata": [
+      {
+        "name": "main_id",
+        "description": "Main identifier for an object",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "meta.id;meta.main",
+        "utype": "mango:MangoObject.identifier"
+      },
+      {
+        "name": "otype",
+        "description": "Object type",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "src.class",
+        "utype": "mango:Label.text[CT.vocabulary=https://www.ivoa.net/rdf/uat#classification]"
+      },
+      {
+        "name": "ra",
+        "description": "Right ascension",
+        "datatype": "DOUBLE",
+        "unit": "deg",
+        "ucd": "pos.eq.ra;meta.main",
+        "utype": "mango:EpochPosition.longitude[CS.spaceSys=ICRS CT.epoch=J2000]"
+      },
+      {
+        "name": "dec",
+        "description": "Declination",
+        "datatype": "DOUBLE",
+        "unit": "deg",
+        "ucd": "pos.eq.dec;meta.main",
+        "utype": "mango:EpochPosition.latitude[CS.spaceSys=ICRS CT.epoch=J2000]"
+      },
+      {
+        "name": "ids",
+        "description": "List of all identifiers concatenated with pipe",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "meta.id"
+      }
+    ],
+    "data": [
+      [
+        "K2-22",
+        "LM*",
+        169.48282206773,
+        2.6190564899399997,
+        "TIC 363445338|LAMOST J111755.86+023708.6|LAMOST J111755.87+023708.6|Gaia DR3 3811002791880297600|Gaia DR2 3811002791880297600|2MASS J11175587+0237086|SDSS J111755.88+023708.6|EPIC 201637175|K2-22|UCAC4 464-046484|AP J11175587+0237086"
+      ]
+    ]
+  }
+}

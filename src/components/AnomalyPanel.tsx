@@ -6,6 +6,7 @@ import { BLS_SDE_THRESHOLD, type BlsResult } from '@/lib/bls'
 import type { CentroidStamp, CentroidVetResult } from '@/lib/centroidVet'
 import { fetchCentroidVet, type CentroidVetPayload, type CentroidVetFailure } from '@/lib/centroidClient'
 import { constellationAt, describeVisibilityStory } from '@/lib/constellations'
+import { selectDisplayNames, type SimbadIdentity } from '@/lib/simbadIds'
 import LightCurve from './LightCurve'
 
 /**
@@ -1390,7 +1391,7 @@ function DipProvenanceLine({ provenance }: { provenance?: LightcurveProvenance }
  * @returns The panel, or null when no star is selected.
  */
 export default function AnomalyPanel() {
-  const { selectedStar, lightcurve, lightcurveLoading, setSelectedStar, setMode, flaggedIds, toggleFlagged } = useStore()
+  const { selectedStar, lightcurve, lightcurveLoading, identity, identityLoading, setSelectedStar, setMode, flaggedIds, toggleFlagged } = useStore()
   const [showLightcurve, setShowLightcurve] = useState(false)
 
   if (!selectedStar) return null
@@ -1556,6 +1557,15 @@ export default function AnomalyPanel() {
         >
           {describeVisibilityStory(selectedStar.ra, selectedStar.dec)}
         </div>
+
+        {/* Alternate designations from SIMBAD. Renders nothing at all on
+            a miss, a failure, or when every name is already on screen —
+            see AlsoKnownAs. */}
+        <AlsoKnownAs
+          identity={identity}
+          loading={identityLoading}
+          displayed={[selectedStar.name, selectedStar.id]}
+        />
 
         <Divider />
 
@@ -1812,6 +1822,104 @@ function InfoRow({
  */
 function Divider() {
   return <div style={{ height: 1, background: 'rgba(255,255,255,0.06)', margin: '12px 0' }} />
+}
+
+/**
+ * @description How long the identity lookup must stay in flight before the
+ * panel shows a placeholder. SIMBAD answers in ~0.3–2.4 s live, but a disk
+ * cache hit returns in a few ms — without this delay every revisit would
+ * flash a one-frame "RESOLVING…" line, which reads as a glitch. 400 ms is
+ * above the cache-hit path and below the point where silence feels broken.
+ */
+const IDENTITY_PLACEHOLDER_DELAY_MS = 400
+
+/**
+ * @description "ALSO KNOWN AS" block: the star's alternate designations
+ * from SIMBAD (common names like "Boyajian's Star", plus SIMBAD's
+ * canonical `main_id` when it adds information).
+ *
+ * Absence is not news. This is bonus cross-reference context, not a core
+ * feature — most faint KOI hosts are simply not in SIMBAD, which is a
+ * normal answer, not an error. So the block renders NOTHING when the
+ * lookup missed, failed, or returned only names the panel already shows.
+ * There is deliberately no error state and no "not found" message: they
+ * would clutter the panel on the common case while telling the user
+ * something they cannot act on.
+ * @param identity Resolved identity, or null for miss/failure/pending.
+ * @param loading True while the lookup is in flight.
+ * @param displayed Strings already shown for this star (name, id), so
+ * the block doesn't echo them back.
+ * @returns The block, or null when there is nothing worth showing.
+ */
+function AlsoKnownAs({
+  identity,
+  loading,
+  displayed,
+}: {
+  identity: SimbadIdentity | null
+  loading: boolean
+  displayed: string[]
+}) {
+  // Gate the placeholder behind a short delay so cache hits (a few ms)
+  // resolve before it would ever paint.
+  const [showPlaceholder, setShowPlaceholder] = useState(false)
+  useEffect(() => {
+    if (!loading) {
+      setShowPlaceholder(false)
+      return
+    }
+    const t = setTimeout(() => setShowPlaceholder(true), IDENTITY_PLACEHOLDER_DELAY_MS)
+    return () => clearTimeout(t)
+  }, [loading])
+
+  if (loading) {
+    if (!showPlaceholder) return null
+    return (
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.25)', letterSpacing: 2, marginBottom: 12 }}>
+        RESOLVING IDENTITY…
+      </div>
+    )
+  }
+
+  if (!identity) return null
+  const { names, mainId } = selectDisplayNames(identity, displayed)
+  if (names.length === 0 && !mainId) return null
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginBottom: 6 }}>
+        ALSO KNOWN AS
+      </div>
+      {names.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: mainId ? 6 : 0 }}>
+          {names.map(name => (
+            <span
+              key={name}
+              style={{
+                fontSize: 10,
+                color: 'rgba(255,255,255,0.85)',
+                letterSpacing: 0.5,
+                padding: '2px 6px',
+                border: '1px solid rgba(76,201,240,0.25)',
+                borderRadius: 3,
+                background: 'rgba(76,201,240,0.07)',
+              }}
+            >
+              {name}
+            </span>
+          ))}
+        </div>
+      )}
+      {mainId && (
+        <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.45)', letterSpacing: 0.3 }}>
+          SIMBAD: {mainId}
+        </div>
+      )}
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.25)', letterSpacing: 0.3, marginTop: 4 }}>
+        via SIMBAD (CDS)
+      </div>
+    </div>
+  )
 }
 
 /**

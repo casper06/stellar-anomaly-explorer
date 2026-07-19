@@ -1,16 +1,16 @@
 /**
- * @description External-dependency health check. Probes the SIX external
- * contracts the app relies on, using the EXACT endpoint constants and
- * URL builders the production API routes use (imported from
- * `src/lib/externalEndpoints.ts`), so a contract change at any provider —
- * an endpoint move, a renamed column, a schema change — surfaces here
- * instead of silently degrading the app to a fallback.
+ * @description External-dependency health check. Probes the SEVEN
+ * external contracts the app relies on, using the EXACT endpoint
+ * constants and URL builders the production API routes use (imported
+ * from `src/lib/externalEndpoints.ts`), so a contract change at any
+ * provider — an endpoint move, a renamed column, a schema change —
+ * surfaces here instead of silently degrading the app to a fallback.
  *
  * Run with `npm run test:external-health`. This hits the live network and
  * is intentionally NOT part of `npm test` (which must stay offline and
- * fast). Exit code 0 = all six healthy; 1 = one or more failed.
+ * fast). Exit code 0 = all seven healthy; 1 = one or more failed.
  *
- * The six checks:
+ * The seven checks:
  *   1. VizieR (Hipparcos catalog)              — /api/stars
  *   2. NASA Exoplanet Archive KOI (Kepler)     — /api/koi
  *   3. NASA Exoplanet Archive TOI (TESS)       — /api/toi
@@ -21,6 +21,11 @@
  *      `-s_tp.fits`), not a documented MAST contract; it was monitored
  *      here BEFORE the TESS implementation landed and is load-bearing
  *      now.
+ *   7. SIMBAD TAP identity resolution          — /api/identity. Verifies
+ *      the JSON envelope (vs the VOTable XML error envelope SIMBAD
+ *      returns for query errors even with FORMAT=json), the
+ *      `main_id`/`ids` column names, and that Tabby's Star still
+ *      resolves with its KIC and a TIC cross-identifier.
  *
  * Each check verifies not just "reachable" but "still shaped how we
  * parse it" — the Hipparcos required columns, the `tid` TOI column, an
@@ -38,6 +43,8 @@ import {
   MAST_HEALTH_PROBE_TARGET,
   TESS_TPF_HEALTH_PROBE_TARGET,
   deriveTessTpfUrl,
+  simbadIdsQueryUrl,
+  SIMBAD_HEALTH_PROBE_IDENTIFIER,
 } from '../src/lib/externalEndpoints.ts'
 
 /** @description Per-check network timeout. Some of these services are slow cold. */
@@ -215,20 +222,61 @@ async function checkTessTpfDerivation() {
 }
 
 /**
- * @description Runs all six checks in order (checks 4→5 are dependent,
+ * @description Check 7 — SIMBAD TAP identity resolution (load-bearing
+ * for /api/identity). Resolves Tabby's Star through the exact
+ * `simbadIdsQueryUrl` builder production uses and asserts the measured
+ * contract: JSON envelope (a VOTable XML body = SIMBAD rejected the
+ * query — reported as an upstream/query error, distinct from a column
+ * rename), `main_id` + `ids` columns present BY NAME, ≥1 data row, and
+ * the `ids` string still carrying `KIC 8462852` plus a `TIC ` entry
+ * (cross-mission identifiers are the whole point of the feature).
+ */
+async function checkSimbad() {
+  const res = await get(simbadIdsQueryUrl(SIMBAD_HEALTH_PROBE_IDENTIFIER))
+  const text = await res.text()
+  let json
+  try {
+    json = JSON.parse(text)
+  } catch {
+    const votableError = /QUERY_STATUS[^>]*ERROR/.test(text)
+    throw new Error(
+      votableError
+        ? `SIMBAD rejected the query (VOTable error envelope): ${text.slice(0, 200)}`
+        : `response was not JSON: ${text.slice(0, 200)}`,
+    )
+  }
+  if (!Array.isArray(json.metadata) || !Array.isArray(json.data)) {
+    throw new Error(`response missing metadata/data arrays; keys: [${Object.keys(json).join(', ')}]`)
+  }
+  const cols = json.metadata.map(c => c.name)
+  for (const name of ['main_id', 'ids']) {
+    if (!cols.includes(name)) throw new Error(`response missing '${name}' column; columns: [${cols.join(', ')}]`)
+  }
+  if (json.data.length === 0) {
+    throw new Error(`0 rows for ${SIMBAD_HEALTH_PROBE_IDENTIFIER} (Tabby's Star should always resolve)`)
+  }
+  const ids = String(json.data[0][cols.indexOf('ids')] ?? '')
+  if (!ids.includes('KIC 8462852')) throw new Error(`ids string lost 'KIC 8462852': ${ids.slice(0, 200)}`)
+  if (!/(^|\|)TIC \d+/.test(ids)) throw new Error(`ids string has no TIC entry: ${ids.slice(0, 200)}`)
+  return `identity OK (${ids.split('|').length} cross-ids, KIC + TIC present)`
+}
+
+/**
+ * @description Runs all seven checks in order (checks 4→5 are dependent,
  * the rest independent), prints an aligned report, and exits non-zero if
  * any failed.
  */
 async function main() {
-  console.log('External dependency health check — probing 6 live contracts\n')
+  console.log('External dependency health check — probing 7 live contracts\n')
   const results = []
   // Independent checks first, in parallel.
-  const [vizier, koi, toi] = await Promise.all([
+  const [vizier, koi, toi, simbad] = await Promise.all([
     runCheck('VizieR (Hipparcos)', checkVizier),
     runCheck('NASA KOI (Kepler)', checkKoi),
     runCheck('NASA TOI (TESS)', checkToi),
+    runCheck('SIMBAD TAP (identity)', checkSimbad),
   ])
-  results.push(vizier, koi, toi)
+  results.push(vizier, koi, toi, simbad)
   // MAST TAP must run before MAST download (download reuses TAP's segment URL).
   const mastTap = await runCheck('MAST VO-TAP (discovery)', checkMastTap)
   results.push(mastTap)

@@ -607,8 +607,204 @@ The core science modules were extracted into a standalone package at
   The name `stellar-vetting-engine` is provisional until an npm
   availability check at publish time.
 
+## 10. SIMBAD TAP identity resolution — measured contract (2026-07-17/18)
+
+Phase B1 (investigation, 2026-07-17) measured the CDS SIMBAD TAP
+service against real queries before any code; phase B2 (2026-07-18)
+shipped the server side: `/api/identity/[id]` + `lib/simbadIds.ts` +
+health check #7 + four frozen fixtures; phase B3 (2026-07-18) shipped
+the UI, mechanism (a) only (see the B3 subsection at the end of this
+§). Everything below was MEASURED, not assumed from documentation.
+
+**Service contract (all verified live):**
+- Endpoint `https://simbad.cds.unistra.fr/simbad/sim-tap/sync`, same
+  ADQL/TAP GET pattern as MAST (`REQUEST=doQuery&LANG=ADQL&FORMAT=json`).
+  No auth.
+- Query shape: `basic ⋈ ids ⋈ ident WHERE ident.id = '<alias>'` —
+  the `ident` join matches ANY known alias; `ids.ids` returns every
+  identifier pipe-concatenated in one row.
+- **Identifier matching is whitespace-normalized**: `KIC8462852`
+  (app form) resolves identically to `KIC 8462852`. Verified for
+  KIC/TIC/EPIC/HIP prefixes. App ids are sent verbatim.
+- **Latency**: warm ~0.3–1.6 s (median ~0.8 s), cold ~2.4 s.
+  Payloads ~0.5–1 KB.
+- **Miss** = HTTP 200 with empty `data` (expected for most faint KOI
+  hosts — SIMBAD indexes studied objects, not all of Kepler's field).
+- **Query error** = VOTable XML envelope (`QUERY_STATUS=ERROR`) even
+  with `FORMAT=json`. JSON parse failure must be treated as an
+  upstream/query error, never as data.
+- **JSON shape gotcha**: columns are listed under `metadata`, NOT
+  `info` as MAST's TAP uses. The parser locates columns BY NAME and
+  throws on a missing one (the VizieR column-rename lesson).
+- **Rate policy** (CDS, quoted in astroquery docs; not on the TAP
+  pages themselves): > ~5–10 queries/second ⇒ IP blacklisted up to an
+  hour. On-demand per-click use is orders of magnitude below. Any
+  future batch resolution must throttle to ≲2 concurrent with delays
+  — do NOT reuse the batch classifier's MAX_CONCURRENCY=5 pattern.
+
+**Identity payoffs found during measurement:**
+- EPIC 201637175 (one of the 11 seeds) is **K2-22** — the famous
+  disintegrating-planet host. The seed table never knew this.
+- HAT-P-7 (KIC 10666592) pins the **Gaia DR1 ≠ DR2/DR3 source_id**
+  subtlety (DR1 …0911665920 vs DR2/DR3 …5211984000) — parsers must
+  key on `Gaia DR3` specifically, never "Gaia".
+- SIMBAD's `main_id` is often NOT the queried id (Tabby's is
+  `TYC 3162-665-1`; HAT-P-7's was served as `BD+47  2846` — note the
+  catalog-native double space, which is why normalization collapses
+  whitespace runs).
+
+**Design decisions (B1, approved 2026-07-18):**
+- On-demand resolution with a 30-day schema-versioned per-star disk
+  cache — SIMBAD is a living compilation, but identifier data is
+  nearly append-only (ids arrive with major catalog releases), so
+  30 days bounds staleness without churn. Expired same-version
+  entries are served `stale: true` when the refetch fails; misses
+  are cached as `identity: null`.
+- Parsing is pure and offline-testable but deliberately APP-SIDE
+  (`lib/simbadIds.ts`), not in the MIT engine package: identifier
+  string munging is catalog plumbing, not vetting science — putting
+  it in the package would dilute its scope (JOSS framing) even
+  though it would technically pass the architecture guard.
+- Fixtures are the four REAL captured responses (Tabby, HAT-P-7,
+  WASP-126, K2-22) under `src/lib/__tests__/fixtures/simbad/`, with
+  capture provenance (date + exact URL) embedded in each file.
+  Refreeze: `scripts/capture-simbad-fixtures.mjs` (throttled 1 q/s).
+
+**Phase B3 — UI integration, mechanism (a) (2026-07-18):**
+
+Shipped: the AnomalyPanel's "ALSO KNOWN AS" block and
+search-by-already-resolved-common-name. Mechanism (b) — the explicit
+press-Enter-to-ask-SIMBAD escape hatch for stars never opened — was
+deferred at the time and shipped later the same day; see the
+mechanism (b) section below.
+
+- **Absence renders as nothing, not as an error.** A SIMBAD miss is
+  the COMMON case (most faint KOI hosts aren't indexed), so a
+  "not found" row would fire constantly while telling the user
+  something unactionable. Miss, route failure, and
+  everything-was-redundant all collapse to the same output: no
+  block. `identityClient.fetchIdentity` flattens the route's
+  miss-vs-outage distinction for exactly this reason — the
+  distinction is real and matters SERVER-side (a confirmed miss is
+  cached, an outage is not), but it buys the UI nothing.
+- **The 400 ms placeholder gate is a measured fix, not a guess.**
+  Warm disk-cache hits return in single-digit ms; without the delay
+  every revisit flashed a one-frame "RESOLVING IDENTITY…" that read
+  as a rendering glitch. Verified in-browser: the placeholder does
+  NOT appear on a warm re-select.
+- **Identity resolves CONCURRENTLY with the light curve.** SIMBAD is
+  ~0.3–2.4 s; a MAST cold path is ~60 s. Awaiting identity inside
+  the curve path would hide the names behind the slowest thing on
+  screen for no reason — they share nothing.
+- **The generation guard is narrower for identity than for the
+  curve, and the difference is load-bearing.** A superseded curve is
+  discarded wholesale (writing it would pair star A's header with
+  star B's data). A superseded IDENTITY is kept out of the panel
+  slot but still written to the search index via `indexIdentity`:
+  the index is keyed by star id, so it cannot mislabel the current
+  selection, and dropping it would discard a SIMBAD query already
+  spent. This asymmetry was caught by a unit test written on the
+  wrong assumption (that the curve's discard-everything rule should
+  apply verbatim) — the test failed, and the failure was the
+  correct signal. Both behaviors are now pinned:
+  `resolvedIdentities` gains the stale star, `identity` does not.
+- **INSTANT search coverage is visited-stars-only BY DESIGN.**
+  Folding resolved identities into the local match set is free and
+  instant. Universal common-name search AS YOU TYPE would require a
+  SIMBAD query per keystroke, which the B1 rate posture (~5–10 q/s ⇒
+  blacklist) rules out categorically. Alias hits rank BELOW the
+  equivalent catalog hit, and matched rows show `↳ <alias>` so a row
+  whose visible text lacks the query explains itself. (Mechanism (b)
+  later added an EXPLICIT one-query-per-keypress escape hatch on top
+  of this — it does not change the typing-fires-nothing rule, which
+  is now enforced by an E2E test.)
+- **`selectDisplayNames` lives in `lib/simbadIds.ts`, not the
+  component** — it is identifier string munging (that module's
+  stated scope) and the redundancy check is the same
+  whitespace/case-insensitive matching the file already owns. Keeps
+  it pure and offline-testable against the frozen fixtures.
+
+**Phase B3 — mechanism (b), the ask-SIMBAD escape hatch (2026-07-18):**
+
+Shipped. Pressing Enter when local search has NO match resolves the
+typed text through SIMBAD, then checks the answer against the catalog
+the app actually renders. This CLOSES the open question recorded here
+previously ("what to do with a hit that resolves to a star we don't
+render") — the answer is a third outcome, `not-tracked`, reported
+honestly and without moving the camera.
+
+- **The open question's answer: say both facts, move nothing.** The
+  copy names SIMBAD's recognition AND our non-coverage — "SIMBAD
+  recognizes Andromeda, but it isn't in our tracked
+  Kepler/TESS/Hipparcos catalog". Reporting only the second half
+  would read as "no such object", which is false and would leave a
+  user doubting a correctly-typed name. Flying to the resolved
+  coordinates was rejected outright: it would point at empty sky and
+  present that as a result.
+- **Membership is tested against the LIVE catalog, never inferred.**
+  Two cheaper proxies were measured and both are WRONG:
+  (a) object type — `3C 273` is a BL Lac quasar that nonetheless
+  carries `HIP 60936` and `EPIC 229151988`; (b) mere presence of a
+  catalog id — Betelgeuse and Vega both carry a TIC (TESS observed
+  most of the bright sky). Only `resolveAgainstCatalog(identity,
+  anomalyStars)` can answer it, so the catalog is passed in and read
+  through a ref (it can finish merging while the query is in flight).
+- **TRAPPIST-1 is the case that proves the design.** It carries
+  `TIC 278892590` + `EPIC 200164267` and LOOKS like an
+  out-of-catalog object — but NASA's TOI table lists `TOI 6838.01`
+  with `tid = 278892590`, the same star. Asking resolves it to a
+  real, rendered TOI and flies there (verified in-browser: landed at
+  RA 346.626°/−5.043°, within ~18″ of SIMBAD's position). A
+  "probably not ours" heuristic would have wrongly refused it.
+- **Id preference order is KIC → TIC → EPIC → HIP, deliberately.**
+  A mission id means real photometry (the point of the app); a HIP
+  hit means we can only point at a background star with no light
+  curve. HIP last ensures a mission target wins whenever both are
+  present. Unit-pinned in both directions.
+- **One route, no new endpoint.** Names go through
+  `/api/identity/[id]` unchanged, because the existing ADQL joins
+  SIMBAD's `ident` table, which matches ANY alias — upstream, an id
+  and a name are the same query (measured: "Boyajian's Star",
+  "BOYAJIAN'S STAR", "boyajian's star" all return one record in
+  0.3–1.7 s). What DID change: `SAFE_ID` → `SAFE_LOOKUP`, since real
+  names carry spaces and apostrophes and the old regex would have
+  400ed the feature's own headline case.
+- **Widening the input alphabet did NOT widen filesystem exposure.**
+  `SAFE_ID` had been doing double duty as the cache-filename guard.
+  Cache keys are now derived by `cacheKeyFor` (lowercase,
+  whitespace-collapsed, every non-`[a-z0-9._-]` char replaced), so
+  filename safety no longer depends on the input regex at all. The
+  normalization also makes case/spacing variants share ONE cache
+  entry, matching SIMBAD's own matching semantics. Cache schema
+  bumped 1 → 2 because keys moved (`identity-KIC8462852.json` →
+  `identity-kic8462852.json`); v1 files are simply never read again.
+- **Explicit-only, and the invariant is TESTED, not just intended.**
+  An E2E test asserts that typing a 8-char query fires ZERO
+  `/api/identity` requests and that one Enter fires exactly one.
+  This is the B1 rate posture (~5–10 q/s ⇒ CDS blacklists the IP)
+  turned into a regression guard, so a future "search as you type"
+  refactor fails loudly instead of quietly getting the IP banned.
+- **`unknown` and `error` stay separate.** `fetchIdentityByName`
+  returns `'error'` distinctly from `null`, unlike the panel's
+  `fetchIdentity` which flattens both. The panel can afford to
+  flatten (both mean "render nothing"); the search box cannot —
+  reporting our own outage as "SIMBAD doesn't know that name" would
+  blame the user for our failure.
+- **A successful ask permanently improves local search.** The
+  resolved identity is folded into `resolvedIdentities` via
+  `indexIdentity`, so the name matches INSTANTLY next time. One
+  query buys a permanent alias rather than being spent once.
+- **M31 is the frozen fixture for the not-tracked branch** — a real
+  captured response with 41 identifiers and not one KIC/TIC/EPIC/HIP.
+  The unit test asserts that premise explicitly, so if SIMBAD ever
+  adds a stellar id to M31 the test fails loudly instead of silently
+  changing meaning.
+
 ---
 
-*Last updated 2026-07-10. When an open issue in §7 is fixed, move it to
+*Last updated 2026-07-18 (§10 extended with phase B3 mechanism (b);
+its previously-open design question is now CLOSED — resolved as the
+`not-tracked` outcome).
+When an open issue in §7 is fixed, move it to
 the relevant "FIXED" section with its root cause, and update the K00931.01
 entry (§4) once §7.1 is resolved.*

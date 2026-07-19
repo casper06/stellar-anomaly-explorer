@@ -1,6 +1,7 @@
 import { useStore, type Star } from './store'
 import { fetchLightcurve, detectDips } from './anomalyDetector'
 import { classifyCurveAsync } from './classifyAsync'
+import { fetchIdentity } from './identityClient'
 
 /**
  * @description Monotonic generation counter for selection requests. Each
@@ -15,11 +16,47 @@ import { classifyCurveAsync } from './classifyAsync'
 let selectionGeneration = 0
 
 /**
+ * @description Resolves the star's SIMBAD identity and pushes it into the
+ * store, guarded by the same generation counter as the light curve.
+ *
+ * Deliberately NOT awaited inside the light-curve path: SIMBAD answers in
+ * ~0.3–2.4 s while a cold MAST fetch can take ~60 s, so serializing them
+ * would hide the alternate names behind the slowest thing on screen. The
+ * two run concurrently and land independently.
+ *
+ * `fetchIdentity` never throws and never rejects, so there is no catch
+ * here — a miss and an outage both arrive as `null`, which clears the
+ * slot and renders as nothing.
+ * @param star The star being selected.
+ * @param generation The caller's claimed selection generation.
+ */
+async function resolveIdentityFor(star: Star, generation: number): Promise<void> {
+  const { setIdentity, indexIdentity, setIdentityLoading } = useStore.getState()
+  try {
+    const identity = await fetchIdentity(star.id)
+    if (generation !== selectionGeneration) {
+      // A newer selection owns the PANEL slot, so this result must not be
+      // shown. It is still a legitimate resolution of `star.id` though —
+      // and the search index is keyed by id, so recording it cannot
+      // mislabel anything. Indexing here keeps the SIMBAD query we
+      // already spent (and the alias it bought) instead of discarding it
+      // just because the user moved on before it landed.
+      if (identity) indexIdentity(star.id, identity)
+      return
+    }
+    setIdentity(star.id, identity)
+  } finally {
+    if (generation === selectionGeneration) setIdentityLoading(false)
+  }
+}
+
+/**
  * @description Selects a star: switches the UI to analyze mode, fetches its
  * light curve, detects dips, classifies the curve, and pushes everything
- * into the store so the AnomalyPanel can render. Also records the star as
- * visited (persisted) and lazily fills the shared server-side pattern
- * cache when a valid profile is produced.
+ * into the store so the AnomalyPanel can render. Concurrently resolves the
+ * star's SIMBAD identity for the panel's "ALSO KNOWN AS" block. Also
+ * records the star as visited (persisted) and lazily fills the shared
+ * server-side pattern cache when a valid profile is produced.
  *
  * Pulled out of StarField.tsx so non-canvas call sites (HUD search bar,
  * flagged panel row click, etc.) can drive the exact same flow as a
@@ -41,6 +78,8 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
     setLightcurve,
     setAnomalies,
     setLightcurveLoading,
+    setIdentity,
+    setIdentityLoading,
     markVisited,
     setClassifiedPattern,
   } = useStore.getState()
@@ -59,6 +98,12 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
   markVisited(star.id)
   setLightcurve(null)
   setLightcurveLoading(true)
+  // Clear the previous star's names immediately so the panel can never
+  // pair this star's header with the last star's aliases, then resolve
+  // concurrently with the light curve (see resolveIdentityFor).
+  setIdentity(star.id, null)
+  setIdentityLoading(true)
+  void resolveIdentityFor(star, generation)
   try {
     // Catalog stars (KIC*/TIC*/EPIC*) get the default behavior:
     // synthetic-in-dev fallback if MAST is down. Anything else is

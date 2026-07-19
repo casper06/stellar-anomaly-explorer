@@ -40,6 +40,7 @@ src/
       pattern-cache/route.ts         # GET/POST sky-radar precomputed pattern cache
       batch-classify/route.ts        # POST start / stop the batch classifier
       batch-classify/status/route.ts # GET live progress of the batch job
+      identity/[id]/route.ts         # On-demand SIMBAD cross-identifier resolution (30-day cache)
   components/
     StarField.tsx         # 3D sky with Three.js — THE MAIN COMPONENT
     HUD.tsx               # Overlay UI (header, crosshair, counter, minimap, onboarding)
@@ -63,6 +64,16 @@ src/
     batchClassifier.ts    # Shared runtime state + worker for the batch classify job
     selectStar.ts         # Shared "select + fly + fetch curve" flow used by clicks and search
     externalEndpoints.ts  # Single source of truth for all external URLs (routes + health check import it)
+    simbadIds.ts          # Pure SIMBAD TAP response → SimbadIdentity parser +
+                          # selectDisplayNames (panel "also known as" filtering);
+                          # app-side, NOT engine
+    identityClient.ts     # Browser fetch wrapper for /api/identity. fetchIdentity()
+                          # never throws (null on any failure, panel path);
+                          # fetchIdentityByName() keeps miss vs outage distinct
+                          # (search path — the copy differs)
+    catalogMembership.ts  # Pure: SIMBAD identity → "is this a star WE render?"
+                          # (matched / not-tracked / unknown). Backs the search
+                          # box's ask-SIMBAD escape hatch; app-side, NOT engine
 packages/
   stellar-vetting-engine/ # MIT-licensed extracted science engine (app is GPL;
                           # see KNOWLEDGE_BASE §9). src/ = the 9 engine modules
@@ -72,7 +83,8 @@ packages/
                           # package.json (tsup build → ESM+CJS+d.ts, own
                           # npm install). NOT published to npm yet.
 scripts/
-    external-health.mjs   # npm run test:external-health — live probe of the 6 external contracts
+    external-health.mjs   # npm run test:external-health — live probe of the 7 external contracts
+    capture-simbad-fixtures.mjs # Refreezes the 4 SIMBAD identity fixtures (live network)
 docs/
     KNOWLEDGE_BASE.md     # Permanent record of confirmed findings + design decisions
     DESIGN_tpf-centroid-analysis.md # TPF Phase-0 audit (measured) + phase-1 design record
@@ -213,6 +225,100 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   (transient artifact, observed live). Strictly on-demand: never
   batch, never auto-run. See docs/DESIGN_tpf-centroid-analysis.md.
 
+- **SIMBAD identity resolver** (phase B2 server-side + phase B3 UI,
+  2026-07-18): `/api/identity/[id]` resolves any star's SIMBAD
+  cross-identifier record on demand (KIC/TIC/EPIC/HIP/Gaia DR3/2MASS/
+  Tycho + common names like "Boyajian's Star", HAT-P-7, K2-22) with a
+  30-day schema-versioned per-star disk cache, expired-cache-on-outage
+  fallback, and cached misses. Pure parser in `lib/simbadIds.ts`
+  (app-side, NOT the engine package), 4 frozen real-response
+  fixtures, health check #7. See the `/api/identity/[id]` section
+  below.
+
+  **B3 UI mechanism (a)** (the instant, no-extra-query half; the
+  explicit press-Enter-to-ask escape hatch is mechanism (b), covered
+  after this):
+  - **"ALSO KNOWN AS" block** in the AnomalyPanel, between the
+    visibility copy and the dips list: common-name chips + SIMBAD's
+    `main_id` when it adds information (Tabby's reads
+    `TYC 3162-665-1`) + a "via SIMBAD (CDS)" attribution line.
+    Resolved via `selectDisplayNames` in `lib/simbadIds.ts`, which
+    drops any name the panel already shows (case/whitespace-
+    insensitive) so the block never echoes the header back.
+  - **Absence is not news**: on a SIMBAD miss, a route failure, or
+    when every name was redundant, the block renders NOTHING — no
+    error state, no "not found" row. Most faint KOI hosts are simply
+    not in SIMBAD; that is a normal answer, and this is bonus
+    context, not a core feature. Do not "improve" this into an error
+    message.
+  - **Loading**: `identityLoading` in the store, but the placeholder
+    is gated behind `IDENTITY_PLACEHOLDER_DELAY_MS = 400` in
+    AnomalyPanel — a warm disk-cache hit returns in a few ms, and
+    without the delay every revisit flashed a one-frame
+    "RESOLVING IDENTITY…" that read as a glitch.
+  - **Concurrency**: the identity fetch runs CONCURRENTLY with the
+    light curve (`resolveIdentityFor` in `selectStar.ts`, not
+    awaited inline) — SIMBAD answers in ~0.3–2.4 s while a MAST cold
+    path can take ~60 s, so serializing would hide the names behind
+    the slowest thing on screen.
+  - **Generation guard, deliberately narrower than the curve's**: a
+    superseded response must not take the PANEL slot, but it IS
+    still indexed into `resolvedIdentities` via `indexIdentity`. The
+    index is keyed by star id, so storing it cannot mislabel the
+    current selection, and discarding it would throw away a SIMBAD
+    query already spent.
+  - **Search by common name**: `resolvedIdentities` (session Map,
+    id → identity) folds into `StarSearch`'s match set, so
+    "boyajian" finds Tabby's Star once that star has been opened.
+    Alias hits rank BELOW the equivalent catalog hit and the
+    dropdown row shows `↳ <alias>` so a row whose visible text
+    lacks the query explains itself. **INSTANT coverage is
+    visited-stars-only BY DESIGN** — universal common-name search
+    AS YOU TYPE needs a query per keystroke, which CDS's rate
+    policy rules out. Names for never-opened stars resolve through
+    mechanism (b) below instead.
+
+  **B3 mechanism (b) — the ask-SIMBAD escape hatch** (shipped
+  2026-07-18; closes the design question formerly open in
+  KNOWLEDGE_BASE §10):
+  - **Trigger is EXPLICIT and one-shot**: pressing Enter when local
+    search has NO match (a link in the empty state mirrors it).
+    Enter keeps its normal meaning whenever a local match exists.
+    **NEVER per-keystroke** — CDS blacklists IPs above ~5–10
+    queries/second. This is not just a convention: `ask-simbad.spec.ts`
+    asserts typing fires ZERO `/api/identity` requests and one Enter
+    fires exactly one. Do not "improve" this into search-as-you-type.
+  - **Flow**: `fetchIdentityByName` → same `/api/identity/[id]`
+    route (SIMBAD's `ident` join matches ANY alias, so a name and an
+    id are the same query upstream — no new endpoint) →
+    `resolveAgainstCatalog(identity, anomalyStars)` in
+    `lib/catalogMembership.ts` → one of three outcomes.
+  - **Three outcomes, deliberately distinct**: `matched` (a
+    cross-id IS in our catalog → fly + select, exactly like a normal
+    search); `not-tracked` (SIMBAD knows the name, none of its
+    cross-ids is a star we render → say so, **move nothing**);
+    `unknown` (SIMBAD doesn't know it). `error` (couldn't reach
+    SIMBAD) is kept separate from `unknown` — reporting our own
+    outage as "no such name" would blame the user for our failure.
+  - **Membership is tested against the LIVE catalog, never
+    inferred.** Object type is not a proxy (`3C 273` is a quasar
+    carrying HIP + EPIC ids) and neither is carrying a catalog id
+    (Betelgeuse and Vega both have a TIC without being in the
+    KOI/TOI merge). Id preference order is KIC → TIC → EPIC → HIP:
+    a mission id means real photometry, HIP only means we can point
+    at a background star.
+  - **Route input alphabet widened** (`SAFE_ID` → `SAFE_LOOKUP`):
+    real names carry spaces and apostrophes, and the old regex would
+    have 400ed `"Boyajian's Star"`. Cache filenames are now derived
+    separately by `cacheKeyFor` (lowercased, whitespace-collapsed,
+    non-filename chars replaced), so widening the input did NOT
+    widen filesystem exposure — and case/spacing variants now share
+    one cache entry, matching SIMBAD's own matching. Cache schema
+    v1 → v2 because keys moved.
+  - **A successful ask permanently improves local search**: the
+    resolved identity is folded into `resolvedIdentities`, so that
+    name matches instantly from then on.
+
 ### Known bugs / pending 🐛
 - (none currently tracked)
 
@@ -233,6 +339,8 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   cross-check on the segment-scatter error bar; (c) TESS validation
   if a public per-TOI centroid table ever appears. Future ideas — not
   being implemented now.
+- *(SIMBAD identity phase B3 mechanism (b) shipped 2026-07-18 — see
+  "What works". No further SIMBAD identity work is planned.)*
 
 ## Real-data integration
 
@@ -287,27 +395,31 @@ so the browser never talks to external archives directly (CORS).
 
 ### External endpoint constants (`src/lib/externalEndpoints.ts`)
 Single source of truth for every EXTERNAL data URL the app hits
-(VizieR, NASA KOI/TOI TAP, MAST VO-TAP, MAST FITS download). Both the
-API routes AND the external-health check import from here, so a probe
-can never test a different URL than production sends. Dependency-free
-(no `next/*`) so the plain-Node health harness can import it. The
-lightcurve route's `mastTapQueryUrl` / `mastConeSearchUrl` /
-`resolveSegmentDownloadUrl` moved here; the KOI/TOI/stars routes import
-their TAP/VizieR URLs from here.
+(VizieR, NASA KOI/TOI TAP, MAST VO-TAP, MAST FITS download, SIMBAD
+TAP). Both the API routes AND the external-health check import from
+here, so a probe can never test a different URL than production sends.
+Dependency-free (no `next/*`) so the plain-Node health harness can
+import it. The lightcurve route's `mastTapQueryUrl` /
+`mastConeSearchUrl` / `resolveSegmentDownloadUrl` moved here; the
+KOI/TOI/stars routes import their TAP/VizieR URLs from here; the
+identity route imports `simbadIdsQueryUrl` from here.
 
 ### External-dependency health check (`npm run test:external-health`)
-Live-network probe of the 6 external contracts, using the exact
+Live-network probe of the 7 external contracts, using the exact
 `externalEndpoints.ts` constants. NOT part of `npm test` (which stays
 offline/fast). Each check verifies the CONTRACT, not just reachability:
 Hipparcos required columns present; KOI schema; TOI `tid` column
 present (the historical `tic_id` mistake); MAST TAP returns
 `access_url` rows; a MAST segment actually downloads as valid FITS
-(`SIMPLE  =` magic); and the **TESS TPF URL derivation** — an
+(`SIMPLE  =` magic); the **TESS TPF URL derivation** — an
 UNSHIPPED contract (`-s_lc.fits` → `-s_tp.fits` naming pattern, not a
 documented MAST interface) monitored from day one so a future TESS
 pixel-vetting implementation never builds on an unwatched assumption
 (ranged GET, first FITS block magic only — never the ~47 MB sector
-file). Exit 0 = all healthy, 1 = any failure. Designed
+file); and **SIMBAD TAP identity resolution** — JSON envelope (vs the
+VOTable XML error envelope), `main_id`/`ids` columns by name, and
+Tabby's Star still resolving with its KIC + a TIC cross-id. Exit 0 =
+all healthy, 1 = any failure. Designed
 to catch the class of silent contract change (VizieR column rename,
 endpoint move) that degraded the app to a fallback undetected. It
 distinguishes a VizieR upstream outage ("service degraded") from a
@@ -590,6 +702,70 @@ the star's RA/Dec so the cone-search path has what it needs.
   fixtures in `centroidRegression.test.ts` (runs in `npm run
   test:data`); refreeze via `packages/stellar-vetting-engine/scripts/capture-centroid-fixtures.mjs`
   (live network) + `--print` on the test before updating EXPECTED.
+
+### `/api/identity/[id]` (SIMBAD cross-identifier resolution, 2026-07-18)
+- On-demand resolution of a star's SIMBAD identity record: `main_id`,
+  `otype`, ICRS position, bare KIC/TIC/EPIC/HIP/Gaia DR3/2MASS/Tycho
+  ids, common names (`NAME …` entries + HAT-P/WASP/Kepler/KOI/K2/TOI
+  survey designations), and the full normalized identifier list
+  (`allIds`). Consumed by the panel's ALSO KNOWN AS block and the
+  session search index (phase B3 mechanism (a)) AND by the search
+  box's explicit ask-SIMBAD action (mechanism (b)) — both shipped,
+  see "What works". The browser calls it through
+  `lib/identityClient.ts`, never directly: `fetchIdentity(starId)`
+  for the panel (flattens miss vs outage) and
+  `fetchIdentityByName(name)` for the search box (keeps them
+  distinct, because the copy differs).
+- **The `[id]` segment is any SIMBAD lookup key**, not just an app
+  star id: `KIC8462852` and `Boyajian's Star` are the same kind of
+  query upstream, because the ADQL joins `ident` (matches ANY
+  alias). Accepted input is `SAFE_LOOKUP` — wider than the app's id
+  alphabet (spaces, apostrophes, `+`) since real designations need
+  it. Filename safety does NOT depend on that regex: `cacheKeyFor`
+  normalizes every key (lowercase, whitespace-collapsed,
+  non-`[a-z0-9._-]` replaced) before it becomes a path, which also
+  makes case/spacing variants share one cache entry.
+- Queries the CDS SIMBAD TAP sync service via `simbadIdsQueryUrl` in
+  `externalEndpoints.ts` (ADQL over `basic` ⋈ `ids` ⋈ `ident`; the
+  `ident` join matches ANY alias). **Measured facts (2026-07-17/18)**:
+  identifier matching is whitespace-normalized, so app-form un-spaced
+  ids (`KIC8462852`) are sent verbatim; warm latency ~0.3–1.6 s, cold
+  ~2.4 s; a miss is HTTP 200 + empty `data`; a query error is a
+  VOTable XML envelope EVEN with `FORMAT=json` (JSON parse failure ⇒
+  error, never data); the column list lives under `metadata`, NOT
+  `info` as MAST's TAP uses. Parsing locates columns BY NAME and
+  throws on a missing column (contract-change detection, the VizieR
+  lesson).
+- **Rate posture**: CDS blacklists IPs above ~5–10 queries/second (up
+  to an hour). One query per click is far below; NEVER point a batch
+  at this route without throttling (≲2 concurrent + delays).
+- **Per-lookup disk cache** `<os.tmpdir()>/stellar-cache/identity-<key>.json`
+  where `<key>` is the `cacheKeyFor`-normalized lookup (lowercased —
+  `identity-kic8462852.json`), schema-versioned
+  (`CACHE_SCHEMA_VERSION`, currently **2**; bump on any query/shape/
+  parsing/KEY-derivation change — mismatched entries are refetched,
+  never served; v1 used un-normalized keys),
+  **30-day TTL** (SIMBAD is a living compilation but identifier data
+  is nearly append-only — ids arrive with major catalog releases).
+  Two deliberate behaviors: an EXPIRED same-version entry is served
+  with `stale: true` when the live refetch fails (KOI-outage lesson),
+  and MISSES are cached as `identity: null` (most faint KOI hosts are
+  not in SIMBAD; without this every click re-queries).
+- Response: `{ source: 'real'|'cached'|'unavailable', identity:
+  SimbadIdentity|null, fetchedAt, stale?, error? }`. `identity: null`
+  with source real/cached = "SIMBAD consulted, object unknown" —
+  distinct from `unavailable` (couldn't ask).
+- Parsing lives in `lib/simbadIds.ts` — pure, dependency-free,
+  deliberately app-side (catalog-identifier plumbing, not vetting
+  science; kept OUT of the MIT engine package). Unit-tested against
+  five frozen REAL responses in `src/lib/__tests__/fixtures/simbad/`
+  (KIC8462852 Tabby, KIC10666592 HAT-P-7, TIC25155310 WASP-126,
+  EPIC201637175 = K2-22, and **M31** — a real object with 41
+  identifiers and NO stellar catalog id, pinning mechanism (b)'s
+  `not-tracked` branch — captured 2026-07-18); refreeze via
+  `node --import ./scripts/register-ts-resolver.mjs scripts/capture-simbad-fixtures.mjs`
+  and hand-verify before updating expectations. Route-level cache/TTL
+  wiring is pinned in `src/app/api/__tests__/identityRoute.route.test.ts`.
 
 ### `lib/fitsCore.ts` / `lib/fitsReader.ts` / `lib/tpfReader.ts`
 - `fitsCore.ts` holds the shared low-level primitives (2880-byte block +
@@ -1489,12 +1665,18 @@ BEFORE and AFTER touching the listed area:**
 | `anomalyDetector` / `curveClassifier` / `fitsReader` / `fitsCore` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
 | `tpfReader` / `centroidVet` / `/api/centroid` | `npm run test:data` + `npm run test:unit` (centroid fixtures live in test:data) |
 | `selectStar` / `store` / `persistence` | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
+| `simbadIds` / `catalogMembership` / `/api/identity` / `identityClient` | `npm run test:unit` + `npm run test:routes` (frozen SIMBAD fixtures live in `src/lib/__tests__/fixtures/simbad/`) |
+| `AlsoKnownAs` panel block / identity store slot / `StarSearch` alias ranking | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
+| `StarSearch` ask-SIMBAD flow / `catalogMembership` outcomes | `npm run test:unit` + `npm run test:e2e` (`ask-simbad.spec.ts` — it also guards the never-query-on-keystroke rate posture) |
 | `StarField` selection paths / CameraSync / disambiguation popover / HUD panels | `npm run test:e2e` |
 | anything else | `npx tsc --noEmit` + verify in the browser, as always |
 
-`npm test` = `test:unit && test:engine` — the fast no-browser gate,
-safe to run reflexively. `test:unit` = APP unit tests
-(`src/lib/__tests__`); `test:engine` = the engine package's full suite
+`npm test` = `test:unit && test:routes && test:engine` — the fast
+no-browser gate, safe to run reflexively. `test:unit` = APP unit tests
+(`src/lib/__tests__`); `test:routes` = API route handlers run directly
+under `node --test` (`src/app/api/__tests__/*.route.test.ts`, via the
+route-test resolver that maps `@/…` and shims `next/server`);
+`test:engine` = the engine package's full suite
 (its unit tests + both data-regression suites + the architecture
 guard, run via `npm --prefix packages/stellar-vetting-engine test`);
 `test:data` delegates to the package's data-regression suites only
@@ -1542,6 +1724,12 @@ hand:
   deterministic: `page.route()` serves the repo's gzipped fixtures
   and holds the stale star's response until after the newer pick
   resolves. No cold MAST, fully offline-reproducible.
+- `ask-simbad.spec.ts` — the mechanism-(b) escape hatch: all three
+  outcomes (matched → selects; not-tracked → message, camera does
+  NOT move; unknown), plus the rate-posture guard that typing fires
+  ZERO `/api/identity` requests and one Enter fires exactly one.
+  `/api/identity/*` is intercepted and served from the frozen SIMBAD
+  fixtures, so the suite never puts CI traffic on CDS.
 Full E2E run ≈ 3–5 min warm; first-ever run adds the chromium
 download and cold catalog fetches.
 

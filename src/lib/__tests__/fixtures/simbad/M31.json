@@ -1,0 +1,57 @@
+{
+  "capturedAt": "2026-07-19T01:43:11.435Z",
+  "identifier": "M31",
+  "url": "https://simbad.cds.unistra.fr/simbad/sim-tap/sync?REQUEST=doQuery&LANG=ADQL&FORMAT=json&QUERY=SELECT+b.main_id%2C+b.otype%2C+b.ra%2C+b.dec%2C+ids.ids+FROM+basic+AS+b+JOIN+ids+ON+ids.oidref+%3D+b.oid+JOIN+ident+ON+ident.oidref+%3D+b.oid+WHERE+ident.id+%3D+%27M31%27",
+  "response": {
+    "metadata": [
+      {
+        "name": "main_id",
+        "description": "Main identifier for an object",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "meta.id;meta.main",
+        "utype": "mango:MangoObject.identifier"
+      },
+      {
+        "name": "otype",
+        "description": "Object type",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "src.class",
+        "utype": "mango:Label.text[CT.vocabulary=https://www.ivoa.net/rdf/uat#classification]"
+      },
+      {
+        "name": "ra",
+        "description": "Right ascension",
+        "datatype": "DOUBLE",
+        "unit": "deg",
+        "ucd": "pos.eq.ra;meta.main",
+        "utype": "mango:EpochPosition.longitude[CS.spaceSys=ICRS CT.epoch=J2000]"
+      },
+      {
+        "name": "dec",
+        "description": "Declination",
+        "datatype": "DOUBLE",
+        "unit": "deg",
+        "ucd": "pos.eq.dec;meta.main",
+        "utype": "mango:EpochPosition.latitude[CS.spaceSys=ICRS CT.epoch=J2000]"
+      },
+      {
+        "name": "ids",
+        "description": "List of all identifiers concatenated with pipe",
+        "datatype": "CHAR",
+        "arraysize": "*",
+        "ucd": "meta.id"
+      }
+    ],
+    "data": [
+      [
+        "M  31",
+        "AGN",
+        10.684708333333333,
+        41.268750000000004,
+        "4FGL J0043.2+4114|PLX  124|AG+40   60|BD+40   148|HD   3969|PPM  43228|PLX  124.00|SRGA J004241.1+411603|2C   56|DA  21|GIN 801|IRAS F00400+4059|IRAS 00400+4059|IRC +40013|K79  1C|LEDA    2557|M  31|MCG+07-02-016|NAME Andromeda|NAME Andromeda Galaxy|NGC   224|RAFGL  104|UGC   454|XSS J00425+4102|Z 535-17|Z 0040.0+4100|[DGW65]   4|2MASX J00424433+4116074|[M98c] 004000.1+405943|[VV2000c] J004244.3+411610|[VV2003c] J004244.3+411610|[VV2006] J004244.3+411610|[VV98c] J004245.1+411622|UZC J004244.3+411608|[VV2010] J004244.3+411610|NAME And Nebula|NAME Andromeda Nebula|2MAXI J0043+412|3FGL J0042.5+4117|2FGL J0042.5+4114|LAMOST J004244.33+411605.6"
+      ]
+    ]
+  }
+}
