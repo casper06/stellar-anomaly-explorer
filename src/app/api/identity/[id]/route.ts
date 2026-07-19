@@ -6,11 +6,19 @@ import { simbadIdsQueryUrl } from '@/lib/externalEndpoints'
 import { parseSimbadIdentityResponse, type SimbadIdentity } from '@/lib/simbadIds'
 
 /**
- * @description GET /api/identity/[id] — resolves a star's SIMBAD
+ * @description GET /api/identity/[id] — resolves a SIMBAD
  * cross-identification record (KIC/TIC/EPIC/HIP/Gaia DR3/2MASS/Tycho ids
  * + common names) on demand. Proxies the CDS SIMBAD TAP service (CORS +
  * the engine-never-networks rule) through the shared `simbadIdsQueryUrl`
- * builder, with a per-star schema-versioned disk cache.
+ * builder, with a schema-versioned disk cache.
+ *
+ * The `[id]` segment is any SIMBAD lookup key — an app star id
+ * (`KIC8462852`, the phase-B3-mechanism-(a) panel path) OR a free-text
+ * name (`Boyajian's Star`, the mechanism-(b) search path). One route
+ * serves both because the underlying ADQL joins SIMBAD's `ident`
+ * table, which matches ANY alias: upstream, an id and a name are the
+ * same query. Callers differ only in how they interpret the result —
+ * the panel wants the names, the search box wants the cross-ids.
  *
  * Freshness policy (design 2026-07-17, phase B1): 30-day TTL. SIMBAD is
  * a living compilation but IDENTIFIER data is nearly append-only (ids
@@ -34,8 +42,16 @@ import { parseSimbadIdentityResponse, type SimbadIdentity } from '@/lib/simbadId
  * in a way that alters stored entries — mismatched entries are treated
  * as a MISS and refetched, never served (same rationale as the
  * lightcurve cache's versioning).
+ *
+ * v2 (2026-07-18, phase B3 mechanism (b)): cache keys are now
+ * normalized (lowercased, whitespace-collapsed) by `cacheKeyFor`, so
+ * v1 files sit under different names — `identity-KIC8462852.json`
+ * became `identity-kic8462852.json`. The version bump is what makes
+ * that a clean one-time refetch instead of a silent orphan: v1 files
+ * are simply never read again. They age out with the tmpdir; nothing
+ * reads or serves them in the meantime.
  */
-const CACHE_SCHEMA_VERSION = 1
+const CACHE_SCHEMA_VERSION = 2
 
 /** @description Identifier freshness bound: 30 days (see policy note above). */
 const DISK_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000
@@ -43,11 +59,23 @@ const DISK_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const CACHE_DIR = path.join(os.tmpdir(), 'stellar-cache')
 
 /**
- * @description Star ids accepted by this route — the app's id alphabet
- * (KIC…/TIC…/EPIC…/HIP…/SYN…), also the safe-filename alphabet for the
- * per-star cache file. Anything else is a 400, not a SIMBAD query.
+ * @description Lookup keys accepted by this route. Deliberately WIDER
+ * than the app's id alphabet: phase B3 mechanism (b) resolves free-text
+ * NAMES through this same route (SIMBAD's `ident` join matches any
+ * alias, so a name and an id are the same kind of query upstream), and
+ * real names carry spaces, apostrophes, and plus signs — "Boyajian's
+ * Star", "BD+47 2846", "alf Ori".
+ *
+ * This is an input-shape guard, NOT the filename guard: cache
+ * filenames are derived separately by `cacheKeyFor`, so widening the
+ * accepted alphabet cannot widen what reaches the filesystem. The
+ * character class stays a conservative allowlist (letters, digits, and
+ * a handful of punctuation that occurs in real designations) rather
+ * than accepting anything, so obviously-junk input is still rejected
+ * before it costs a SIMBAD query. ADQL injection is separately
+ * neutralized by the quote-escaping in `simbadIdsQueryUrl`.
  */
-const SAFE_ID = /^[A-Za-z0-9._-]{1,64}$/
+const SAFE_LOOKUP = /^[A-Za-z0-9 ._'+*-]{1,64}$/
 
 /** @description On-disk cache entry. `identity: null` = confirmed not in SIMBAD. */
 interface IdentityCacheEntry {
@@ -74,13 +102,37 @@ interface IdentityResponse {
 }
 
 /**
- * @description Cache file path for one star id (id is pre-validated
- * against `SAFE_ID`, so it is filename-safe by construction).
- * @param id App-form star id.
+ * @description Derives a filename-safe, case-insensitive cache key
+ * from a lookup key.
+ *
+ * Two jobs, both load-bearing since names joined the id alphabet:
+ *   1. SAFETY. `SAFE_LOOKUP` now admits spaces, apostrophes and `+`,
+ *      none of which belong in a filename. Every character outside
+ *      `[A-Za-z0-9._-]` is replaced, so the key is filename-safe by
+ *      construction rather than by trusting the input guard. (Path
+ *      traversal was already impossible — `.` and `-` are allowed but
+ *      `/` and `\` never were — and this keeps it that way
+ *      independently of the input regex.)
+ *   2. CACHE HIT RATE. SIMBAD's matching is case- and
+ *      whitespace-insensitive (measured: "Boyajian's Star",
+ *      "BOYAJIAN'S STAR" and "boyajian's star" return one record), so
+ *      those must share one cache entry instead of three. Lowercasing
+ *      and collapsing whitespace makes the key agree with upstream
+ *      semantics.
+ * @param lookup Pre-validated lookup key (app star id or free-text name).
+ * @returns Filename-safe cache key.
+ */
+function cacheKeyFor(lookup: string): string {
+  return lookup.replace(/\s+/g, ' ').trim().toLowerCase().replace(/[^a-z0-9._-]/g, '_')
+}
+
+/**
+ * @description Cache file path for one lookup key.
+ * @param lookup Pre-validated lookup key.
  * @returns Absolute cache file path.
  */
-function cacheFileFor(id: string): string {
-  return path.join(CACHE_DIR, `identity-${id}.json`)
+function cacheFileFor(lookup: string): string {
+  return path.join(CACHE_DIR, `identity-${cacheKeyFor(lookup)}.json`)
 }
 
 /**
@@ -200,9 +252,9 @@ export async function GET(
   const { id } = await ctx.params
   const tag = `[identity ${id}]`
 
-  if (!SAFE_ID.test(id)) {
+  if (!SAFE_LOOKUP.test(id)) {
     return NextResponse.json<IdentityResponse>(
-      { source: 'unavailable', identity: null, fetchedAt: 0, error: 'invalid star id' },
+      { source: 'unavailable', identity: null, fetchedAt: 0, error: 'invalid lookup key' },
       { status: 400 },
     )
   }

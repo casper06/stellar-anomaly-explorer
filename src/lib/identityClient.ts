@@ -46,3 +46,51 @@ export async function fetchIdentity(starId: string): Promise<IdentityResult> {
     return null
   }
 }
+
+/**
+ * @description Resolves a user-typed NAME (rather than an app star id)
+ * through the same route — the search box's explicit "ask SIMBAD"
+ * action, phase B3 mechanism (b).
+ *
+ * Same route, same cache, same rate posture; the only difference is
+ * what goes in. That works because the route's ADQL joins SIMBAD's
+ * `ident` table, which matches ANY alias of an object — so a
+ * colloquial name resolves exactly like a catalog id does (measured
+ * 2026-07-18: "Boyajian's Star", "BOYAJIAN'S STAR" and "boyajian's
+ * star" all return the same record, 0.3–1.7 s). No new endpoint, no
+ * new query builder.
+ *
+ * Rate posture: this is safe ONLY because it fires on an explicit
+ * keypress, one query per press. It must never be wired to typing —
+ * see the CDS blacklist threshold in `externalEndpoints.ts`.
+ *
+ * Distinct from `fetchIdentity` in one way that matters: it reports
+ * FAILURE separately from a miss. The panel can treat both as "show
+ * nothing", but the search box cannot — "SIMBAD doesn't know that
+ * name" and "we couldn't reach SIMBAD" need different copy, and
+ * showing the first when the second happened would be a lie.
+ * @param name Free-text name as typed by the user.
+ * @returns The identity, `null` for a confirmed miss, or `'error'`
+ * when SIMBAD could not be consulted at all.
+ */
+export async function fetchIdentityByName(
+  name: string,
+): Promise<SimbadIdentity | null | 'error'> {
+  const trimmed = name.trim()
+  if (!trimmed) return null
+  try {
+    const res = await fetch(`/api/identity/${encodeURIComponent(trimmed)}`)
+    if (!res.ok) return 'error'
+    const data = (await res.json()) as {
+      source?: string
+      identity?: SimbadIdentity | null
+    }
+    // `unavailable` means the route could not ask (outage / bad
+    // response), NOT that the object is unknown — surfacing that as
+    // "no such name" would misattribute our own failure to the user.
+    if (data.source === 'unavailable') return 'error'
+    return data.identity ?? null
+  } catch {
+    return 'error'
+  }
+}

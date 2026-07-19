@@ -166,10 +166,13 @@ interface AppState {
    * This is the backing index for search-by-common-name (phase B3
    * mechanism (a)): once a star's identity has been resolved, its
    * common names become searchable for free, with no new SIMBAD query.
-   * Coverage is therefore visited-stars-only BY DESIGN — universal
-   * common-name search would need a per-keystroke SIMBAD query, which
-   * the B1 rate posture rules out; that is mechanism (b), a separate
-   * explicit press-Enter-to-ask escape hatch, not built here.
+   * INSTANT coverage is therefore visited-stars-only BY DESIGN —
+   * universal common-name search AS YOU TYPE would need a
+   * per-keystroke SIMBAD query, which the B1 rate posture rules out.
+   * Names for never-opened stars go through mechanism (b) instead
+   * (the explicit press-Enter-to-ask escape hatch in `StarSearch`),
+   * which writes its result back here via `indexIdentity` — so one
+   * explicit ask permanently adds that name to this instant index.
    *
    * Stars confirmed ABSENT from SIMBAD are intentionally not recorded:
    * they contribute no searchable names, and the route already caches

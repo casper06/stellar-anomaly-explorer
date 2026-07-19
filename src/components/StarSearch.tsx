@@ -2,6 +2,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, type Star } from '@/lib/store'
 import { selectStarAndFetchCurve } from '@/lib/selectStar'
+import { fetchIdentityByName } from '@/lib/identityClient'
+import { resolveAgainstCatalog, identityLabel } from '@/lib/catalogMembership'
 
 /**
  * @description Minimum query length before we start showing suggestions.
@@ -49,6 +51,25 @@ interface Suggestion {
   star: Star
   via: string | null
 }
+
+/**
+ * @description State of the explicit "ask SIMBAD" lookup (phase B3
+ * mechanism (b)) — the escape hatch for a common name belonging to a
+ * star the user has never opened, so no local alias exists to match.
+ *
+ * `not-tracked` is the state this feature was built to make
+ * expressible: SIMBAD recognized the name, but none of its cross-ids
+ * is a star we render. It is an ANSWER, not a failure, and it is
+ * reported as such — the alternative (flying the camera to the
+ * resolved coordinates) would point at empty sky and present that as
+ * a result.
+ */
+type AskState =
+  | { kind: 'idle' }
+  | { kind: 'asking'; name: string }
+  | { kind: 'not-tracked'; name: string; label: string }
+  | { kind: 'unknown'; name: string }
+  | { kind: 'error'; name: string }
 
 /**
  * @description Ranks a matched star against the normalized query. Lower
@@ -131,12 +152,24 @@ export default function StarSearch() {
   // visited-stars-only by design; see the empty-state copy below.
   const resolvedIdentities = useStore(s => s.resolvedIdentities)
 
+  const anomalyStarsRef = useRef(anomalyStars)
+  anomalyStarsRef.current = anomalyStars
+  const indexIdentity = useStore(s => s.indexIdentity)
+
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [isFocused, setIsFocused] = useState(false)
   const [highlight, setHighlight] = useState(0)
+  const [ask, setAsk] = useState<AskState>({ kind: 'idle' })
   const containerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  /**
+   * Generation guard for the ask-SIMBAD request, mirroring
+   * `selectStar`'s: a slow SIMBAD response (up to ~2.4 s cold) must not
+   * overwrite the state of a NEWER ask, and must not resurrect a result
+   * after the user cleared or retyped the query.
+   */
+  const askGenerationRef = useRef(0)
 
   // Debounce the query → debouncedQuery. Any new keystroke resets the
   // timer, so bursts collapse to a single suggestion recompute at the
@@ -149,6 +182,15 @@ export default function StarSearch() {
   // Reset the keyboard highlight to row 0 whenever the query changes,
   // so it doesn't point past the end of a shrunken suggestion list.
   useEffect(() => { setHighlight(0) }, [debouncedQuery])
+
+  // Any edit invalidates a previous ask: the message referred to the
+  // OLD text, so leaving it up would caption the new query with a
+  // verdict about a different name. Bumping the generation also
+  // discards any request still in flight.
+  useEffect(() => {
+    askGenerationRef.current++
+    setAsk({ kind: 'idle' })
+  }, [query])
 
   // Click-outside dismiss. Registers on the document because focusing
   // the input needs to keep the dropdown open, but a click on the sky
@@ -196,23 +238,73 @@ export default function StarSearch() {
     inputRef.current?.blur()
   }
 
+  /**
+   * @description Asks SIMBAD to resolve the typed text, then checks the
+   * answer against the catalog we actually render.
+   *
+   * EXPLICIT ONLY — invoked from the Enter key (and the button that
+   * mirrors it), never from typing. One query per deliberate keypress
+   * stays far below the CDS fair-use threshold (~5–10 q/s ⇒ IP
+   * blacklist); a per-keystroke version of this exact call is the
+   * thing the B1 rate investigation ruled out.
+   */
+  async function askSimbad() {
+    const name = query.trim()
+    if (!name) return
+    const generation = ++askGenerationRef.current
+    setAsk({ kind: 'asking', name })
+
+    const identity = await fetchIdentityByName(name)
+    // A newer ask (or an edit) owns the UI now — drop this result.
+    if (generation !== askGenerationRef.current) return
+
+    if (identity === 'error') { setAsk({ kind: 'error', name }); return }
+
+    // Read the catalog through a ref: it can finish merging KOI/TOI
+    // while the request is in flight, and membership must be tested
+    // against the catalog as it is NOW, not as it was at keypress.
+    const resolution = resolveAgainstCatalog(identity, anomalyStarsRef.current)
+
+    if (resolution.outcome === 'unknown') { setAsk({ kind: 'unknown', name }); return }
+
+    if (resolution.outcome === 'not-tracked') {
+      setAsk({ kind: 'not-tracked', name, label: identityLabel(resolution.identity) })
+      return
+    }
+
+    const star = anomalyStarsRef.current.find(s => s.id === resolution.starId)
+    if (!star) {
+      // Catalog changed between the membership test and the lookup.
+      setAsk({ kind: 'not-tracked', name, label: identityLabel(resolution.identity) })
+      return
+    }
+    // Fold the resolved identity into the session index, so this name
+    // is matched LOCALLY next time — one ask permanently improves the
+    // instant search rather than being spent once.
+    indexIdentity(star.id, resolution.identity)
+    pick(star)
+  }
+
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key === 'Escape') {
       setIsFocused(false)
       inputRef.current?.blur()
       return
     }
-    if (!showDropdown || suggestions.length === 0) return
-    if (e.key === 'ArrowDown') {
+    if (e.key === 'ArrowDown' && showDropdown && suggestions.length > 0) {
       e.preventDefault()
       setHighlight(h => Math.min(suggestions.length - 1, h + 1))
-    } else if (e.key === 'ArrowUp') {
+    } else if (e.key === 'ArrowUp' && showDropdown && suggestions.length > 0) {
       e.preventDefault()
       setHighlight(h => Math.max(0, h - 1))
     } else if (e.key === 'Enter') {
       e.preventDefault()
       const target = suggestions[highlight]
+      // Enter keeps its existing meaning whenever there IS a local
+      // match — the escape hatch only takes over when the local search
+      // has nothing, which is exactly when the user needs it.
       if (target) pick(target.star)
+      else if (ask.kind !== 'asking') void askSimbad()
     }
   }
 
@@ -269,26 +361,10 @@ export default function StarSearch() {
               }}
             >
               <div>No star found matching &quot;{debouncedQuery}&quot;</div>
-              {/* Sets expectations honestly: alternate names are searchable
-                  only for stars already opened this session (or still in the
-                  server cache), because that is when SIMBAD was consulted.
-                  Universal common-name search needs a query per keystroke,
-                  which CDS's rate policy rules out — that is the separate
-                  press-Enter-to-ask escape hatch, not built yet. Do not
-                  reword this into a promise of universal name search. */}
-              <div
-                style={{
-                  marginTop: 6,
-                  fontSize: 9,
-                  color: 'rgba(255,255,255,0.3)',
-                  letterSpacing: 0.3,
-                  lineHeight: 1.5,
-                }}
-              >
-                Catalog ids (KIC, KOI, TOI) always work. Common names such as
-                &quot;Boyajian&apos;s Star&quot; are searchable only for stars
-                you have already opened.
-              </div>
+              <AskSimbadBlock
+                ask={ask}
+                onAsk={() => { void askSimbad() }}
+              />
             </div>
           ) : (
             suggestions.map(({ star, via }, i) => (
@@ -304,6 +380,85 @@ export default function StarSearch() {
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * @description The "ask SIMBAD" area of the empty state (phase B3
+ * mechanism (b)) — the prompt, the in-flight indicator, and the three
+ * terminal outcomes.
+ *
+ * Copy rules, all deliberate:
+ *   - The `not-tracked` message names BOTH facts, in order: SIMBAD
+ *     knows it, we don't render it. Saying only the second would read
+ *     as "no such object", which is false and would leave the user
+ *     doubting a name they typed correctly.
+ *   - `unknown` and `error` stay distinct. "SIMBAD doesn't know this
+ *     name" is about the query; "couldn't reach SIMBAD" is about us.
+ *     Reporting our own outage as the user's typo is the specific
+ *     dishonesty the split return type exists to prevent.
+ *   - Nothing here is styled as an error (no red). A dead end is an
+ *     ordinary, informative result — same reasoning as the panel's
+ *     absence-renders-as-nothing rule.
+ * @param ask Current ask state.
+ * @param onAsk Fires the explicit lookup.
+ * @returns The prompt or the outcome message.
+ */
+function AskSimbadBlock({ ask, onAsk }: { ask: AskState; onAsk: () => void }) {
+  const noteStyle: React.CSSProperties = {
+    marginTop: 8,
+    fontSize: 9,
+    color: 'rgba(255,255,255,0.45)',
+    letterSpacing: 0.3,
+    lineHeight: 1.6,
+  }
+
+  if (ask.kind === 'asking') {
+    return <div style={noteStyle}>Asking SIMBAD about &quot;{ask.name}&quot;…</div>
+  }
+
+  if (ask.kind === 'not-tracked') {
+    return (
+      <div style={noteStyle}>
+        SIMBAD recognizes <span style={{ color: 'rgba(255,255,255,0.75)' }}>{ask.label}</span>,
+        but it isn&apos;t in our tracked Kepler/TESS/Hipparcos catalog — so there is
+        nothing to fly to.
+      </div>
+    )
+  }
+
+  if (ask.kind === 'unknown') {
+    return <div style={noteStyle}>SIMBAD doesn&apos;t know the name &quot;{ask.name}&quot;.</div>
+  }
+
+  if (ask.kind === 'error') {
+    return <div style={noteStyle}>Couldn&apos;t reach SIMBAD just now. Try again in a moment.</div>
+  }
+
+  return (
+    <div style={noteStyle}>
+      Catalog ids (KIC, KOI, TOI) always work.{' '}
+      <button
+        type="button"
+        // onMouseDown, not onClick: the dropdown dismisses on the
+        // document's mousedown, which would unmount this button before
+        // a click could ever land on it.
+        onMouseDown={e => { e.preventDefault(); onAsk() }}
+        style={{
+          background: 'none',
+          border: 'none',
+          padding: 0,
+          font: 'inherit',
+          letterSpacing: 'inherit',
+          color: 'rgba(76,201,240,0.9)',
+          cursor: 'pointer',
+          textDecoration: 'underline',
+        }}
+      >
+        Press Enter to ask SIMBAD
+      </button>{' '}
+      for a common name.
     </div>
   )
 }

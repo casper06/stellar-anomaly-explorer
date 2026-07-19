@@ -67,7 +67,13 @@ src/
     simbadIds.ts          # Pure SIMBAD TAP response → SimbadIdentity parser +
                           # selectDisplayNames (panel "also known as" filtering);
                           # app-side, NOT engine
-    identityClient.ts     # Browser fetch wrapper for /api/identity (never throws; null on any failure)
+    identityClient.ts     # Browser fetch wrapper for /api/identity. fetchIdentity()
+                          # never throws (null on any failure, panel path);
+                          # fetchIdentityByName() keeps miss vs outage distinct
+                          # (search path — the copy differs)
+    catalogMembership.ts  # Pure: SIMBAD identity → "is this a star WE render?"
+                          # (matched / not-tracked / unknown). Backs the search
+                          # box's ask-SIMBAD escape hatch; app-side, NOT engine
 packages/
   stellar-vetting-engine/ # MIT-licensed extracted science engine (app is GPL;
                           # see KNOWLEDGE_BASE §9). src/ = the 9 engine modules
@@ -229,8 +235,9 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   fixtures, health check #7. See the `/api/identity/[id]` section
   below.
 
-  **B3 UI** (mechanism (a) only — the explicit press-Enter-to-ask
-  SIMBAD escape hatch is mechanism (b), still NOT built):
+  **B3 UI mechanism (a)** (the instant, no-extra-query half; the
+  explicit press-Enter-to-ask escape hatch is mechanism (b), covered
+  after this):
   - **"ALSO KNOWN AS" block** in the AnomalyPanel, between the
     visibility copy and the dips list: common-name chips + SIMBAD's
     `main_id` when it adds information (Tabby's reads
@@ -265,11 +272,52 @@ For type aliases and interfaces, a single `@description` block is enough; docume
     "boyajian" finds Tabby's Star once that star has been opened.
     Alias hits rank BELOW the equivalent catalog hit and the
     dropdown row shows `↳ <alias>` so a row whose visible text
-    lacks the query explains itself. **Coverage is visited-stars-
-    only BY DESIGN** — universal common-name search needs a query
-    per keystroke, which CDS's rate policy rules out. The
-    empty-state copy says so explicitly; do not reword it into a
-    promise of universal name search.
+    lacks the query explains itself. **INSTANT coverage is
+    visited-stars-only BY DESIGN** — universal common-name search
+    AS YOU TYPE needs a query per keystroke, which CDS's rate
+    policy rules out. Names for never-opened stars resolve through
+    mechanism (b) below instead.
+
+  **B3 mechanism (b) — the ask-SIMBAD escape hatch** (shipped
+  2026-07-18; closes the design question formerly open in
+  KNOWLEDGE_BASE §10):
+  - **Trigger is EXPLICIT and one-shot**: pressing Enter when local
+    search has NO match (a link in the empty state mirrors it).
+    Enter keeps its normal meaning whenever a local match exists.
+    **NEVER per-keystroke** — CDS blacklists IPs above ~5–10
+    queries/second. This is not just a convention: `ask-simbad.spec.ts`
+    asserts typing fires ZERO `/api/identity` requests and one Enter
+    fires exactly one. Do not "improve" this into search-as-you-type.
+  - **Flow**: `fetchIdentityByName` → same `/api/identity/[id]`
+    route (SIMBAD's `ident` join matches ANY alias, so a name and an
+    id are the same query upstream — no new endpoint) →
+    `resolveAgainstCatalog(identity, anomalyStars)` in
+    `lib/catalogMembership.ts` → one of three outcomes.
+  - **Three outcomes, deliberately distinct**: `matched` (a
+    cross-id IS in our catalog → fly + select, exactly like a normal
+    search); `not-tracked` (SIMBAD knows the name, none of its
+    cross-ids is a star we render → say so, **move nothing**);
+    `unknown` (SIMBAD doesn't know it). `error` (couldn't reach
+    SIMBAD) is kept separate from `unknown` — reporting our own
+    outage as "no such name" would blame the user for our failure.
+  - **Membership is tested against the LIVE catalog, never
+    inferred.** Object type is not a proxy (`3C 273` is a quasar
+    carrying HIP + EPIC ids) and neither is carrying a catalog id
+    (Betelgeuse and Vega both have a TIC without being in the
+    KOI/TOI merge). Id preference order is KIC → TIC → EPIC → HIP:
+    a mission id means real photometry, HIP only means we can point
+    at a background star.
+  - **Route input alphabet widened** (`SAFE_ID` → `SAFE_LOOKUP`):
+    real names carry spaces and apostrophes, and the old regex would
+    have 400ed `"Boyajian's Star"`. Cache filenames are now derived
+    separately by `cacheKeyFor` (lowercased, whitespace-collapsed,
+    non-filename chars replaced), so widening the input did NOT
+    widen filesystem exposure — and case/spacing variants now share
+    one cache entry, matching SIMBAD's own matching. Cache schema
+    v1 → v2 because keys moved.
+  - **A successful ask permanently improves local search**: the
+    resolved identity is folded into `resolvedIdentities`, so that
+    name matches instantly from then on.
 
 ### Known bugs / pending 🐛
 - (none currently tracked)
@@ -291,21 +339,8 @@ For type aliases and interfaces, a single `@description` block is enough; docume
   cross-check on the segment-scatter error bar; (c) TESS validation
   if a public per-TOI centroid table ever appears. Future ideas — not
   being implemented now.
-- **SIMBAD identity phase B3 mechanism (b) — ask-SIMBAD escape
-  hatch**: B2 (route + parser + cache + health check + fixtures) and
-  B3 mechanism (a) (ALSO KNOWN AS block + search over
-  already-resolved identities) both shipped 2026-07-18 (see "What
-  works"). Mechanism (b) is the remaining piece: an EXPLICIT
-  press-Enter-to-ask-SIMBAD action in the search box, so a common
-  name for a star the user has never opened can still resolve. Must
-  stay explicit and one-shot — **NEVER per-keystroke queries**; CDS
-  blacklists IPs above ~5–10 queries/second (see the rate posture in
-  the `/api/identity` section). Open design questions: what the
-  resolver does with a hit that isn't in the local catalog at all
-  (SIMBAD knows millions of stars the app doesn't render), and
-  whether to surface "asking SIMBAD…" as a dropdown row or a
-  separate affordance. Awaiting a separate greenlight — not being
-  implemented now.
+- *(SIMBAD identity phase B3 mechanism (b) shipped 2026-07-18 — see
+  "What works". No further SIMBAD identity work is planned.)*
 
 ## Real-data integration
 
@@ -674,10 +709,22 @@ the star's RA/Dec so the cone-search path has what it needs.
   ids, common names (`NAME …` entries + HAT-P/WASP/Kepler/KOI/K2/TOI
   survey designations), and the full normalized identifier list
   (`allIds`). Consumed by the panel's ALSO KNOWN AS block and the
-  session search index (phase B3 mechanism (a), shipped — see "What
-  works"); the browser calls it through `lib/identityClient.ts`, never
-  directly. Mechanism (b), the explicit ask-SIMBAD escape hatch for
-  never-opened stars, is still unbuilt (see "Next features").
+  session search index (phase B3 mechanism (a)) AND by the search
+  box's explicit ask-SIMBAD action (mechanism (b)) — both shipped,
+  see "What works". The browser calls it through
+  `lib/identityClient.ts`, never directly: `fetchIdentity(starId)`
+  for the panel (flattens miss vs outage) and
+  `fetchIdentityByName(name)` for the search box (keeps them
+  distinct, because the copy differs).
+- **The `[id]` segment is any SIMBAD lookup key**, not just an app
+  star id: `KIC8462852` and `Boyajian's Star` are the same kind of
+  query upstream, because the ADQL joins `ident` (matches ANY
+  alias). Accepted input is `SAFE_LOOKUP` — wider than the app's id
+  alphabet (spaces, apostrophes, `+`) since real designations need
+  it. Filename safety does NOT depend on that regex: `cacheKeyFor`
+  normalizes every key (lowercase, whitespace-collapsed,
+  non-`[a-z0-9._-]` replaced) before it becomes a path, which also
+  makes case/spacing variants share one cache entry.
 - Queries the CDS SIMBAD TAP sync service via `simbadIdsQueryUrl` in
   `externalEndpoints.ts` (ADQL over `basic` ⋈ `ids` ⋈ `ident`; the
   `ident` join matches ANY alias). **Measured facts (2026-07-17/18)**:
@@ -692,9 +739,12 @@ the star's RA/Dec so the cone-search path has what it needs.
 - **Rate posture**: CDS blacklists IPs above ~5–10 queries/second (up
   to an hour). One query per click is far below; NEVER point a batch
   at this route without throttling (≲2 concurrent + delays).
-- **Per-star disk cache** `<os.tmpdir()>/stellar-cache/identity-<id>.json`,
-  schema-versioned (`CACHE_SCHEMA_VERSION`, bump on any query/shape/
-  parsing change — mismatched entries are refetched, never served),
+- **Per-lookup disk cache** `<os.tmpdir()>/stellar-cache/identity-<key>.json`
+  where `<key>` is the `cacheKeyFor`-normalized lookup (lowercased —
+  `identity-kic8462852.json`), schema-versioned
+  (`CACHE_SCHEMA_VERSION`, currently **2**; bump on any query/shape/
+  parsing/KEY-derivation change — mismatched entries are refetched,
+  never served; v1 used un-normalized keys),
   **30-day TTL** (SIMBAD is a living compilation but identifier data
   is nearly append-only — ids arrive with major catalog releases).
   Two deliberate behaviors: an EXPIRED same-version entry is served
@@ -708,9 +758,11 @@ the star's RA/Dec so the cone-search path has what it needs.
 - Parsing lives in `lib/simbadIds.ts` — pure, dependency-free,
   deliberately app-side (catalog-identifier plumbing, not vetting
   science; kept OUT of the MIT engine package). Unit-tested against
-  four frozen REAL responses in `src/lib/__tests__/fixtures/simbad/`
+  five frozen REAL responses in `src/lib/__tests__/fixtures/simbad/`
   (KIC8462852 Tabby, KIC10666592 HAT-P-7, TIC25155310 WASP-126,
-  EPIC201637175 = K2-22 — captured 2026-07-18); refreeze via
+  EPIC201637175 = K2-22, and **M31** — a real object with 41
+  identifiers and NO stellar catalog id, pinning mechanism (b)'s
+  `not-tracked` branch — captured 2026-07-18); refreeze via
   `node --import ./scripts/register-ts-resolver.mjs scripts/capture-simbad-fixtures.mjs`
   and hand-verify before updating expectations. Route-level cache/TTL
   wiring is pinned in `src/app/api/__tests__/identityRoute.route.test.ts`.
@@ -1613,8 +1665,9 @@ BEFORE and AFTER touching the listed area:**
 | `anomalyDetector` / `curveClassifier` / `fitsReader` / `fitsCore` / `/api/lightcurve` fetch or normalization | `npm run test:data` + `npm run test:unit` |
 | `tpfReader` / `centroidVet` / `/api/centroid` | `npm run test:data` + `npm run test:unit` (centroid fixtures live in test:data) |
 | `selectStar` / `store` / `persistence` | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
-| `simbadIds` / `/api/identity` / `identityClient` | `npm run test:unit` + `npm run test:routes` (frozen SIMBAD fixtures live in `src/lib/__tests__/fixtures/simbad/`) |
+| `simbadIds` / `catalogMembership` / `/api/identity` / `identityClient` | `npm run test:unit` + `npm run test:routes` (frozen SIMBAD fixtures live in `src/lib/__tests__/fixtures/simbad/`) |
 | `AlsoKnownAs` panel block / identity store slot / `StarSearch` alias ranking | `npm run test:unit` (+ `test:e2e` if the selection flow changed) |
+| `StarSearch` ask-SIMBAD flow / `catalogMembership` outcomes | `npm run test:unit` + `npm run test:e2e` (`ask-simbad.spec.ts` — it also guards the never-query-on-keystroke rate posture) |
 | `StarField` selection paths / CameraSync / disambiguation popover / HUD panels | `npm run test:e2e` |
 | anything else | `npx tsc --noEmit` + verify in the browser, as always |
 
@@ -1671,6 +1724,12 @@ hand:
   deterministic: `page.route()` serves the repo's gzipped fixtures
   and holds the stale star's response until after the newer pick
   resolves. No cold MAST, fully offline-reproducible.
+- `ask-simbad.spec.ts` — the mechanism-(b) escape hatch: all three
+  outcomes (matched → selects; not-tracked → message, camera does
+  NOT move; unknown), plus the rate-posture guard that typing fires
+  ZERO `/api/identity` requests and one Enter fires exactly one.
+  `/api/identity/*` is intercepted and served from the frozen SIMBAD
+  fixtures, so the suite never puts CI traffic on CDS.
 Full E2E run ≈ 3–5 min warm; first-ever run adds the chromium
 download and cold catalog fetches.
 

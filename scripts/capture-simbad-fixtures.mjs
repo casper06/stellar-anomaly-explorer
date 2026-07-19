@@ -17,8 +17,15 @@ import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { simbadIdsQueryUrl } from '../src/lib/externalEndpoints.ts'
 
-/** @description The four frozen identity targets, in the app's un-spaced id form. */
-const TARGETS = ['KIC8462852', 'KIC10666592', 'TIC25155310', 'EPIC201637175']
+/**
+ * @description The frozen identity targets. The first four are app-form
+ * star ids (the phase-B3-mechanism-(a) panel path). `M31` is the
+ * mechanism-(b) counter-case: a real, unambiguous SIMBAD object that
+ * carries NO stellar catalog id at all (no KIC/TIC/EPIC/HIP), so it
+ * pins the "SIMBAD recognizes it but we don't track it" branch against
+ * a real response rather than a hand-written one.
+ */
+const TARGETS = ['KIC8462852', 'KIC10666592', 'TIC25155310', 'EPIC201637175', 'M31']
 
 const OUT_DIR = path.join(
   path.dirname(fileURLToPath(import.meta.url)),

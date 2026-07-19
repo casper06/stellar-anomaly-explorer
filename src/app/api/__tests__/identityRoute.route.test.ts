@@ -32,14 +32,53 @@ import * as path from 'node:path'
 import { GET } from '@/app/api/identity/[id]/route'
 
 const CACHE_DIR = path.join(os.tmpdir(), 'stellar-cache')
-const STAR = 'KIC8462852'
-const CACHE_FILE = path.join(CACHE_DIR, `identity-${STAR}.json`)
+
+/**
+ * @description The star id these tests own on disk.
+ *
+ * Deliberately a SYNTHETIC id, not the real `KIC8462852` whose fixture
+ * body is served below: the cache directory is shared with anything
+ * else on this machine that talks to the route — a running dev server,
+ * a browser session, an E2E run. Using a real id let a concurrent
+ * writer clobber the exact file these tests back up and restore, which
+ * produced an intermittent failure (observed 2026-07-18 with a dev
+ * server open in another terminal). No real session ever resolves this
+ * id, so the tests are now isolated by construction rather than by
+ * hoping nothing else runs.
+ */
+const STAR = 'KIC999999998'
+
+/**
+ * @description Mirrors the route's `cacheKeyFor` normalization
+ * (lowercase, whitespace-collapsed, non-filename chars replaced).
+ * Duplicated rather than imported because these tests assert the
+ * route's ON-DISK layout from the outside — importing the route's own
+ * helper would make a key-derivation regression invisible here.
+ * @param lookup Lookup key as sent to the route.
+ * @returns Absolute cache file path.
+ */
+function cacheFileFor(lookup: string): string {
+  const key = lookup.replace(/\s+/g, ' ').trim().toLowerCase().replace(/[^a-z0-9._-]/g, '_')
+  return path.join(CACHE_DIR, `identity-${key}.json`)
+}
+
+const CACHE_FILE = cacheFileFor(STAR)
+
+/** @description Current cache schema version (bumped to 2 for normalized keys). */
+const SCHEMA_VERSION = 2
 
 const DAY = 24 * 3600 * 1000
 
-/** @description The frozen real SIMBAD TAP body for Tabby's Star. */
+/**
+ * @description The frozen real SIMBAD TAP body for Tabby's Star, served
+ * as the stubbed upstream response regardless of which id the test asks
+ * for. The fixture FILENAME is the real star's (`KIC8462852.json`) —
+ * only the id these tests write to disk under is synthetic (`STAR`),
+ * and the two are intentionally decoupled: the body needs to be a real
+ * response, the cache path needs to be one nothing else touches.
+ */
 const TABBY_BODY = JSON.parse(
-  readFileSync(path.join(import.meta.dirname, '..', '..', '..', 'lib', '__tests__', 'fixtures', 'simbad', `${STAR}.json`), 'utf8'),
+  readFileSync(path.join(import.meta.dirname, '..', '..', '..', 'lib', '__tests__', 'fixtures', 'simbad', 'KIC8462852.json'), 'utf8'),
 ).response
 
 /** @description A structurally valid SIMBAD response with zero rows (a miss). */
@@ -56,7 +95,7 @@ async function call(id: string): Promise<{ status: number; body: Record<string, 
 }
 
 /** @description Writes the route's cache file with a controlled age and version. */
-async function writeCache(identity: unknown, ageMs: number, schemaVersion = 1): Promise<void> {
+async function writeCache(identity: unknown, ageMs: number, schemaVersion = SCHEMA_VERSION): Promise<void> {
   await fs.mkdir(CACHE_DIR, { recursive: true })
   await fs.writeFile(CACHE_FILE, JSON.stringify({ schemaVersion, fetchedAt: Date.now() - ageMs, identity }), 'utf8')
 }
@@ -174,5 +213,82 @@ describe('identity route — cache + TTL + fallback wiring', () => {
     assert.equal(status, 400)
     assert.equal(body.source, 'unavailable')
     assert.equal(fetchStub.called, 0)
+  })
+})
+
+/**
+ * @description Free-text NAME lookups (phase B3 mechanism (b)). The
+ * route accepts a name in the same segment an id goes in, because
+ * SIMBAD's `ident` join matches any alias — these pin that the wider
+ * input alphabet works and that it did not widen what reaches the
+ * filesystem.
+ */
+describe('identity route — name lookups (phase B3 mechanism (b))', () => {
+  // Synthetic name, same isolation reasoning as STAR above: a real name
+  // like "Boyajian's Star" is exactly what a concurrent dev session or
+  // E2E run would write. The apostrophe and space are what matter here
+  // (they are what the v1 SAFE_ID rejected), not the specific words.
+  const NAME = "Zzz Testfixture's Star"
+  const NAME_CACHE = cacheFileFor(NAME)
+  const NOCAT_NAME = 'ZzzTestfixtureNoCatalog'
+
+  afterEach(async () => {
+    await fs.rm(NAME_CACHE, { force: true })
+    await fs.rm(cacheFileFor(NOCAT_NAME), { force: true })
+  })
+
+  it('accepts a name with a space and an apostrophe (the v1 SAFE_ID would have 400ed)', async () => {
+    fetchStub.install(TABBY_BODY)
+    const { status, body } = await call(NAME)
+    assert.equal(status, 200)
+    assert.equal(body.source, 'real')
+    assert.equal((body.identity as Record<string, unknown>).kic, '8462852')
+    assert.equal(fetchStub.called, 1)
+  })
+
+  it('writes the name cache under a filename-safe normalized key', async () => {
+    fetchStub.install(TABBY_BODY)
+    await call(NAME)
+    const onDisk = JSON.parse(await fs.readFile(NAME_CACHE, 'utf8'))
+    assert.equal(onDisk.identity.kic, '8462852')
+    // The apostrophe and space must not survive into the filename.
+    assert.equal(path.basename(NAME_CACHE), 'identity-zzz_testfixture_s_star.json')
+  })
+
+  it('shares one cache entry across case and spacing variants', async () => {
+    fetchStub.install(TABBY_BODY)
+    await call(NAME)
+    assert.equal(fetchStub.called, 1)
+    // SIMBAD matching is case/whitespace-insensitive, so these are the
+    // same query upstream and must not each cost a round trip.
+    const upper = await call("ZZZ  TESTFIXTURE'S   STAR")
+    assert.equal(upper.body.source, 'cached')
+    assert.equal(fetchStub.called, 1, 'variant served from the same cache entry')
+  })
+
+  it('resolves a real object that carries no stellar catalog id (the not-tracked source case)', async () => {
+    const M31_BODY = JSON.parse(
+      readFileSync(path.join(import.meta.dirname, '..', '..', '..', 'lib', '__tests__', 'fixtures', 'simbad', 'M31.json'), 'utf8'),
+    ).response
+    fetchStub.install(M31_BODY)
+    const { body } = await call(NOCAT_NAME)
+    assert.equal(body.source, 'real')
+    const identity = body.identity as Record<string, unknown>
+    // The route's job ends at "SIMBAD knows it"; deciding that we do
+    // not render it is `resolveAgainstCatalog`'s (unit-tested there).
+    assert.ok(identity, 'SIMBAD recognizes M31')
+    assert.equal(identity.kic, null)
+    assert.equal(identity.tic, null)
+    assert.equal(identity.epic, null)
+    assert.equal(identity.hip, null)
+  })
+
+  it('still rejects path separators and other junk', async () => {
+    fetchStub.install(TABBY_BODY)
+    for (const bad of ['../etc/passwd', 'a/b', 'a\\b', 'x'.repeat(65), '']) {
+      const { status } = await call(bad)
+      assert.equal(status, 400, `${JSON.stringify(bad)} must be rejected`)
+    }
+    assert.equal(fetchStub.called, 0, 'no rejected input reached the network')
   })
 })
