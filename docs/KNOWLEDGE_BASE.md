@@ -802,9 +802,87 @@ honestly and without moving the camera.
 
 ---
 
-*Last updated 2026-07-18 (§10 extended with phase B3 mechanism (b);
+## 11. Data-source acknowledgments & citations (2026-07-18)
+
+**Framing — this is NOT §9.** §9 is about SOFTWARE LICENSING (GPL app
+/ MIT engine): what others may legally do with this code. This section
+is about ACADEMIC CITATION NORMS: what the data providers ask users of
+their DATA to reproduce in a publication. The two are independent
+obligations with different enforcement (copyright law vs. scholarly
+convention) and neither substitutes for the other. Keep them
+separate — conflating "we acknowledged NASA" with "we complied with a
+license" would be wrong in both directions.
+
+The verbatim text for all five providers lives in **README.md → Data
+sources & attribution → Required acknowledgments**, which is the
+single source of truth. It is not duplicated here; this section
+records the FINDINGS behind it.
+
+**Findings (all verified live 2026-07-18, not assumed):**
+
+- **VizieR and SIMBAD need SEPARATE acknowledgments** even though both
+  are CDS Strasbourg services. Using one does not cover the other, and
+  this project uses both (VizieR for Hipparcos, SIMBAD for
+  cross-identifiers). Their citable papers are likewise separate — and
+  are companion papers in the same volume: Ochsenbein+ 2000, A&AS 143,
+  **23** (VizieR) and Wenger+ 2000, A&AS 143, **9** (SIMBAD). Easy to
+  conflate; don't.
+- **STScI's Kepler and TESS texts are asymmetric, and that is not a
+  transcription error.** Kepler reads "Funding **to** US Institutions
+  for the Kepler mission **was** provided…" (past tense — the mission
+  ended in 2018); TESS reads "Funding **for** US Institutions for the
+  TESS mission **is** provided…" (present — still observing). Both
+  close with the identical STScI/AURA sentence. Reproduce them as
+  STScI words them rather than normalizing them to match each other.
+- **The NAS contract number uses an EN-DASH**: `NAS 5–26555`, not a
+  hyphen. Verified against the STScI page.
+- **Older Kepler/TESS wording circulates widely in the literature**
+  ("Funding for the Kepler mission is provided by the NASA Science
+  Mission Directorate", without the "US Institutions" qualifier).
+  Papers using it are not wrong — it was the text at the time — but
+  this project follows the CURRENT STScI page. If STScI revises it
+  again, README is the file to update.
+- **The NASA Exoplanet Archive's citable paper changed in 2025.**
+  Christiansen et al. 2025, PSJ 6, 186 (10.3847/PSJ/ade3c2) now
+  supersedes Akeson et al. 2013, PASP 125, 989 (10.1086/672273) as the
+  reference the archive asks users to cite. Cite Christiansen; the
+  Akeson DOI is recorded here only so a future reader recognizes it as
+  the superseded one rather than a second required citation.
+- **Acknowledgment text ≠ paper citation.** Most of these providers
+  want BOTH: the acknowledgment paragraph in the acknowledgments
+  section, and the paper in the reference list. Satisfying one does
+  not satisfy the other.
+
+**Reference list stub for the eventual `paper.md`** (all five DOIs
+resolved and title/volume/page-checked against Crossref on
+2026-07-18 — none of these were reconstructed from memory):
+
+| Source | Reference | DOI |
+|---|---|---|
+| Kepler | Borucki et al. 2010, *Science*, 327, 977 | 10.1126/science.1185402 |
+| TESS | Ricker et al. 2015, *JATIS*, 1, 014003 | 10.1117/1.JATIS.1.1.014003 |
+| NASA Exoplanet Archive | Christiansen et al. 2025, *PSJ*, 6, 186 | 10.3847/PSJ/ade3c2 |
+| VizieR | Ochsenbein, Bauer & Marcout 2000, *A&AS*, 143, 23 | 10.1051/aas:2000169 |
+| SIMBAD | Wenger et al. 2000, *A&AS*, 143, 9 | 10.1051/aas:2000332 |
+
+Deliberately NOT included: a Hipparcos-catalog reference (ESA 1997,
+SP-1200) — the catalog is consumed THROUGH VizieR, whose own
+acknowledgment is required and covered above; whether the JOSS paper
+should additionally cite ESA 1997 for the catalog itself is a
+paper-writing decision, not a data-attribution one, and no source
+consulted here demands it. Also not included: any MAST-specific
+citation beyond the mission papers, since MAST's requirement is
+satisfied by the acknowledgment text rather than a separate reference.
+
+---
+
+*Last updated 2026-07-18 (§11 added: data-source acknowledgments +
+verified citable references, deliberately distinct from §9's software
+licensing).*
+
+*Previously: §10 extended with phase B3 mechanism (b);
 its previously-open design question is now CLOSED — resolved as the
-`not-tracked` outcome).
+`not-tracked` outcome.
 When an open issue in §7 is fixed, move it to
 the relevant "FIXED" section with its root cause, and update the K00931.01
 entry (§4) once §7.1 is resolved.*

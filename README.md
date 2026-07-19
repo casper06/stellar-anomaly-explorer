@@ -38,8 +38,55 @@ Planned (not yet implemented): constellation boundary outlines on the minimap an
 | Star catalog (positions, magnitudes, B–V colors) | [Hipparcos main catalog (I/239)](https://vizier.cds.unistra.fr/viz-bin/VizieR?-source=I/239) via VizieR, CDS Strasbourg |
 | Kepler Objects of Interest (KOI) & TESS Objects of Interest (TOI) | [NASA Exoplanet Archive](https://exoplanetarchive.ipac.caltech.edu/) (TAP service) |
 | Kepler & TESS light curves (PDCSAP flux) | [MAST — Mikulski Archive for Space Telescopes](https://archive.stsci.edu/), STScI |
+| Cross-identifiers & common names | [SIMBAD](https://simbad.cds.unistra.fr/simbad/), CDS Strasbourg (TAP service) |
 
 All external archives are proxied through Next.js API routes (CORS + caching); the browser never talks to them directly.
+
+### Required acknowledgments
+
+Each archive below asks users of its data to reproduce a specific
+acknowledgment. These are **academic citation norms — not software
+license terms**, and they are entirely separate from this project's
+GPL/MIT licensing (see [License](#license)). They are reproduced here
+verbatim, as each provider words them, and should be carried into any
+paper, poster, or publication built on this project.
+
+**Kepler** (light curves via MAST):
+
+> This paper includes data collected by the Kepler mission and obtained from the MAST data archive at the Space Telescope Science Institute (STScI). Funding to US Institutions for the Kepler mission was provided by the NASA Science Mission Directorate. STScI is operated by the Association of Universities for Research in Astronomy, Inc., under NASA contract NAS 5–26555.
+
+**TESS** (light curves via MAST):
+
+> This paper includes data collected with the TESS mission, obtained from the MAST data archive at the Space Telescope Science Institute (STScI). Funding for US Institutions for the TESS mission is provided by the NASA Explorer Program. STScI is operated by the Association of Universities for Research in Astronomy, Inc., under NASA contract NAS 5–26555.
+
+**NASA Exoplanet Archive** (KOI + TOI catalogs):
+
+> This research has made use of the NASA Exoplanet Archive, which is operated by the California Institute of Technology, under contract with the National Aeronautics and Space Administration under the Exoplanet Exploration Program.
+
+**VizieR** (Hipparcos catalog access):
+
+> This research has made use of the VizieR catalogue access tool, CDS, Strasbourg, France.
+
+**SIMBAD** (cross-identifier resolution):
+
+> This research has made use of the SIMBAD database, operated at CDS, Strasbourg, France.
+
+VizieR and SIMBAD are both CDS services but require **separate**
+acknowledgments — using one does not cover the other, and this project
+uses both.
+
+### Citable references
+
+Acknowledgment text and a paper citation are different obligations;
+most of these providers want both. Verified references:
+
+| Source | Reference | DOI |
+|---|---|---|
+| Kepler | Borucki et al. 2010, *Science*, 327, 977 | [10.1126/science.1185402](https://doi.org/10.1126/science.1185402) |
+| TESS | Ricker et al. 2015, *JATIS*, 1, 014003 | [10.1117/1.JATIS.1.1.014003](https://doi.org/10.1117/1.JATIS.1.1.014003) |
+| NASA Exoplanet Archive | Christiansen et al. 2025, *PSJ*, 6, 186 | [10.3847/PSJ/ade3c2](https://doi.org/10.3847/PSJ/ade3c2) |
+| VizieR | Ochsenbein, Bauer & Marcout 2000, *A&AS*, 143, 23 | [10.1051/aas:2000169](https://doi.org/10.1051/aas:2000169) |
+| SIMBAD | Wenger et al. 2000, *A&AS*, 143, 9 | [10.1051/aas:2000332](https://doi.org/10.1051/aas:2000332) |
 
 ## Getting started
 
