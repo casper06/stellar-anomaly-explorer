@@ -13,104 +13,17 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { readMastLightcurveColumns } from '../src/fitsReader.ts'
-
-const BLOCK = 2880
-
-/**
- * @description Formats one FITS header card: keyword padded to 8 chars,
- * `= `, then the value, padded to the 80-char card width.
- * @param key Header keyword (≤8 chars).
- * @param value Value as it should appear after `= ` (quote strings
- * yourself: `"'BINTABLE'"`).
- * @returns 80-character card string.
- */
-function card(key: string, value: string): string {
-  return `${key.padEnd(8)}= ${value}`.padEnd(80)
-}
-
-/**
- * @description Builds a full FITS header from cards: appends the END card
- * and pads with spaces to a whole number of 2880-byte blocks.
- * @param cards Pre-formatted 80-char cards (see `card`).
- * @returns Header bytes ready to concatenate into a file buffer.
- */
-function headerBlocks(cards: string[]): Buffer {
-  let text = cards.join('') + 'END'.padEnd(80)
-  const blocks = Math.ceil(text.length / BLOCK)
-  text = text.padEnd(blocks * BLOCK)
-  return Buffer.from(text, 'ascii')
-}
-
-/**
- * @description Pads a data payload to a whole number of 2880-byte blocks
- * (FITS requires block-aligned data sections).
- * @param data Raw data bytes.
- * @returns Block-padded copy.
- */
-function padData(data: Buffer): Buffer {
-  const blocks = Math.ceil(data.length / BLOCK)
-  return Buffer.concat([data, Buffer.alloc(blocks * BLOCK - data.length)])
-}
-
-/** @description Minimal primary HDU (header only, no data). */
-function primaryHdu(): Buffer {
-  return headerBlocks([card('SIMPLE', 'T'), card('BITPIX', '8'), card('NAXIS', '0')])
-}
-
-/**
- * @description One column spec for `bintableHdu`: TTYPE name, TFORM string
- * (e.g. "1D", "3E"), and a per-row writer that appends this column's bytes.
- */
-interface ColSpec {
-  name: string
-  tform: string
-  /** Writes this column's bytes for row `r` into `buf` at `offset`; returns bytes written. */
-  write: (buf: Buffer, offset: number, r: number) => number
-}
-
-/**
- * @description Builds a BINTABLE extension HDU (header + block-padded data)
- * from column specs and a row count.
- * @param colSpecs Column definitions in physical order.
- * @param nRows Number of table rows.
- * @param rowBytes Total bytes per row (must match the sum of column widths).
- * @returns Full HDU bytes.
- */
-function bintableHdu(colSpecs: ColSpec[], nRows: number, rowBytes: number): Buffer {
-  const cards = [
-    card('XTENSION', "'BINTABLE'"),
-    card('BITPIX', '8'),
-    card('NAXIS', '2'),
-    card('NAXIS1', String(rowBytes)),
-    card('NAXIS2', String(nRows)),
-    card('PCOUNT', '0'),
-    card('GCOUNT', '1'),
-    card('TFIELDS', String(colSpecs.length)),
-    ...colSpecs.flatMap((c, i) => [
-      card(`TTYPE${i + 1}`, `'${c.name}'`),
-      card(`TFORM${i + 1}`, `'${c.tform}'`),
-    ]),
-  ]
-  const data = Buffer.alloc(nRows * rowBytes)
-  for (let r = 0; r < nRows; r++) {
-    let offset = r * rowBytes
-    for (const c of colSpecs) offset += c.write(data, offset, r)
-  }
-  return Buffer.concat([headerBlocks(cards), padData(data)])
-}
-
-/** @description Standard two-column (TIME 1D + PDCSAP_FLUX 1E) table with given values. */
-function standardFile(times: number[], flux: number[]): Buffer {
-  const hdu = bintableHdu(
-    [
-      { name: 'TIME', tform: '1D', write: (b, o, r) => { b.writeDoubleBE(times[r], o); return 8 } },
-      { name: 'PDCSAP_FLUX', tform: '1E', write: (b, o, r) => { b.writeFloatBE(flux[r], o); return 4 } },
-    ],
-    times.length,
-    12,
-  )
-  return Buffer.concat([primaryHdu(), hdu])
-}
+// Synthetic-FITS builders are shared with fitsCore.unit.test.ts so both
+// suites construct byte-identical fixtures from one definition.
+import {
+  BLOCK,
+  card,
+  headerBlocks,
+  padData,
+  primaryHdu,
+  bintableHdu,
+  standardFile,
+} from './syntheticFits.ts'
 
 describe('readMastLightcurveColumns', () => {
   it('extracts D and E columns from a standard TIME/PDCSAP_FLUX table', () => {
