@@ -306,6 +306,46 @@ export async function fetchKOICatalog(): Promise<KoiFetchResult> {
 }
 
 /**
+ * @description Asserts that incoming catalog rows are unique by host-star
+ * id, logging loudly (never throwing) when they are not.
+ *
+ * WHY THIS EXISTS — the dedup that actually enforces this invariant lives
+ * UPSTREAM in `fetchKOICatalog` / `fetchTOICatalog`, which collapse the
+ * many-KOIs-per-star TAP response down to one row per host star. The
+ * merge functions below just consume the result and never checked it.
+ * That matters because the HUD's `koiCount` / `toiCount` is `rows.length`
+ * — a number that only means "unique host stars" because of a guarantee
+ * nothing downstream verified. A regression upstream would therefore
+ * surface as a silently inflated counter, not as an error.
+ *
+ * Logs rather than throws deliberately: a duplicate corrupts a COUNTER,
+ * and throwing here would take down the entire sky render over it. The
+ * merge itself stays correct regardless — the id-match branch folds the
+ * duplicate into the existing entry.
+ * @param rows Rows about to be merged.
+ * @param label Catalog name used in the log line ("KOI" / "TOI").
+ * @returns True when the invariant holds.
+ */
+function assertUniqueByHostStar(rows: { id: string }[], label: string): boolean {
+  const seen = new Set<string>()
+  const dupes = new Set<string>()
+  for (const r of rows) {
+    if (seen.has(r.id)) dupes.add(r.id)
+    else seen.add(r.id)
+  }
+  if (dupes.size === 0) return true
+  const sample = [...dupes].slice(0, 5).join(', ')
+  console.error(
+    `[starCatalog] INVARIANT VIOLATED: ${label} rows are not unique by host-star id — ` +
+      `${rows.length} rows carry only ${seen.size} distinct ids (${dupes.size} duplicated: ${sample}` +
+      `${dupes.size > 5 ? ', …' : ''}). ` +
+      `Dedup is owned by fetch${label}Catalog, so the regression is THERE, not in the merge. ` +
+      `The ${label.toLowerCase()}Count HUD counter is now overstated.`,
+  )
+  return false
+}
+
+/**
  * @description Merges a deduped KOI catalog into a Hipparcos catalog by
  * position. For each KOI row, looks for a Hipparcos entry within
  * `KOI_HIPPARCOS_MATCH_DEG` (also checks by id first so seeded
@@ -329,6 +369,7 @@ export function mergeKoiIntoHipparcos(
   hipparcos: CatalogStar[],
   kois: KoiClientRow[],
 ): MergedCatalog {
+  assertUniqueByHostStar(kois, 'KOI')
   // Index Hipparcos stars into a sparse RA/Dec grid for cheap proximity
   // lookups. Bucket size = match threshold so each KOI checks at most 9
   // buckets (its own + 8 neighbors).
@@ -551,6 +592,7 @@ export function mergeToiIntoCatalog(
   catalog: CatalogStar[],
   tois: ToiClientRow[],
 ): ToiMergeResult {
+  assertUniqueByHostStar(tois, 'TOI')
   const bucketKey = (ra: number, dec: number) =>
     `${Math.floor(ra / TOI_HIPPARCOS_MATCH_DEG)}|${Math.floor(dec / TOI_HIPPARCOS_MATCH_DEG)}`
   const grid = new Map<string, CatalogStar[]>()

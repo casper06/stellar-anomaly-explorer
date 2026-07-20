@@ -39,6 +39,18 @@ const CACHE_FILE = path.join(CACHE_DIR, 'pattern-cache.json')
 let memoryCache: PatternCache | null = null
 
 /**
+ * @description The IN-FLIGHT load promise, memoized so that concurrent
+ * cold-start callers await one shared load instead of each running their
+ * own. Memoizing only the resolved value (`memoryCache`) is not enough:
+ * on a cold cache, N concurrent `setEntry` calls would all observe
+ * `memoryCache === null`, each build a separate `{entries:{}}`, and the
+ * last write would win — 12 concurrent calls produced 1 entry.
+ * Never reset: the cache is mutated in place for the process lifetime,
+ * so there is no invalidation event to reset it on.
+ */
+let cachePromise: Promise<PatternCache> | null = null
+
+/**
  * @description Serializes concurrent writers so two async setEntry calls
  * can't race a load/save pair and lose an entry. Chain-of-promises
  * pattern: each write awaits the previous.
@@ -55,6 +67,18 @@ let writeChain: Promise<void> = Promise.resolve()
  */
 export async function getCache(): Promise<PatternCache> {
   if (memoryCache) return memoryCache
+  // Assigned BEFORE the first await inside loadCache, so any caller that
+  // arrives while the read is still in flight joins this same promise.
+  cachePromise ??= loadCache()
+  return cachePromise
+}
+
+/**
+ * @description Performs the actual disk read for `getCache`. Split out so
+ * the memoized promise wraps exactly one execution of this body.
+ * @returns The loaded cache, or a fresh empty one on miss/corruption.
+ */
+async function loadCache(): Promise<PatternCache> {
   try {
     const raw = await fs.readFile(CACHE_FILE, 'utf8')
     const parsed = JSON.parse(raw) as PatternCache
