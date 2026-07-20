@@ -51,3 +51,7 @@ packages/*/dist/
 # Claude Code local config (model preference + machine-specific permission
 # allowlist with absolute paths) — personal, not shared project config
 .claude/
+
+# Local planning docs (personal, not shared project config)
+STELLAR_ANOMALY_EXPLORER_LONGTERM_ROADMAP.md
+STELLAR_ANOMALY_EXPLORER_PLAN.md
