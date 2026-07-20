@@ -33,6 +33,11 @@ export const QUADRANT_DEC_STEP =
  * @returns Quadrant id like "C4", or null if outside the grid.
  */
 export function quadrantFor(ra: number, dec: number): string | null {
+  // Number.isFinite (not a range comparison) is what rejects NaN: every
+  // comparison against NaN is false, so the bounds checks below would let
+  // it through and the template interpolation would emit a malformed id
+  // like "undefined3". Callers are not guaranteed to reject NaN upstream.
+  if (!Number.isFinite(ra) || !Number.isFinite(dec)) return null
   if (ra < QUADRANT_RA_MIN || ra >= QUADRANT_RA_MAX) return null
   if (dec < QUADRANT_DEC_MIN || dec >= QUADRANT_DEC_MAX) return null
   const colIdx = Math.floor((ra - QUADRANT_RA_MIN) / QUADRANT_RA_STEP)

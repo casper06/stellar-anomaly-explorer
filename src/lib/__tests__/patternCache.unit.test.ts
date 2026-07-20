@@ -108,28 +108,25 @@ describe('patternCache — round-trip', () => {
     assert.equal(Object.keys(onDisk.entries).length, 12, 'every write survived')
   })
 
-  it('CURRENT BEHAVIOR (latent defect, pinned deliberately): concurrent writes on a COLD cache collapse to one', async () => {
-    // ⚠ Documents a REAL RACE rather than intended behavior, and is
-    // written to fail loudly if it is fixed — at which point it should
-    // be REPLACED with the 12/12 assertion, not deleted.
+  it('survives concurrent writes on a COLD cache too (no warm-up required)', async () => {
+    // Regression guard for a cold-start race fixed 2026-07-20. Note this
+    // case takes NO `await m.getCache()` warm-up — that is the point.
     //
-    // Mechanism: `getCache()` memoizes into a module-level variable but
-    // is not guarded by an in-flight promise. N callers racing a cold
-    // cache each observe `memoryCache === null`, each build their own
-    // `{ entries: {} }`, and the last assignment wins — so N-1 mutations
-    // are silently dropped before `persist()` (which is correctly
-    // serialized by writeChain) ever runs. The writeChain is not at
-    // fault; the un-deduped cache LOAD is.
+    // Mechanism of the old bug: `getCache()` memoized the resolved value
+    // into a module-level variable, not the in-flight promise. N callers
+    // racing a cold cache each observed `memoryCache === null`, each
+    // built their own `{ entries: {} }`, and the last assignment won — so
+    // N-1 mutations were silently dropped before `persist()` (correctly
+    // serialized by writeChain) ever ran. The writeChain was never at
+    // fault; the un-deduped cache LOAD was. 12 concurrent writes yielded
+    // 1 entry.
     //
-    // Why it is NOT currently reachable in production: the only
-    // concurrent writer is `batchClassifier`, and it awaits
-    // `getCachedIds()` — which warms the same memoized cache — before
-    // its first `Promise.all` chunk. The organic fill-in path writes one
-    // star per user click. So the window exists but nothing enters it.
-    //
-    // Fix when it becomes reachable: memoize the in-flight PROMISE
-    // rather than the resolved value, so concurrent callers await one
-    // shared load.
+    // Why it was never reachable in production: the only concurrent
+    // writer is `batchClassifier`, and it awaits `getCachedIds()` — which
+    // warms the same memoized cache — before its first `Promise.all`
+    // chunk. The organic fill-in path writes one star per user click. The
+    // window existed but nothing entered it; this test now holds the
+    // cold path to the same guarantee as the warm and sequential ones.
     const m = await freshModule('concurrent-cold')
     await Promise.all(
       Array.from({ length: 12 }, (_, i) => m.setEntry(`KIC${i}`, PATTERN)),
@@ -137,8 +134,8 @@ describe('patternCache — round-trip', () => {
     const onDisk = JSON.parse(await fs.readFile(CACHE_FILE, 'utf8'))
     assert.equal(
       Object.keys(onDisk.entries).length,
-      1,
-      'cold-start race: only the last writer’s cache object survives',
+      12,
+      'every write survived a cold-start race',
     )
   })
 

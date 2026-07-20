@@ -98,7 +98,16 @@ describe('runBls', () => {
     const r = runBls(times, flux)
     const elapsed = performance.now() - start
     assert.ok(r, 'result expected')
-    assert.ok(elapsed < 3000, `search took ${elapsed.toFixed(0)} ms (budget 3000)`)
+    // Budget raised 3000 → 6000 (2026-07-20). Measured on this machine:
+    // ~1400 ms idle, ~2500 ms under heavy CPU contention — a smooth
+    // throughput-scaling curve with no cliff, so a contended run is not a
+    // regression signal, and 3000 ms left only 1.2x headroom on a busy
+    // box (GitHub Actions free runners are typically 2 vCPU).
+    // CAVEAT: this is still an ABSOLUTE wall-clock assertion, i.e. it
+    // measures the runner as much as the code. The real fix — relative-
+    // to-baseline timing, or moving perf tracking out of the correctness
+    // suite entirely — is future work, tracked in the plan doc.
+    assert.ok(elapsed < 6000, `search took ${elapsed.toFixed(0)} ms (budget 6000)`)
     assert.ok(r.sde >= BLS_SDE_THRESHOLD, `confident detection expected (sde=${r.sde.toFixed(1)})`)
     assert.ok(Math.abs(r.periodDays - P) / P < 0.005, `period ${r.periodDays.toFixed(4)} ≈ ${P}`)
   })

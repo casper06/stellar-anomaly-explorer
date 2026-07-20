@@ -194,6 +194,55 @@ describe('mergeKoiIntoHipparcos — duplicate host stars (the HUD counter rule)'
     assert.equal(out.stars.length, 1, 'stars collapse correctly')
     assert.equal(out.koiCount, 2, 'but the count is rows.length, NOT unique hosts')
   })
+
+  it('logs loudly when incoming rows are NOT unique by host star', () => {
+    // The defensive assertion added 2026-07-20. It does not FIX the
+    // over-count above — it makes it announce itself, and points at
+    // fetchKOICatalog (which owns the dedup) rather than at the merge.
+    // Deliberately non-throwing: a duplicate corrupts a counter, and
+    // throwing would take down the whole sky render over it.
+    const errors: string[] = []
+    const original = console.error
+    console.error = (...args: unknown[]) => { errors.push(args.join(' ')) }
+    try {
+      mergeKoiIntoHipparcos([], [
+        koi({ id: 'KIC777', name: 'K00777.01' }),
+        koi({ id: 'KIC777', name: 'K00777.02' }),
+      ])
+    } finally {
+      console.error = original
+    }
+    assert.equal(errors.length, 1, 'exactly one loud line')
+    assert.match(errors[0], /INVARIANT VIOLATED/)
+    assert.match(errors[0], /KIC777/, 'names the duplicated id')
+    assert.match(errors[0], /fetchKOICatalog/, 'points at the owner of the guarantee')
+  })
+
+  it('stays silent when rows are properly deduped', () => {
+    const errors: string[] = []
+    const original = console.error
+    console.error = (...args: unknown[]) => { errors.push(args.join(' ')) }
+    try {
+      mergeKoiIntoHipparcos([], [koi({ id: 'KIC1' }), koi({ id: 'KIC2' })])
+    } finally {
+      console.error = original
+    }
+    assert.equal(errors.length, 0, 'no false alarm on the normal path')
+  })
+
+  it('fires the same assertion for TOI rows', () => {
+    const errors: string[] = []
+    const original = console.error
+    console.error = (...args: unknown[]) => { errors.push(args.join(' ')) }
+    try {
+      mergeToiIntoCatalog([], [toi({ id: 'TIC555' }), toi({ id: 'TIC555' })])
+    } finally {
+      console.error = original
+    }
+    assert.equal(errors.length, 1)
+    assert.match(errors[0], /INVARIANT VIOLATED: TOI/)
+    assert.match(errors[0], /fetchTOICatalog/)
+  })
 })
 
 describe('mergeKoiIntoHipparcos — disposition scoring', () => {

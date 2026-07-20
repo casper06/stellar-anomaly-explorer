@@ -124,36 +124,23 @@ describe('quadrantFor — outside the grid', () => {
     assert.equal(quadrantFor(300, Infinity), null)
   })
 
-  it('CURRENT BEHAVIOR (defect, pinned deliberately): NaN yields a malformed id, not null', () => {
-    // ⚠ This test documents a REAL DEFECT rather than intended
-    // behavior, and is written to fail loudly if the defect is fixed —
-    // at which point it should be REPLACED with the `null` assertions
-    // commented below, not deleted.
+  it('returns null for NaN in either coordinate', () => {
+    // Regression guard for a latent defect fixed 2026-07-20. Previously
+    // the guards were range comparisons only; every comparison against
+    // NaN is false, so NaN slipped past both early returns, made
+    // `colIdx`/`rowIdx` NaN, and template interpolation stringified the
+    // undefined lookups into malformed ids ("undefined3", "ENaN").
     //
-    // Why it happens: every range comparison against NaN is false, so
-    // the two early-return guards never fire; the arithmetic then makes
-    // `colIdx`/`rowIdx` NaN and template interpolation stringifies the
-    // undefined lookups.
-    //
-    // Why it is NOT currently reachable in production: both catalog
-    // parsers reject a row whose ra/dec is not a number, and NASA TAP
-    // sends JSON `null` (not NaN) for missing coordinates, so the guard
-    // catches it. It is latent, not firing — note though that those
-    // guards use `typeof x !== 'number'`, and `typeof NaN === 'number'`,
-    // so a NaN arriving from any future caller would slip through.
-    assert.equal(quadrantFor(NaN, 44), 'undefined3')
-    assert.equal(quadrantFor(300, NaN), 'ENaN')
-    assert.equal(quadrantFor(NaN, NaN), 'undefinedNaN')
-
-    // Desired behavior once fixed (one `Number.isFinite` guard):
-    //   assert.equal(quadrantFor(NaN, 44), null)
-    //   assert.equal(quadrantFor(300, NaN), null)
-    //   assert.equal(quadrantFor(NaN, NaN), null)
-
-    // Containment: a malformed id does NOT round-trip, so it cannot
-    // silently become a real cell downstream.
-    assert.equal(quadrantCenter('undefined3'), null)
-    assert.equal(quadrantCenter('ENaN'), null)
+    // Why it was never reachable in production: the KOI/TOI/Hipparcos
+    // parsers all reject a row whose ra/dec is not a number, and NASA
+    // TAP sends JSON `null` (not NaN) for missing coordinates. That is
+    // an UPSTREAM guarantee, not a property of this function — a future
+    // caller (e.g. Gaia coordinate parsing, where a failed float parse
+    // naturally yields NaN rather than null) is not bound by it. Hence
+    // the explicit `Number.isFinite` guard and this test.
+    assert.equal(quadrantFor(NaN, 44), null)
+    assert.equal(quadrantFor(300, NaN), null)
+    assert.equal(quadrantFor(NaN, NaN), null)
   })
 })
 
