@@ -1,5 +1,5 @@
 /**
- * @description External-dependency health check. Probes the SEVEN
+ * @description External-dependency health check. Probes the EIGHT
  * external contracts the app relies on, using the EXACT endpoint
  * constants and URL builders the production API routes use (imported
  * from `src/lib/externalEndpoints.ts`), so a contract change at any
@@ -8,9 +8,9 @@
  *
  * Run with `npm run test:external-health`. This hits the live network and
  * is intentionally NOT part of `npm test` (which must stay offline and
- * fast). Exit code 0 = all seven healthy; 1 = one or more failed.
+ * fast). Exit code 0 = all eight healthy; 1 = one or more failed.
  *
- * The seven checks:
+ * The eight checks:
  *   1. VizieR (Hipparcos catalog)              — /api/stars
  *   2. NASA Exoplanet Archive KOI (Kepler)     — /api/koi
  *   3. NASA Exoplanet Archive TOI (TESS)       — /api/toi
@@ -26,6 +26,12 @@
  *      returns for query errors even with FORMAT=json), the
  *      `main_id`/`ids` column names, and that Tabby's Star still
  *      resolves with its KIC and a TIC cross-identifier.
+ *   8. Gaia DR3 TAP gaia_source                — /api/gaia. Resolves
+ *      Tabby's source_id through the exact `gaiaSourceQueryUrl` builder
+ *      and asserts a real `<TABLEDATA>` row with the columns the parser
+ *      reads by name. Crucially it detects the C1 outage mode — an
+ *      HTTP-200 body that is HTML/BINARY2/anything-but-tabular-VOTable —
+ *      by requiring the parsed row, not by trusting the status code.
  *
  * Each check verifies not just "reachable" but "still shaped how we
  * parse it" — the Hipparcos required columns, the `tid` TOI column, an
@@ -45,7 +51,10 @@ import {
   deriveTessTpfUrl,
   simbadIdsQueryUrl,
   SIMBAD_HEALTH_PROBE_IDENTIFIER,
+  gaiaSourceQueryUrl,
+  GAIA_HEALTH_PROBE_SOURCE_ID,
 } from '../src/lib/externalEndpoints.ts'
+import { parseGaiaSourceVotable, isGaiaErrorEnvelope } from '../src/lib/gaiaSource.ts'
 
 /** @description Per-check network timeout. Some of these services are slow cold. */
 const TIMEOUT_MS = 60000
@@ -262,21 +271,66 @@ async function checkSimbad() {
 }
 
 /**
- * @description Runs all seven checks in order (checks 4→5 are dependent,
+ * @description Check 8 — Gaia DR3 TAP `gaia_source` (load-bearing for
+ * /api/gaia). Resolves Tabby's source_id through the exact
+ * `gaiaSourceQueryUrl` builder production uses, then runs the REAL
+ * `parseGaiaSourceVotable` engine parser on the body — so a schema change
+ * (renamed/removed column) surfaces as a thrown parse error naming the
+ * column, and the C1 OUTAGE mode surfaces too: Gaia serves downtime as
+ * HTTP 200 + an HTML page, so this check must NOT trust the status code.
+ * It deliberately does its own fetch (not the shared `get`, which throws
+ * only on non-2xx) and asserts the body parses into a row with the trap
+ * column populated (`phot_variable_flag = NOT_AVAILABLE` for Tabby), which
+ * an HTML outage page or a BINARY2-serialized body could not do.
+ */
+async function checkGaia() {
+  const res = await fetch(gaiaSourceQueryUrl(GAIA_HEALTH_PROBE_SOURCE_ID), {
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  })
+  const text = await res.text()
+  // Body-sniff BEFORE trusting status. An outage is 200 + HTML.
+  if (isGaiaErrorEnvelope(text)) {
+    throw new Error(`Gaia rejected the query (error envelope): ${text.slice(0, 160)}`)
+  }
+  if (!/<VOTABLE|<FIELD\b/i.test(text)) {
+    const looksHtml = /<html/i.test(text)
+    throw new Error(
+      looksHtml
+        ? `Gaia returned an HTTP-200 HTML page (outage), not VOTable: ${text.slice(0, 120)}`
+        : `Gaia returned a non-VOTable body: ${text.slice(0, 160)}`,
+    )
+  }
+  // Run the actual production parser — catches column-contract changes by name.
+  const row = parseGaiaSourceVotable(text)
+  if (row === null) {
+    throw new Error(`0 rows for source_id ${GAIA_HEALTH_PROBE_SOURCE_ID} (Tabby's Star should always resolve)`)
+  }
+  if (row.photVariableFlag !== 'NOT_AVAILABLE') {
+    // A strong signal the row we parsed is the wrong object or a changed
+    // value — worth flagging loudly (Tabby's flag is a stable NOT_AVAILABLE).
+    throw new Error(`unexpected phot_variable_flag for Tabby: ${JSON.stringify(row.photVariableFlag)} (expected NOT_AVAILABLE)`)
+  }
+  if (row.ruwe === null) throw new Error('ruwe came back null for Tabby (column contract change?)')
+  return `gaia_source OK (RUWE ${row.ruwe.toFixed(3)}, flag ${row.photVariableFlag})`
+}
+
+/**
+ * @description Runs all eight checks in order (checks 4→5 are dependent,
  * the rest independent), prints an aligned report, and exits non-zero if
  * any failed.
  */
 async function main() {
-  console.log('External dependency health check — probing 7 live contracts\n')
+  console.log('External dependency health check — probing 8 live contracts\n')
   const results = []
   // Independent checks first, in parallel.
-  const [vizier, koi, toi, simbad] = await Promise.all([
+  const [vizier, koi, toi, simbad, gaia] = await Promise.all([
     runCheck('VizieR (Hipparcos)', checkVizier),
     runCheck('NASA KOI (Kepler)', checkKoi),
     runCheck('NASA TOI (TESS)', checkToi),
     runCheck('SIMBAD TAP (identity)', checkSimbad),
+    runCheck('Gaia DR3 TAP (gaia_source)', checkGaia),
   ])
-  results.push(vizier, koi, toi, simbad)
+  results.push(vizier, koi, toi, simbad, gaia)
   // MAST TAP must run before MAST download (download reuses TAP's segment URL).
   const mastTap = await runCheck('MAST VO-TAP (discovery)', checkMastTap)
   results.push(mastTap)
