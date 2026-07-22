@@ -7,6 +7,7 @@ import type { CentroidStamp, CentroidVetResult } from '@/lib/centroidVet'
 import { fetchCentroidVet, type CentroidVetPayload, type CentroidVetFailure } from '@/lib/centroidClient'
 import { constellationAt, describeVisibilityStory } from '@/lib/constellations'
 import { selectDisplayNames, type SimbadIdentity } from '@/lib/simbadIds'
+import type { GaiaDescription } from '@/lib/gaiaSource'
 import LightCurve from './LightCurve'
 
 /**
@@ -1391,7 +1392,7 @@ function DipProvenanceLine({ provenance }: { provenance?: LightcurveProvenance }
  * @returns The panel, or null when no star is selected.
  */
 export default function AnomalyPanel() {
-  const { selectedStar, lightcurve, lightcurveLoading, identity, identityLoading, setSelectedStar, setMode, flaggedIds, toggleFlagged } = useStore()
+  const { selectedStar, lightcurve, lightcurveLoading, identity, identityLoading, gaia, gaiaLoading, setSelectedStar, setMode, flaggedIds, toggleFlagged } = useStore()
   const [showLightcurve, setShowLightcurve] = useState(false)
 
   if (!selectedStar) return null
@@ -1566,6 +1567,14 @@ export default function AnomalyPanel() {
           loading={identityLoading}
           displayed={[selectedStar.name, selectedStar.id]}
         />
+
+        {/* Gaia DR3 descriptive profile — an independent instrument
+            reading (RUWE / RV-variability / photometric-variability flag /
+            bonus ML class), sitting alongside the NASA score and the local
+            detectors, never fused into a combined verdict. Renders nothing
+            when there is no Gaia data (the common case for faint KOI
+            hosts), exactly like AlsoKnownAs. */}
+        <GaiaProfile gaia={gaia} loading={gaiaLoading} />
 
         <Divider />
 
@@ -1917,6 +1926,209 @@ function AlsoKnownAs({
       )}
       <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.25)', letterSpacing: 0.3, marginTop: 4 }}>
         via SIMBAD (CDS)
+      </div>
+    </div>
+  )
+}
+
+/**
+ * @description How long the Gaia lookup must stay in flight before the
+ * panel shows a placeholder. The chain is SIMBAD→Gaia (~1–3 s cold), but a
+ * warm disk cache on both legs returns in a few ms — same reasoning as
+ * `IDENTITY_PLACEHOLDER_DELAY_MS`: gate the placeholder so a cache hit
+ * never flashes a one-frame "RESOLVING…".
+ */
+const GAIA_PLACEHOLDER_DELAY_MS = 500
+
+/**
+ * @description Accent color per `GaiaRow` tone. The three POSITIVE-flag
+ * tones are deliberately distinct hues so the three different KINDS of Gaia
+ * finding — astrometric (RUWE), spectroscopic (RV), photometric — are
+ * distinguishable at a glance, not one undifferentiated amber. All three
+ * stay in the warm "notable, worth a look" family (they reuse the project's
+ * INTERESTING-orange / HIGH_VARIABILITY-yellow palette plus a soft violet),
+ * NONE of them the error/WOW red `#ff4d6d` — a Gaia flag is a prompt, not a
+ * fault. `muted` grey is for a "not evaluated / no data" non-reading that
+ * must not read as a negative finding; `neutral` light for an evaluated-
+ * and-quiet reading.
+ */
+const GAIA_TONE_COLOR: Record<'alertAstro' | 'alertRv' | 'alertPhot' | 'muted' | 'neutral', string> = {
+  alertAstro: '#f4a261', // astrometric (RUWE) — INTERESTING orange
+  alertRv: '#c792ea', // spectroscopic (RV) — soft violet
+  alertPhot: '#facc15', // photometric variability — HIGH_VARIABILITY gold
+  muted: 'rgba(255,255,255,0.4)',
+  neutral: 'rgba(255,255,255,0.72)',
+}
+
+/**
+ * @description One label + descriptive-sentence row inside the Gaia
+ * section. `tone` picks the accent color of the sentence — see
+ * `GAIA_TONE_COLOR` for the three distinct positive-flag hues plus muted /
+ * neutral.
+ * @param label Short uppercase field label.
+ * @param children The descriptive sentence.
+ * @param tone Accent for the sentence text.
+ * @returns Label + sentence block.
+ */
+function GaiaRow({
+  label,
+  children,
+  tone = 'neutral',
+}: {
+  label: string
+  children: React.ReactNode
+  tone?: keyof typeof GAIA_TONE_COLOR
+}) {
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ fontSize: 7.5, color: 'rgba(255,255,255,0.35)', letterSpacing: 1.5, marginBottom: 2 }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 9.5, color: GAIA_TONE_COLOR[tone], letterSpacing: 0.2, lineHeight: 1.5 }}>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * @description "GAIA DR3" section: the Gaia descriptive profile as its own
+ * independent instrument reading, sitting alongside — never fused with —
+ * the NASA score, the local BLS/dip detector, and the centroid vetting.
+ * Descriptive only, matching the project voice: it reports what Gaia
+ * measured and how that sits against published reference values; it never
+ * asserts a physical cause ("binary", "planet").
+ *
+ * Absence is not news, exactly like `AlsoKnownAs`: most faint KOI hosts
+ * have no Gaia cross-id in SIMBAD, or aren't a resolvable source — a normal
+ * answer, not an error. So the whole section renders NOTHING when the
+ * profile is null. No error state, no "Gaia unavailable" row.
+ *
+ * The three highest-risk copy points, all handled so the WORDING (not just
+ * the data model) keeps the distinctions:
+ *   - RUWE is banded descriptively ("elevated, consistent with a possible
+ *     unresolved companion"), never "this star is a binary".
+ *   - RV-variability's NOT_EVALUATED is muted grey and worded as "not
+ *     evaluated — no RVS data", so it cannot be mistaken for the neutral
+ *     "consistent" (NOT_VARIABLE) reading.
+ *   - phot_variable_flag's NOT_FLAGGED carries an inline clarification that
+ *     DR3 makes no "constant" determination — the C1 semantic trap, closed
+ *     in copy so a tooltip is not load-bearing.
+ * @param gaia The Gaia descriptive profile, or null for miss/failure/pending.
+ * @param loading True while the SIMBAD→Gaia chain is in flight.
+ * @returns The section, or null when there is nothing to show.
+ */
+function GaiaProfile({
+  gaia,
+  loading,
+}: {
+  gaia: GaiaDescription | null
+  loading: boolean
+}) {
+  // Gate the placeholder behind a short delay so warm cache hits resolve
+  // before it would paint (same pattern as AlsoKnownAs).
+  const [showPlaceholder, setShowPlaceholder] = useState(false)
+  useEffect(() => {
+    if (!loading) {
+      setShowPlaceholder(false)
+      return
+    }
+    const t = setTimeout(() => setShowPlaceholder(true), GAIA_PLACEHOLDER_DELAY_MS)
+    return () => clearTimeout(t)
+  }, [loading])
+
+  if (loading) {
+    if (!showPlaceholder) return null
+    return (
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.25)', letterSpacing: 2, marginBottom: 12 }}>
+        CONSULTING GAIA DR3…
+      </div>
+    )
+  }
+
+  if (!gaia) return null
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginBottom: 8 }}>
+        GAIA DR3
+      </div>
+
+      {/* RUWE — astrometric goodness-of-fit, banded against the ~1.4
+          single-star reference. Descriptive; "elevated" prompts, never
+          concludes "binary". */}
+      {gaia.ruwe !== null && (
+        <GaiaRow label="ASTROMETRIC FIT (RUWE)" tone={gaia.ruweBand === 'ELEVATED' ? 'alertAstro' : 'neutral'}>
+          {gaia.ruweBand === 'ELEVATED'
+            ? `RUWE elevated (${gaia.ruwe.toFixed(2)}), above the ~1.4 single-star reference — consistent with a possible unresolved companion, though not by itself a confirmation.`
+            : `RUWE ${gaia.ruwe.toFixed(2)}, within the ~1.4 single-star reference (a well-behaved single-star astrometric fit).`}
+        </GaiaRow>
+      )}
+
+      {/* Radial-velocity variability. NOT_EVALUATED is deliberately muted
+          and worded as "not evaluated — no RVS data" so it can never be
+          read as the neutral "consistent" (NOT_VARIABLE) case. */}
+      {gaia.rvVariability === 'VARIABLE' ? (
+        <GaiaRow label="RADIAL VELOCITY" tone="alertRv">
+          Varies across Gaia&apos;s repeated measurements
+          {gaia.rvNbTransits !== null ? ` (${gaia.rvNbTransits} transits` : ''}
+          {gaia.rvNbTransits !== null ? ', by Gaia DR3’s documented variability criterion).' : '.'}
+        </GaiaRow>
+      ) : gaia.rvVariability === 'NOT_VARIABLE' ? (
+        <GaiaRow label="RADIAL VELOCITY" tone="neutral">
+          Consistent across Gaia&apos;s repeated measurements
+          {gaia.rvNbTransits !== null ? ` (${gaia.rvNbTransits} transits` : ''}
+          {gaia.rvNbTransits !== null ? ', no variability by Gaia’s criterion).' : '.'}
+        </GaiaRow>
+      ) : (
+        <GaiaRow label="RADIAL VELOCITY" tone="muted">
+          Not evaluated — no Gaia spectroscopic (RVS) time series for this
+          star, so RV variability could not be checked. (This is missing
+          data, not a finding of steadiness.)
+        </GaiaRow>
+      )}
+
+      {/* phot_variable_flag — the highest-risk copy in the feature.
+          NOT_FLAGGED must never read as "Gaia confirms not variable": DR3
+          has no CONSTANT value, so the inline clarification is load-bearing
+          and stays even without a tooltip. */}
+      {gaia.photVariable === 'FLAGGED_VARIABLE' ? (
+        <GaiaRow label="PHOTOMETRIC VARIABILITY" tone="alertPhot">
+          Flagged as variable in Gaia DR3&apos;s photometric variability
+          processing.
+        </GaiaRow>
+      ) : gaia.photVariable === 'NOT_FLAGGED' ? (
+        <GaiaRow label="PHOTOMETRIC VARIABILITY" tone="muted">
+          Not flagged as variable in Gaia DR3&apos;s variability processing.
+          DR3 makes no &quot;constant&quot; determination, so this is not a
+          statement that the star is steady — many known variables (Tabby&apos;s
+          Star among them) are unflagged here.
+        </GaiaRow>
+      ) : null}
+
+      {/* Bonus ML classifier — shown ONLY when present, exactly like
+          SIMBAD's alt-names. No empty state, no "no classifier" row. */}
+      {gaia.classifier && (
+        <GaiaRow label="GAIA VARIABLE-STAR CLASS" tone="neutral">
+          Gaia&apos;s variability classifier labeled this source{' '}
+          <span style={{ color: 'white', fontWeight: 700 }}>{gaia.classifier.className}</span>
+          {gaia.classifier.score !== null
+            ? ` (confidence ${(gaia.classifier.score * 100).toFixed(0)}%).`
+            : '.'}
+        </GaiaRow>
+      )}
+
+      {/* Supplementary photometric context — plain, unbanded, no flags. */}
+      {(gaia.photGMeanMag !== null || gaia.bpRp !== null) && (
+        <div style={{ fontSize: 8.5, color: 'rgba(255,255,255,0.4)', letterSpacing: 0.2, lineHeight: 1.5, marginTop: 2 }}>
+          {gaia.photGMeanMag !== null ? `G ${gaia.photGMeanMag.toFixed(2)}` : ''}
+          {gaia.photGMeanMag !== null && gaia.bpRp !== null ? ' · ' : ''}
+          {gaia.bpRp !== null ? `BP−RP ${gaia.bpRp.toFixed(2)}` : ''}
+        </div>
+      )}
+
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.25)', letterSpacing: 0.3, marginTop: 6 }}>
+        via Gaia DR3 (ESA/CDS) · independent of the NASA score and the local detectors above
       </div>
     </div>
   )

@@ -11,6 +11,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { useStore, type Star } from '../store.ts'
 import type { SimbadIdentity } from '../simbadIds.ts'
+import type { GaiaDescription } from '../gaiaSource.ts'
 
 /** @description In-memory localStorage shim recording writes. */
 class LocalStorageShim {
@@ -36,6 +37,8 @@ beforeEach(() => {
     identity: null,
     identityLoading: false,
     resolvedIdentities: new Map(),
+    gaia: null,
+    gaiaLoading: false,
   })
 })
 
@@ -169,5 +172,46 @@ describe('identity slot contracts (phase B3)', () => {
     const ref = useStore.getState().resolvedIdentities
     useStore.getState().setIdentity('KIC1', id)
     assert.equal(useStore.getState().resolvedIdentities, ref, 'same identity → no referential churn')
+  })
+})
+
+describe('gaia slot contracts (Bloque C3)', () => {
+  /** @description Minimal GaiaDescription stub; only the panel-slot behavior matters here. */
+  function gaiaStub(rvVariability: GaiaDescription['rvVariability']): GaiaDescription {
+    return {
+      sourceId: '2081900940499099136',
+      ruwe: 0.82,
+      ruweBand: 'WITHIN_REFERENCE',
+      rvVariability,
+      radialVelocity: -0.46,
+      radialVelocityError: 3.9,
+      rvNbTransits: 17,
+      photVariable: 'NOT_FLAGGED',
+      astrometricExcessNoise: 0.05,
+      ipdFracMultiPeak: 0,
+      nonSingleStar: 0,
+      photGMeanMag: 11.76,
+      bpRp: 0.78,
+    }
+  }
+
+  it('setGaia writes the panel slot; there is no session index to touch', () => {
+    const g = gaiaStub('VARIABLE')
+    useStore.getState().setGaia(g)
+    assert.equal(useStore.getState().gaia, g)
+  })
+
+  it('a null clears the slot (silent absence, the faint-KOI-host case)', () => {
+    useStore.getState().setGaia(gaiaStub('NOT_VARIABLE'))
+    useStore.getState().setGaia(null)
+    assert.equal(useStore.getState().gaia, null)
+  })
+
+  it('setGaiaLoading toggles the flag independently of the slot', () => {
+    useStore.getState().setGaiaLoading(true)
+    assert.equal(useStore.getState().gaiaLoading, true)
+    assert.equal(useStore.getState().gaia, null, 'loading does not fabricate a profile')
+    useStore.getState().setGaiaLoading(false)
+    assert.equal(useStore.getState().gaiaLoading, false)
   })
 })

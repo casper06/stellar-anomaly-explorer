@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { FLAGGED_KEY, VISITED_KEY, loadIdSet, saveIdSet } from './persistence'
 import type { CurveProfile, CurvePattern } from './curveClassifier'
 import type { SimbadIdentity } from './simbadIds'
+import type { GaiaDescription } from './gaiaSource'
 
 /**
  * @description Catalog of origin for a star. Used by the renderer to pick
@@ -179,6 +180,25 @@ interface AppState {
    * the miss so re-selecting them costs no query.
    */
   resolvedIdentities: Map<string, SimbadIdentity>
+  /**
+   * @description Gaia DR3 descriptive profile for the currently-selected
+   * star (RUWE band + RV-variability + phot-variable reading + the bonus ML
+   * classifier when present), or null when the star has no Gaia data, the
+   * lookup failed, or none has been fetched yet. Follows the same
+   * nullable-data + sibling-loading-flag shape as `identity`/`lightcurve`:
+   * the panel treats "no Gaia cross-id" / "not in Gaia" / "outage" /
+   * "not-yet-asked" identically (render nothing), so a richer state machine
+   * would buy no UI behavior. Set via the identity chain in `selectStar`.
+   */
+  gaia: GaiaDescription | null
+  /**
+   * @description True while a `fetchGaiaForStar` call for the
+   * currently-selected star is in flight. Distinguishes "still asking" from
+   * "asked, nothing to show" so the panel can gate a slim placeholder,
+   * mirroring `identityLoading`. The chain runs SIMBAD→Gaia, so this can
+   * stay true a little longer than `identityLoading`.
+   */
+  gaiaLoading: boolean
   loading: boolean
   flyTo: FlyToCommand | null
   /**
@@ -278,6 +298,15 @@ interface AppState {
    */
   indexIdentity: (starId: string, identity: SimbadIdentity) => void
   setIdentityLoading: (loading: boolean) => void
+  /**
+   * @description Sets the currently-selected star's Gaia descriptive
+   * profile (or null for a miss / no Gaia cross-id / outage). Simpler than
+   * `setIdentity` — there is no session search-index for Gaia, so this just
+   * writes the panel slot.
+   * @param gaia The resolved profile, or null.
+   */
+  setGaia: (gaia: GaiaDescription | null) => void
+  setGaiaLoading: (loading: boolean) => void
   setLoading: (loading: boolean) => void
   setKoiCount: (n: number) => void
   setKoiError: (err: string | null) => void
@@ -342,6 +371,8 @@ export const useStore = create<AppState>((set) => ({
   identity: null,
   identityLoading: false,
   resolvedIdentities: new Map<string, SimbadIdentity>(),
+  gaia: null,
+  gaiaLoading: false,
   loading: false,
   flyTo: null,
   koiCount: 0,
@@ -384,6 +415,8 @@ export const useStore = create<AppState>((set) => ({
     return { resolvedIdentities: next }
   }),
   setIdentityLoading: (loading) => set({ identityLoading: loading }),
+  setGaia: (gaia) => set({ gaia }),
+  setGaiaLoading: (loading) => set({ gaiaLoading: loading }),
   setLoading: (loading) => set({ loading }),
   setKoiCount: (n) => set({ koiCount: n }),
   setKoiError: (err) => set({ koiError: err }),

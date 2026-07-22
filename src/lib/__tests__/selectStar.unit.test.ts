@@ -49,10 +49,21 @@ function lightcurveJson(tag: number) {
  * @description Deferred fetch stub: every `/api/lightcurve/*` call queues a
  * resolver the test releases by star id; `/api/pattern-cache` POSTs resolve
  * immediately and are recorded.
+ *
+ * `/api/identity/*` uses a QUEUE per id, not a single slot, because two
+ * independent resolvers now fetch identity for the same star during one
+ * selection: `resolveIdentityFor` (the panel's ALSO KNOWN AS) and
+ * `fetchGaiaForStar` inside `resolveGaiaFor` (which needs the Gaia
+ * source_id from SIMBAD). Both land through this same track; a queue lets
+ * the test answer each in turn instead of the second overwriting the
+ * first. `resolveIdentity(id, json)` releases the OLDEST outstanding call
+ * for `id`; `resolveAllIdentity(id, json)` drains every queued one at once
+ * (the common case — both legs get the same SIMBAD record).
  */
 class FetchStub {
   private pending = new Map<string, (json: unknown) => void>()
-  private pendingIdentity = new Map<string, (json: unknown) => void>()
+  private pendingIdentity = new Map<string, Array<(json: unknown) => void>>()
+  private pendingGaia = new Map<string, (json: unknown) => void>()
   patternCachePosts: string[] = []
   install(): void {
     globalThis.fetch = ((url: string, init?: RequestInit) => {
@@ -67,7 +78,16 @@ class FetchStub {
       if (u.startsWith('/api/identity/')) {
         const id = decodeURIComponent(u.split('/api/identity/')[1]?.split('?')[0] ?? '')
         return new Promise<Response>(resolve => {
-          this.pendingIdentity.set(id, (json) => resolve(new Response(JSON.stringify(json), { status: 200 })))
+          const q = this.pendingIdentity.get(id) ?? []
+          q.push((json) => resolve(new Response(JSON.stringify(json), { status: 200 })))
+          this.pendingIdentity.set(id, q)
+        })
+      }
+      // Gaia resolves on its own deferred track (source_id path).
+      if (u.startsWith('/api/gaia/')) {
+        const sid = decodeURIComponent(u.split('/api/gaia/')[1]?.split('?')[0] ?? '')
+        return new Promise<Response>(resolve => {
+          this.pendingGaia.set(sid, (json) => resolve(new Response(JSON.stringify(json), { status: 200 })))
         })
       }
       const id = decodeURIComponent(u.split('/api/lightcurve/')[1]?.split('?')[0] ?? '')
@@ -83,16 +103,35 @@ class FetchStub {
     this.pending.delete(id)
     r(json)
   }
-  /** Resolves the in-flight identity fetch for `id` with `json`. */
+  /** Resolves the OLDEST outstanding identity fetch for `id` with `json`. */
   resolveIdentity(id: string, json: unknown): void {
-    const r = this.pendingIdentity.get(id)
-    assert.ok(r, `no pending identity fetch for ${id}`)
+    const q = this.pendingIdentity.get(id)
+    assert.ok(q && q.length > 0, `no pending identity fetch for ${id}`)
+    const r = q.shift()!
+    if (q.length === 0) this.pendingIdentity.delete(id)
+    r(json)
+  }
+  /** Drains EVERY outstanding identity fetch for `id` with the same `json`. */
+  resolveAllIdentity(id: string, json: unknown): void {
+    const q = this.pendingIdentity.get(id)
+    assert.ok(q && q.length > 0, `no pending identity fetch for ${id}`)
     this.pendingIdentity.delete(id)
+    for (const r of q) r(json)
+  }
+  /** Resolves the in-flight Gaia fetch for source_id `sid` with `json`. */
+  resolveGaia(sid: string, json: unknown): void {
+    const r = this.pendingGaia.get(sid)
+    assert.ok(r, `no pending gaia fetch for ${sid}`)
+    this.pendingGaia.delete(sid)
     r(json)
   }
   /** True when an identity fetch for `id` is still outstanding. */
   hasPendingIdentity(id: string): boolean {
-    return this.pendingIdentity.has(id)
+    return (this.pendingIdentity.get(id)?.length ?? 0) > 0
+  }
+  /** True when a Gaia fetch for source_id `sid` is still outstanding. */
+  hasPendingGaia(sid: string): boolean {
+    return this.pendingGaia.has(sid)
   }
 }
 
@@ -116,6 +155,8 @@ beforeEach(() => {
     identity: null,
     identityLoading: false,
     resolvedIdentities: new Map(),
+    gaia: null,
+    gaiaLoading: false,
   })
 })
 
@@ -283,5 +324,148 @@ describe('identity resolution during selection (phase B3)', () => {
 
     stub.resolve('KIC_UNKNOWN', lightcurveJson(1))
     await p
+  })
+})
+
+describe('Gaia resolution during selection (Bloque C3)', () => {
+  /**
+   * @description /api/identity payload carrying a Gaia DR3 source_id (or
+   * not), which is what `fetchGaiaForStar` reads to decide whether to query
+   * Gaia at all.
+   * @param gaiaDr3 The Gaia DR3 source_id string, or null (no cross-id).
+   */
+  function identityWithGaia(gaiaDr3: string | null) {
+    return {
+      source: 'real',
+      fetchedAt: Date.now(),
+      identity: {
+        mainId: 'TYC 3162-665-1',
+        otype: '*',
+        ra: 290, dec: 44,
+        kic: null, tic: null, epic: null, hip: null,
+        gaiaDr3,
+        twoMass: null, tycho: null,
+        commonNames: [],
+        allIds: [],
+      },
+    }
+  }
+
+  /** @description A minimal /api/gaia payload with a chosen RV-variability reading. */
+  function gaiaJson(rvVariability: 'VARIABLE' | 'NOT_VARIABLE' | 'NOT_EVALUATED') {
+    return {
+      source: 'real',
+      fetchedAt: Date.now(),
+      servedBy: 'esac',
+      description: {
+        sourceId: '2081900940499099136',
+        ruwe: 0.82,
+        ruweBand: 'WITHIN_REFERENCE',
+        rvVariability,
+        radialVelocity: -0.46,
+        radialVelocityError: 3.9,
+        rvNbTransits: rvVariability === 'NOT_EVALUATED' ? null : 17,
+        photVariable: 'NOT_FLAGGED',
+        astrometricExcessNoise: 0.05,
+        ipdFracMultiPeak: 0,
+        nonSingleStar: 0,
+        photGMeanMag: 11.76,
+        bpRp: 0.78,
+      },
+    }
+  }
+
+  it('resolves the SIMBAD→Gaia chain and lands the profile in the store', async () => {
+    const p = selectStarAndFetchCurve(star('KIC8462852'))
+    assert.equal(useStore.getState().gaiaLoading, true)
+
+    // Both identity legs (panel + gaia chain) get the same SIMBAD record,
+    // which carries a Gaia source_id.
+    stub.resolveAllIdentity('KIC8462852', identityWithGaia('2081900940499099136'))
+    await tick()
+    // The gaia chain now has the source_id and queries /api/gaia.
+    assert.ok(stub.hasPendingGaia('2081900940499099136'), 'Gaia was queried with the resolved source_id')
+    stub.resolveGaia('2081900940499099136', gaiaJson('VARIABLE'))
+    await tick()
+
+    const g = useStore.getState().gaia
+    assert.ok(g, 'Gaia profile landed')
+    assert.equal(g.rvVariability, 'VARIABLE')
+    assert.equal(g.ruweBand, 'WITHIN_REFERENCE')
+    assert.equal(useStore.getState().gaiaLoading, false, 'not stuck consulting')
+
+    stub.resolve('KIC8462852', lightcurveJson(111))
+    await p
+    assert.ok(useStore.getState().gaia, 'Gaia survives the curve landing')
+  })
+
+  it('stays silent (null, not loading) when SIMBAD has no Gaia cross-id', async () => {
+    const p = selectStarAndFetchCurve(star('KIC_NOGAIA'))
+    // SIMBAD resolves but the record carries no Gaia DR3 id → no Gaia query.
+    stub.resolveAllIdentity('KIC_NOGAIA', identityWithGaia(null))
+    await tick()
+    assert.equal(useStore.getState().gaia, null, 'no Gaia section')
+    assert.equal(useStore.getState().gaiaLoading, false, 'not stuck consulting Gaia')
+
+    stub.resolve('KIC_NOGAIA', lightcurveJson(1))
+    await p
+  })
+
+  it('stays silent when SIMBAD misses entirely (faint KOI host case)', async () => {
+    const p = selectStarAndFetchCurve(star('KIC_FAINT'))
+    stub.resolveAllIdentity('KIC_FAINT', { source: 'real', fetchedAt: Date.now(), identity: null })
+    await tick()
+    assert.equal(useStore.getState().gaia, null)
+    assert.equal(useStore.getState().gaiaLoading, false)
+
+    stub.resolve('KIC_FAINT', lightcurveJson(1))
+    await p
+  })
+
+  it('a stale Gaia profile never overwrites a newer selection', async () => {
+    const pA = selectStarAndFetchCurve(star('KIC_A'))
+    const pB = selectStarAndFetchCurve(star('KIC_B'))
+
+    // B resolves fully first.
+    stub.resolveAllIdentity('KIC_B', identityWithGaia('222'))
+    await tick()
+    stub.resolveGaia('222', gaiaJson('NOT_VARIABLE'))
+    await tick()
+    assert.equal(useStore.getState().gaia?.rvVariability, 'NOT_VARIABLE')
+
+    // A's Gaia reply lands late — belongs to a dead selection, must be dropped.
+    stub.resolveAllIdentity('KIC_A', identityWithGaia('111'))
+    await tick()
+    stub.resolveGaia('111', gaiaJson('VARIABLE'))
+    await tick()
+    assert.equal(useStore.getState().gaia?.rvVariability, 'NOT_VARIABLE', 'stale Gaia discarded')
+
+    stub.resolve('KIC_A', lightcurveJson(1))
+    stub.resolve('KIC_B', lightcurveJson(2))
+    await Promise.all([pA, pB])
+  })
+
+  it('a superseded selection does not clear the newer one’s gaiaLoading flag', async () => {
+    const pA = selectStarAndFetchCurve(star('KIC_A'))
+    const pB = selectStarAndFetchCurve(star('KIC_B'))
+
+    // A (stale) resolves its whole chain while B is still asking.
+    stub.resolveAllIdentity('KIC_A', identityWithGaia('111'))
+    await tick()
+    stub.resolveGaia('111', gaiaJson('VARIABLE'))
+    await tick()
+    assert.equal(useStore.getState().gaiaLoading, true, 'B is still consulting Gaia')
+    assert.equal(useStore.getState().gaia, null, 'stale Gaia did not appear')
+
+    stub.resolveAllIdentity('KIC_B', identityWithGaia('222'))
+    await tick()
+    stub.resolveGaia('222', gaiaJson('NOT_EVALUATED'))
+    await tick()
+    assert.equal(useStore.getState().gaiaLoading, false)
+    assert.equal(useStore.getState().gaia?.rvVariability, 'NOT_EVALUATED')
+
+    stub.resolve('KIC_A', lightcurveJson(1))
+    stub.resolve('KIC_B', lightcurveJson(2))
+    await Promise.all([pA, pB])
   })
 })

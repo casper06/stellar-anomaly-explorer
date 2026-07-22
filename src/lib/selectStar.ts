@@ -2,6 +2,7 @@ import { useStore, type Star } from './store'
 import { fetchLightcurve, detectDips } from './anomalyDetector'
 import { classifyCurveAsync } from './classifyAsync'
 import { fetchIdentity } from './identityClient'
+import { fetchGaiaForStar } from './gaiaClient'
 
 /**
  * @description Monotonic generation counter for selection requests. Each
@@ -51,6 +52,54 @@ async function resolveIdentityFor(star: Star, generation: number): Promise<void>
 }
 
 /**
+ * @description Resolves the star's Gaia DR3 descriptive profile and pushes
+ * it into the store, guarded by the same generation counter as the light
+ * curve and identity. Runs the full identity chain internally
+ * (`fetchGaiaForStar`: star id → SIMBAD → gaiaDr3 → Gaia), so it is a
+ * SUPERSET of the SIMBAD round-trip that `resolveIdentityFor` also does —
+ * but that SIMBAD leg hits the shared 30-day identity disk cache the other
+ * resolver just warmed, so in practice it is one cheap cache hit plus the
+ * Gaia query, not two SIMBAD calls.
+ *
+ * Deliberately NOT awaited inside the light-curve path, same reasoning as
+ * `resolveIdentityFor`: Gaia answers in ~1–3 s while a cold MAST fetch can
+ * take ~60 s. `fetchGaiaForStar` never throws (a miss, a missing Gaia
+ * cross-id, and an outage all arrive as `null`), so there is no catch —
+ * `null` clears the slot and the panel's Gaia section renders nothing.
+ *
+ * Unlike identity there is no session index to preserve on a superseded
+ * result: a stale Gaia profile is simply dropped, because nothing else
+ * consumes it (no search-by-Gaia feature). Keeps the guard trivial.
+ *
+ * Defense-in-depth: `fetchGaiaForStar` is documented never-throws, but that
+ * contract lives in a NEIGHBORING module (`gaiaClient.ts`) this path does
+ * not own. A local try/catch backstops a future regression there (or any
+ * unforeseen edge) — a throw is logged and treated identically to a null
+ * result (clear the slot), so it can never propagate into the
+ * star-selection flow and break the light-curve/identity paths. Same
+ * posture the project applies elsewhere: never trust a neighbor's contract
+ * to hold forever without a local net.
+ * @param star The star being selected.
+ * @param generation The caller's claimed selection generation.
+ */
+async function resolveGaiaFor(star: Star, generation: number): Promise<void> {
+  const { setGaia, setGaiaLoading } = useStore.getState()
+  try {
+    const gaia = await fetchGaiaForStar(star.id)
+    if (generation !== selectionGeneration) return
+    setGaia(gaia)
+  } catch (err) {
+    // Should be unreachable (fetchGaiaForStar swallows its own failures),
+    // but if that contract ever regresses, degrade to the same benign
+    // outcome as a miss: clear the slot, stay silent in the panel.
+    console.error(`[selectStar] Gaia resolution threw unexpectedly for ${star.id}:`, err)
+    if (generation === selectionGeneration) setGaia(null)
+  } finally {
+    if (generation === selectionGeneration) setGaiaLoading(false)
+  }
+}
+
+/**
  * @description Selects a star: switches the UI to analyze mode, fetches its
  * light curve, detects dips, classifies the curve, and pushes everything
  * into the store so the AnomalyPanel can render. Concurrently resolves the
@@ -80,6 +129,8 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
     setLightcurveLoading,
     setIdentity,
     setIdentityLoading,
+    setGaia,
+    setGaiaLoading,
     markVisited,
     setClassifiedPattern,
   } = useStore.getState()
@@ -104,6 +155,12 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
   setIdentity(star.id, null)
   setIdentityLoading(true)
   void resolveIdentityFor(star, generation)
+  // Gaia DR3 descriptive profile — same concurrent, generation-guarded
+  // pattern as identity. Cleared synchronously so this star's panel can
+  // never show the previous star's Gaia reading.
+  setGaia(null)
+  setGaiaLoading(true)
+  void resolveGaiaFor(star, generation)
   try {
     // Catalog stars (KIC*/TIC*/EPIC*) get the default behavior:
     // synthetic-in-dev fallback if MAST is down. Anything else is

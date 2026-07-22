@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "eslint",
     "test": "npm run test:unit && npm run test:routes && npm run test:engine",
-    "test:unit": "node --import ./scripts/register-ts-resolver.mjs --test src/lib/__tests__/*.unit.test.ts",
+    "test:unit": "node --experimental-test-module-mocks --import ./scripts/register-ts-resolver.mjs --test src/lib/__tests__/*.unit.test.ts",
     "test:routes": "node --import ./scripts/register-route-test-resolver.mjs --test src/app/api/__tests__/*.route.test.ts",
     "test:engine": "npm --prefix packages/stellar-vetting-engine test",
     "test:data": "npm --prefix packages/stellar-vetting-engine run test:data",
