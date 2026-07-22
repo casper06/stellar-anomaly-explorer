@@ -27,7 +27,7 @@ const GLOSSARY: Record<string, string> = {
   BKJD: 'Barycentric Kepler Julian Date: time system used by the Kepler telescope.',
   TJD: 'TESS Julian Date: time system used by the TESS telescope (BJD − 2457000).',
   SKY: 'The IAU constellation this position falls in — where the star sits in the real night sky. Below it: which Earth latitudes can ever see it, and the month it is highest around midnight.',
-  NASA_SCORE: "NASA's own catalog vetting score for this candidate, independent from the local detector and BLS results shown below. A low score here alongside high local activity (many dips, high variability, or a confident BLS signal) is expected, not contradictory — they are two separate instruments looking at the same star.",
+  NASA_SCORE: "NASA Exoplanet Archive's own vetting score, computed independently of this app's dip detector and BLS search below. The two are never combined — so a low score next to high local activity is expected, not a contradiction.",
   TOI_SCALE: "This is a TESS (TOI) candidate, and the TOI score scale tops out around 50 rather than 100 — it lacks the extra NASA-vetting term that Kepler (KOI) scores carry. So a value like 41 sits near the top of TOI's range, not artificially low next to a KOI score.",
 }
 
@@ -162,22 +162,94 @@ function StarVisualization({
   )
 }
 
+/** @description Fixed width of an `InfoBadge` tooltip, in CSS px. */
+const TOOLTIP_WIDTH = 200
+
+/** @description Minimum gap kept between a tooltip edge and its clipping container. */
+const TOOLTIP_EDGE_MARGIN = 8
+
+/**
+ * @description Horizontal offset (CSS px) applied to an `InfoBadge`
+ * tooltip relative to the badge center. 0 = centered (the default).
+ * Positive shifts right (badge near the left edge), negative shifts left
+ * (badge near the right edge).
+ */
+type TooltipShift = number
+
+/**
+ * @description Computes how far a centered tooltip must be nudged
+ * horizontally to stay inside its clipping container.
+ *
+ * WHY THIS EXISTS — the tooltip is `position: absolute` inside the badge
+ * and was centered unconditionally via `translateX(-50%)`. The AnomalyPanel
+ * is a 300px column with `overflow: auto`, so a badge closer than
+ * `TOOLTIP_WIDTH / 2` to either edge had its tooltip clipped: the NASA
+ * SCORE / RA / DEC / MAG / COLOR / SKY badges all sit ~78px from the panel's
+ * left edge, which clipped the first ~16px (one character per line —
+ * measured 2026-07-22, tooltip left 1284 vs container left 1300).
+ *
+ * The fix is the standard measure-then-flip pattern: compare the centered
+ * position against the container's content box and shift by exactly the
+ * overflow, so the tooltip stays as close to centered as it can while
+ * remaining fully visible. Shifting (rather than hard left/right-anchoring)
+ * keeps the tooltip visually associated with its badge.
+ * @param badge The badge element (the tooltip's positioning parent).
+ * @returns Pixel offset to add to the centered position.
+ */
+function tooltipShiftFor(badge: HTMLElement | null): TooltipShift {
+  if (!badge) return 0
+  // The clipping ancestor is the nearest scrollable box; fall back to the
+  // viewport when the badge is not inside one.
+  const clipper = badge.closest('[style*="overflow"]') as HTMLElement | null
+  const bounds = clipper
+    ? clipper.getBoundingClientRect()
+    : ({ left: 0, right: window.innerWidth } as DOMRect)
+
+  const badgeRect = badge.getBoundingClientRect()
+  const badgeCenter = badgeRect.left + badgeRect.width / 2
+  const centeredLeft = badgeCenter - TOOLTIP_WIDTH / 2
+  const centeredRight = badgeCenter + TOOLTIP_WIDTH / 2
+
+  const overflowLeft = bounds.left + TOOLTIP_EDGE_MARGIN - centeredLeft
+  if (overflowLeft > 0) return overflowLeft
+  const overflowRight = centeredRight - (bounds.right - TOOLTIP_EDGE_MARGIN)
+  if (overflowRight > 0) return -overflowRight
+  return 0
+}
+
 /**
  * @description Small "?" badge next to a label. On hover/focus, shows a tooltip with the
  * matching glossary entry. Falls back silently if the term isn't in GLOSSARY.
+ *
+ * The tooltip is edge-aware: it centers on the badge when there is room and
+ * shifts just enough to stay inside the scrolling panel otherwise (see
+ * `tooltipShiftFor`). The offset is measured on OPEN rather than on every
+ * render, because it depends on live layout (panel scroll position, whether
+ * the star's name wrapped, etc.) — measuring at hover time is what makes it
+ * correct for all six call sites without per-site tuning.
  * @param term Key into GLOSSARY (e.g. "MAG", "RA").
  * @returns Inline badge, or null if the term has no glossary entry.
  */
 function InfoBadge({ term }: { term: string }) {
   const [open, setOpen] = useState(false)
+  const [shift, setShift] = useState<TooltipShift>(0)
+  const badgeRef = useRef<HTMLSpanElement>(null)
   const text = GLOSSARY[term]
+
+  /** Measures the needed offset, then reveals the tooltip. */
+  const reveal = () => {
+    setShift(tooltipShiftFor(badgeRef.current))
+    setOpen(true)
+  }
+
   if (!text) return null
 
   return (
     <span
-      onMouseEnter={() => setOpen(true)}
+      ref={badgeRef}
+      onMouseEnter={reveal}
       onMouseLeave={() => setOpen(false)}
-      onFocus={() => setOpen(true)}
+      onFocus={reveal}
       onBlur={() => setOpen(false)}
       tabIndex={0}
       style={{
@@ -204,7 +276,9 @@ function InfoBadge({ term }: { term: string }) {
             position: 'absolute',
             bottom: 'calc(100% + 6px)',
             left: '50%',
-            transform: 'translateX(-50%)',
+            // Centered, then nudged by the measured overflow so the tooltip
+            // never spills outside the scrolling panel.
+            transform: `translateX(calc(-50% + ${shift}px))`,
             background: 'rgba(0,0,0,0.95)',
             border: '1px solid rgba(76,201,240,0.4)',
             borderRadius: 4,
@@ -212,7 +286,7 @@ function InfoBadge({ term }: { term: string }) {
             fontSize: 9,
             lineHeight: 1.5,
             color: 'rgba(255,255,255,0.85)',
-            width: 200,
+            width: TOOLTIP_WIDTH,
             textAlign: 'left',
             letterSpacing: 0.3,
             pointerEvents: 'none',

@@ -427,7 +427,18 @@ export default function HUD() {
             badge instead of a number when its fetch failed. The
             per-star detected-dip count (`anomalies.length`) still
             drives the status color/label in the header — different
-            semantic. */}
+            semantic.
+
+            The "OBJECTS OF INTEREST" heading exists because the bare
+            numbers read as ambiguous: they are UNIQUE CANDIDATE HOST
+            STARS from NASA's KOI/TOI catalogs (confirmed + candidate
+            dispositions, deduped per host), NOT the count of stars
+            rendered in the sky, and NOT including the 11 hand-picked
+            KNOWN_ANOMALIES seeds. The full clarification rides on the
+            heading's native `title` tooltip — the same lightweight
+            mechanism `PartialDataBadge` uses in AnomalyPanel, rather
+            than porting that panel's InfoBadge component into the HUD
+            (which has no tooltip infrastructure of its own). */}
         <div
           style={{
             background: 'rgba(0,0,0,0.7)',
@@ -442,6 +453,44 @@ export default function HUD() {
             gap: 8,
           }}
         >
+          <div
+            title={
+              'Unique candidate host stars from NASA’s Kepler (KOI) and TESS (TOI) catalogs — ' +
+              'confirmed and candidate dispositions only, counted once per host star even when a ' +
+              'star hosts several candidates.\n\n' +
+              'This is NOT the number of stars rendered in the sky (the background catalog is ' +
+              '~118,000 Hipparcos stars), and it does not include the 11 hand-picked known-anomaly ' +
+              'seeds such as Tabby’s Star.'
+            }
+            style={{
+              fontSize: 8,
+              color: 'rgba(255,255,255,0.35)',
+              letterSpacing: 1.5,
+              cursor: 'help',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+            }}
+          >
+            OBJECTS OF INTEREST
+            <span
+              aria-hidden
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: 11,
+                height: 11,
+                borderRadius: '50%',
+                border: '1px solid rgba(255,255,255,0.25)',
+                color: 'rgba(255,255,255,0.5)',
+                fontSize: 7.5,
+                lineHeight: 1,
+              }}
+            >
+              ?
+            </span>
+          </div>
           <MissionCount label="KEPLER" count={koiCount} error={koiError} accent="#ff4d6d" />
           <MissionCount label="TESS" count={toiCount} error={toiError} accent="#00e5ff" />
         </div>
