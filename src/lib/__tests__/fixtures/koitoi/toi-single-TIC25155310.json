@@ -1,0 +1,19 @@
+{
+ "capturedAt": "2026-07-23T02:58:13.906Z",
+ "mission": "TOI",
+ "note": "single KP (WASP-126)",
+ "adql": "select toi,tid,ra,dec,tfopwg_disp,pl_trandep,pl_trandurh,pl_orbper,st_tmag from toi where tid=25155310 order by toi",
+ "rows": [
+  {
+   "toi": "114.01",
+   "tid": 25155310,
+   "ra": 63.374706,
+   "dec": -69.226593,
+   "tfopwg_disp": "KP",
+   "pl_trandep": 7005.7247902,
+   "pl_trandurh": 3.4367717,
+   "pl_orbper": 3.2887898,
+   "st_tmag": 10.6103
+  }
+ ]
+}

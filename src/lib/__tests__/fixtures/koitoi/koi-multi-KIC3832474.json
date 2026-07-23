@@ -1,0 +1,63 @@
+{
+ "capturedAt": "2026-07-23T02:58:07.164Z",
+ "mission": "KOI",
+ "note": "3 CONFIRMED + 2 FALSE POSITIVE, one host",
+ "adql": "select kepid,kepoi_name,koi_disposition,koi_period,koi_depth,koi_duration,koi_score,ra,dec from cumulative where kepid=3832474 order by kepoi_name",
+ "rows": [
+  {
+   "kepid": 3832474,
+   "kepoi_name": "K00806.01",
+   "koi_disposition": "CONFIRMED",
+   "koi_period": 143.2063047,
+   "koi_depth": 10565.7,
+   "koi_duration": 8.9302,
+   "koi_score": 1,
+   "ra": 285.28363,
+   "dec": 38.947281
+  },
+  {
+   "kepid": 3832474,
+   "kepoi_name": "K00806.02",
+   "koi_disposition": "CONFIRMED",
+   "koi_period": 60.32494216,
+   "koi_depth": 20280.4,
+   "koi_duration": 6.6188,
+   "koi_score": 0.745,
+   "ra": 285.28363,
+   "dec": 38.947281
+  },
+  {
+   "kepid": 3832474,
+   "kepoi_name": "K00806.03",
+   "koi_disposition": "CONFIRMED",
+   "koi_period": 29.1598615,
+   "koi_depth": 488,
+   "koi_duration": 4.803,
+   "koi_score": null,
+   "ra": 285.28363,
+   "dec": 38.947281
+  },
+  {
+   "kepid": 3832474,
+   "kepoi_name": "K00806.04",
+   "koi_disposition": "FALSE POSITIVE",
+   "koi_period": 381.850599,
+   "koi_depth": 1702,
+   "koi_duration": 4.772,
+   "koi_score": null,
+   "ra": 285.28363,
+   "dec": 38.947281
+  },
+  {
+   "kepid": 3832474,
+   "kepoi_name": "K00806.05",
+   "koi_disposition": "FALSE POSITIVE",
+   "koi_period": 412.041857,
+   "koi_depth": 1959,
+   "koi_duration": 5.572,
+   "koi_score": null,
+   "ra": 285.28363,
+   "dec": 38.947281
+  }
+ ]
+}

@@ -1,0 +1,19 @@
+{
+ "capturedAt": "2026-07-23T02:58:09.361Z",
+ "mission": "KOI",
+ "note": "single CONFIRMED (HAT-P-7)",
+ "adql": "select kepid,kepoi_name,koi_disposition,koi_period,koi_depth,koi_duration,koi_score,ra,dec from cumulative where kepid=10666592 order by kepoi_name",
+ "rows": [
+  {
+   "kepid": 10666592,
+   "kepoi_name": "K00002.01",
+   "koi_disposition": "CONFIRMED",
+   "koi_period": 2.204735417,
+   "koi_depth": 6674.7,
+   "koi_duration": 3.88864,
+   "koi_score": 1,
+   "ra": 292.24728,
+   "dec": 47.969521
+  }
+ ]
+}
