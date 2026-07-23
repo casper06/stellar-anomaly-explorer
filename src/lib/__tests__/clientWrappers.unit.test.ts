@@ -22,6 +22,7 @@ import { classifyCurve } from '../curveClassifier.ts'
 import { detectDips } from '../anomalyDetector.ts'
 import { fetchIdentity, fetchIdentityByName } from '../identityClient.ts'
 import { fetchCentroidVet } from '../centroidClient.ts'
+import { fetchGaiaBySourceId, fetchGaiaForStar } from '../gaiaClient.ts'
 import type { BlsResult } from '../bls.ts'
 
 const realFetch = globalThis.fetch
@@ -214,6 +215,86 @@ describe('fetchIdentityByName — keeps a miss distinct from an outage', () => {
     globalThis.fetch = (async () => { called = true; return new Response('{}') }) as typeof fetch
     assert.equal(await fetchIdentityByName('   '), null)
     assert.equal(called, false, 'no query is spent on empty input')
+  })
+})
+
+describe('fetchGaiaBySourceId — every failure collapses to null', () => {
+  it('returns the description on success', async () => {
+    const description = { sourceId: '2081900940499099136', ruweBand: 'WITHIN_REFERENCE', rvVariability: 'VARIABLE' }
+    stubFetch({ source: 'real', description })
+    assert.deepEqual(await fetchGaiaBySourceId('2081900940499099136'), description as never)
+  })
+
+  it('returns null on a confirmed Gaia miss (no such source_id)', async () => {
+    stubFetch({ source: 'real', description: null })
+    assert.equal(await fetchGaiaBySourceId('1'), null)
+  })
+
+  it('returns null on non-ok status, a throw, or non-JSON', async () => {
+    stubFetch(500)
+    assert.equal(await fetchGaiaBySourceId('1'), null)
+    stubFetch('throw')
+    assert.equal(await fetchGaiaBySourceId('1'), null)
+    stubFetch('bad-json')
+    assert.equal(await fetchGaiaBySourceId('1'), null)
+  })
+})
+
+describe('fetchGaiaForStar — identity chain, silent absence at every link', () => {
+  /**
+   * @description URL-dispatching fetch: SIMBAD identity leg vs the Gaia
+   * leg answer independently, so the chain's branch points can be tested.
+   * @param identityBody Body for `/api/identity/*` (or 'throw').
+   * @param gaiaBody Body for `/api/gaia/*` (or 'throw').
+   */
+  function stubChain(identityBody: Record<string, unknown> | 'throw', gaiaBody: Record<string, unknown> | 'throw'): void {
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url)
+      if (u.startsWith('/api/identity/')) {
+        if (identityBody === 'throw') throw new Error('simulated SIMBAD failure')
+        return new Response(JSON.stringify(identityBody), { status: 200 })
+      }
+      if (gaiaBody === 'throw') throw new Error('simulated Gaia failure')
+      return new Response(JSON.stringify(gaiaBody), { status: 200 })
+    }) as typeof fetch
+  }
+
+  it('resolves star → SIMBAD gaiaDr3 → Gaia description', async () => {
+    const description = { sourceId: '2081900940499099136', rvVariability: 'VARIABLE' }
+    stubChain(
+      { source: 'real', identity: { mainId: 'X', gaiaDr3: '2081900940499099136', commonNames: [], allIds: [] } },
+      { source: 'real', description },
+    )
+    assert.deepEqual(await fetchGaiaForStar('KIC8462852'), description as never)
+  })
+
+  it('returns null (no Gaia query) when SIMBAD resolves but has no Gaia cross-id', async () => {
+    let gaiaCalled = false
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url)
+      if (u.startsWith('/api/identity/')) {
+        return new Response(JSON.stringify({ source: 'real', identity: { mainId: 'X', gaiaDr3: null, commonNames: [], allIds: [] } }), { status: 200 })
+      }
+      gaiaCalled = true
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    assert.equal(await fetchGaiaForStar('KIC_NOGAIA'), null)
+    assert.equal(gaiaCalled, false, 'no Gaia query without a source_id')
+  })
+
+  it('returns null when SIMBAD misses entirely (faint KOI host)', async () => {
+    stubChain({ source: 'real', identity: null }, { source: 'real', description: { sourceId: 'x' } })
+    assert.equal(await fetchGaiaForStar('KIC_FAINT'), null)
+  })
+
+  it('returns null when SIMBAD throws, or when Gaia throws after a good identity', async () => {
+    stubChain('throw', { source: 'real', description: { sourceId: 'x' } })
+    assert.equal(await fetchGaiaForStar('KIC1'), null)
+    stubChain(
+      { source: 'real', identity: { mainId: 'X', gaiaDr3: '123', commonNames: [], allIds: [] } },
+      'throw',
+    )
+    assert.equal(await fetchGaiaForStar('KIC1'), null)
   })
 })
 

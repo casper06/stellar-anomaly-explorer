@@ -7,6 +7,7 @@ import type { CentroidStamp, CentroidVetResult } from '@/lib/centroidVet'
 import { fetchCentroidVet, type CentroidVetPayload, type CentroidVetFailure } from '@/lib/centroidClient'
 import { constellationAt, describeVisibilityStory } from '@/lib/constellations'
 import { selectDisplayNames, type SimbadIdentity } from '@/lib/simbadIds'
+import type { GaiaDescription } from '@/lib/gaiaSource'
 import LightCurve from './LightCurve'
 
 /**
@@ -26,7 +27,7 @@ const GLOSSARY: Record<string, string> = {
   BKJD: 'Barycentric Kepler Julian Date: time system used by the Kepler telescope.',
   TJD: 'TESS Julian Date: time system used by the TESS telescope (BJD − 2457000).',
   SKY: 'The IAU constellation this position falls in — where the star sits in the real night sky. Below it: which Earth latitudes can ever see it, and the month it is highest around midnight.',
-  NASA_SCORE: "NASA's own catalog vetting score for this candidate, independent from the local detector and BLS results shown below. A low score here alongside high local activity (many dips, high variability, or a confident BLS signal) is expected, not contradictory — they are two separate instruments looking at the same star.",
+  NASA_SCORE: "NASA Exoplanet Archive's own vetting score, computed independently of this app's dip detector and BLS search below. The two are never combined — so a low score next to high local activity is expected, not a contradiction.",
   TOI_SCALE: "This is a TESS (TOI) candidate, and the TOI score scale tops out around 50 rather than 100 — it lacks the extra NASA-vetting term that Kepler (KOI) scores carry. So a value like 41 sits near the top of TOI's range, not artificially low next to a KOI score.",
 }
 
@@ -161,22 +162,94 @@ function StarVisualization({
   )
 }
 
+/** @description Fixed width of an `InfoBadge` tooltip, in CSS px. */
+const TOOLTIP_WIDTH = 200
+
+/** @description Minimum gap kept between a tooltip edge and its clipping container. */
+const TOOLTIP_EDGE_MARGIN = 8
+
+/**
+ * @description Horizontal offset (CSS px) applied to an `InfoBadge`
+ * tooltip relative to the badge center. 0 = centered (the default).
+ * Positive shifts right (badge near the left edge), negative shifts left
+ * (badge near the right edge).
+ */
+type TooltipShift = number
+
+/**
+ * @description Computes how far a centered tooltip must be nudged
+ * horizontally to stay inside its clipping container.
+ *
+ * WHY THIS EXISTS — the tooltip is `position: absolute` inside the badge
+ * and was centered unconditionally via `translateX(-50%)`. The AnomalyPanel
+ * is a 300px column with `overflow: auto`, so a badge closer than
+ * `TOOLTIP_WIDTH / 2` to either edge had its tooltip clipped: the NASA
+ * SCORE / RA / DEC / MAG / COLOR / SKY badges all sit ~78px from the panel's
+ * left edge, which clipped the first ~16px (one character per line —
+ * measured 2026-07-22, tooltip left 1284 vs container left 1300).
+ *
+ * The fix is the standard measure-then-flip pattern: compare the centered
+ * position against the container's content box and shift by exactly the
+ * overflow, so the tooltip stays as close to centered as it can while
+ * remaining fully visible. Shifting (rather than hard left/right-anchoring)
+ * keeps the tooltip visually associated with its badge.
+ * @param badge The badge element (the tooltip's positioning parent).
+ * @returns Pixel offset to add to the centered position.
+ */
+function tooltipShiftFor(badge: HTMLElement | null): TooltipShift {
+  if (!badge) return 0
+  // The clipping ancestor is the nearest scrollable box; fall back to the
+  // viewport when the badge is not inside one.
+  const clipper = badge.closest('[style*="overflow"]') as HTMLElement | null
+  const bounds = clipper
+    ? clipper.getBoundingClientRect()
+    : ({ left: 0, right: window.innerWidth } as DOMRect)
+
+  const badgeRect = badge.getBoundingClientRect()
+  const badgeCenter = badgeRect.left + badgeRect.width / 2
+  const centeredLeft = badgeCenter - TOOLTIP_WIDTH / 2
+  const centeredRight = badgeCenter + TOOLTIP_WIDTH / 2
+
+  const overflowLeft = bounds.left + TOOLTIP_EDGE_MARGIN - centeredLeft
+  if (overflowLeft > 0) return overflowLeft
+  const overflowRight = centeredRight - (bounds.right - TOOLTIP_EDGE_MARGIN)
+  if (overflowRight > 0) return -overflowRight
+  return 0
+}
+
 /**
  * @description Small "?" badge next to a label. On hover/focus, shows a tooltip with the
  * matching glossary entry. Falls back silently if the term isn't in GLOSSARY.
+ *
+ * The tooltip is edge-aware: it centers on the badge when there is room and
+ * shifts just enough to stay inside the scrolling panel otherwise (see
+ * `tooltipShiftFor`). The offset is measured on OPEN rather than on every
+ * render, because it depends on live layout (panel scroll position, whether
+ * the star's name wrapped, etc.) — measuring at hover time is what makes it
+ * correct for all six call sites without per-site tuning.
  * @param term Key into GLOSSARY (e.g. "MAG", "RA").
  * @returns Inline badge, or null if the term has no glossary entry.
  */
 function InfoBadge({ term }: { term: string }) {
   const [open, setOpen] = useState(false)
+  const [shift, setShift] = useState<TooltipShift>(0)
+  const badgeRef = useRef<HTMLSpanElement>(null)
   const text = GLOSSARY[term]
+
+  /** Measures the needed offset, then reveals the tooltip. */
+  const reveal = () => {
+    setShift(tooltipShiftFor(badgeRef.current))
+    setOpen(true)
+  }
+
   if (!text) return null
 
   return (
     <span
-      onMouseEnter={() => setOpen(true)}
+      ref={badgeRef}
+      onMouseEnter={reveal}
       onMouseLeave={() => setOpen(false)}
-      onFocus={() => setOpen(true)}
+      onFocus={reveal}
       onBlur={() => setOpen(false)}
       tabIndex={0}
       style={{
@@ -203,7 +276,9 @@ function InfoBadge({ term }: { term: string }) {
             position: 'absolute',
             bottom: 'calc(100% + 6px)',
             left: '50%',
-            transform: 'translateX(-50%)',
+            // Centered, then nudged by the measured overflow so the tooltip
+            // never spills outside the scrolling panel.
+            transform: `translateX(calc(-50% + ${shift}px))`,
             background: 'rgba(0,0,0,0.95)',
             border: '1px solid rgba(76,201,240,0.4)',
             borderRadius: 4,
@@ -211,7 +286,7 @@ function InfoBadge({ term }: { term: string }) {
             fontSize: 9,
             lineHeight: 1.5,
             color: 'rgba(255,255,255,0.85)',
-            width: 200,
+            width: TOOLTIP_WIDTH,
             textAlign: 'left',
             letterSpacing: 0.3,
             pointerEvents: 'none',
@@ -1391,7 +1466,7 @@ function DipProvenanceLine({ provenance }: { provenance?: LightcurveProvenance }
  * @returns The panel, or null when no star is selected.
  */
 export default function AnomalyPanel() {
-  const { selectedStar, lightcurve, lightcurveLoading, identity, identityLoading, setSelectedStar, setMode, flaggedIds, toggleFlagged } = useStore()
+  const { selectedStar, lightcurve, lightcurveLoading, identity, identityLoading, gaia, gaiaLoading, setSelectedStar, setMode, flaggedIds, toggleFlagged } = useStore()
   const [showLightcurve, setShowLightcurve] = useState(false)
 
   if (!selectedStar) return null
@@ -1566,6 +1641,14 @@ export default function AnomalyPanel() {
           loading={identityLoading}
           displayed={[selectedStar.name, selectedStar.id]}
         />
+
+        {/* Gaia DR3 descriptive profile — an independent instrument
+            reading (RUWE / RV-variability / photometric-variability flag /
+            bonus ML class), sitting alongside the NASA score and the local
+            detectors, never fused into a combined verdict. Renders nothing
+            when there is no Gaia data (the common case for faint KOI
+            hosts), exactly like AlsoKnownAs. */}
+        <GaiaProfile gaia={gaia} loading={gaiaLoading} />
 
         <Divider />
 
@@ -1917,6 +2000,209 @@ function AlsoKnownAs({
       )}
       <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.25)', letterSpacing: 0.3, marginTop: 4 }}>
         via SIMBAD (CDS)
+      </div>
+    </div>
+  )
+}
+
+/**
+ * @description How long the Gaia lookup must stay in flight before the
+ * panel shows a placeholder. The chain is SIMBAD→Gaia (~1–3 s cold), but a
+ * warm disk cache on both legs returns in a few ms — same reasoning as
+ * `IDENTITY_PLACEHOLDER_DELAY_MS`: gate the placeholder so a cache hit
+ * never flashes a one-frame "RESOLVING…".
+ */
+const GAIA_PLACEHOLDER_DELAY_MS = 500
+
+/**
+ * @description Accent color per `GaiaRow` tone. The three POSITIVE-flag
+ * tones are deliberately distinct hues so the three different KINDS of Gaia
+ * finding — astrometric (RUWE), spectroscopic (RV), photometric — are
+ * distinguishable at a glance, not one undifferentiated amber. All three
+ * stay in the warm "notable, worth a look" family (they reuse the project's
+ * INTERESTING-orange / HIGH_VARIABILITY-yellow palette plus a soft violet),
+ * NONE of them the error/WOW red `#ff4d6d` — a Gaia flag is a prompt, not a
+ * fault. `muted` grey is for a "not evaluated / no data" non-reading that
+ * must not read as a negative finding; `neutral` light for an evaluated-
+ * and-quiet reading.
+ */
+const GAIA_TONE_COLOR: Record<'alertAstro' | 'alertRv' | 'alertPhot' | 'muted' | 'neutral', string> = {
+  alertAstro: '#f4a261', // astrometric (RUWE) — INTERESTING orange
+  alertRv: '#c792ea', // spectroscopic (RV) — soft violet
+  alertPhot: '#facc15', // photometric variability — HIGH_VARIABILITY gold
+  muted: 'rgba(255,255,255,0.4)',
+  neutral: 'rgba(255,255,255,0.72)',
+}
+
+/**
+ * @description One label + descriptive-sentence row inside the Gaia
+ * section. `tone` picks the accent color of the sentence — see
+ * `GAIA_TONE_COLOR` for the three distinct positive-flag hues plus muted /
+ * neutral.
+ * @param label Short uppercase field label.
+ * @param children The descriptive sentence.
+ * @param tone Accent for the sentence text.
+ * @returns Label + sentence block.
+ */
+function GaiaRow({
+  label,
+  children,
+  tone = 'neutral',
+}: {
+  label: string
+  children: React.ReactNode
+  tone?: keyof typeof GAIA_TONE_COLOR
+}) {
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ fontSize: 7.5, color: 'rgba(255,255,255,0.35)', letterSpacing: 1.5, marginBottom: 2 }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 9.5, color: GAIA_TONE_COLOR[tone], letterSpacing: 0.2, lineHeight: 1.5 }}>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * @description "GAIA DR3" section: the Gaia descriptive profile as its own
+ * independent instrument reading, sitting alongside — never fused with —
+ * the NASA score, the local BLS/dip detector, and the centroid vetting.
+ * Descriptive only, matching the project voice: it reports what Gaia
+ * measured and how that sits against published reference values; it never
+ * asserts a physical cause ("binary", "planet").
+ *
+ * Absence is not news, exactly like `AlsoKnownAs`: most faint KOI hosts
+ * have no Gaia cross-id in SIMBAD, or aren't a resolvable source — a normal
+ * answer, not an error. So the whole section renders NOTHING when the
+ * profile is null. No error state, no "Gaia unavailable" row.
+ *
+ * The three highest-risk copy points, all handled so the WORDING (not just
+ * the data model) keeps the distinctions:
+ *   - RUWE is banded descriptively ("elevated, consistent with a possible
+ *     unresolved companion"), never "this star is a binary".
+ *   - RV-variability's NOT_EVALUATED is muted grey and worded as "not
+ *     evaluated — no RVS data", so it cannot be mistaken for the neutral
+ *     "consistent" (NOT_VARIABLE) reading.
+ *   - phot_variable_flag's NOT_FLAGGED carries an inline clarification that
+ *     DR3 makes no "constant" determination — the C1 semantic trap, closed
+ *     in copy so a tooltip is not load-bearing.
+ * @param gaia The Gaia descriptive profile, or null for miss/failure/pending.
+ * @param loading True while the SIMBAD→Gaia chain is in flight.
+ * @returns The section, or null when there is nothing to show.
+ */
+function GaiaProfile({
+  gaia,
+  loading,
+}: {
+  gaia: GaiaDescription | null
+  loading: boolean
+}) {
+  // Gate the placeholder behind a short delay so warm cache hits resolve
+  // before it would paint (same pattern as AlsoKnownAs).
+  const [showPlaceholder, setShowPlaceholder] = useState(false)
+  useEffect(() => {
+    if (!loading) {
+      setShowPlaceholder(false)
+      return
+    }
+    const t = setTimeout(() => setShowPlaceholder(true), GAIA_PLACEHOLDER_DELAY_MS)
+    return () => clearTimeout(t)
+  }, [loading])
+
+  if (loading) {
+    if (!showPlaceholder) return null
+    return (
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.25)', letterSpacing: 2, marginBottom: 12 }}>
+        CONSULTING GAIA DR3…
+      </div>
+    )
+  }
+
+  if (!gaia) return null
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.4)', letterSpacing: 2, marginBottom: 8 }}>
+        GAIA DR3
+      </div>
+
+      {/* RUWE — astrometric goodness-of-fit, banded against the ~1.4
+          single-star reference. Descriptive; "elevated" prompts, never
+          concludes "binary". */}
+      {gaia.ruwe !== null && (
+        <GaiaRow label="ASTROMETRIC FIT (RUWE)" tone={gaia.ruweBand === 'ELEVATED' ? 'alertAstro' : 'neutral'}>
+          {gaia.ruweBand === 'ELEVATED'
+            ? `RUWE elevated (${gaia.ruwe.toFixed(2)}), above the ~1.4 single-star reference — consistent with a possible unresolved companion, though not by itself a confirmation.`
+            : `RUWE ${gaia.ruwe.toFixed(2)}, within the ~1.4 single-star reference (a well-behaved single-star astrometric fit).`}
+        </GaiaRow>
+      )}
+
+      {/* Radial-velocity variability. NOT_EVALUATED is deliberately muted
+          and worded as "not evaluated — no RVS data" so it can never be
+          read as the neutral "consistent" (NOT_VARIABLE) case. */}
+      {gaia.rvVariability === 'VARIABLE' ? (
+        <GaiaRow label="RADIAL VELOCITY" tone="alertRv">
+          Varies across Gaia&apos;s repeated measurements
+          {gaia.rvNbTransits !== null ? ` (${gaia.rvNbTransits} transits` : ''}
+          {gaia.rvNbTransits !== null ? ', by Gaia DR3’s documented variability criterion).' : '.'}
+        </GaiaRow>
+      ) : gaia.rvVariability === 'NOT_VARIABLE' ? (
+        <GaiaRow label="RADIAL VELOCITY" tone="neutral">
+          Consistent across Gaia&apos;s repeated measurements
+          {gaia.rvNbTransits !== null ? ` (${gaia.rvNbTransits} transits` : ''}
+          {gaia.rvNbTransits !== null ? ', no variability by Gaia’s criterion).' : '.'}
+        </GaiaRow>
+      ) : (
+        <GaiaRow label="RADIAL VELOCITY" tone="muted">
+          Not evaluated — no Gaia spectroscopic (RVS) time series for this
+          star, so RV variability could not be checked. (This is missing
+          data, not a finding of steadiness.)
+        </GaiaRow>
+      )}
+
+      {/* phot_variable_flag — the highest-risk copy in the feature.
+          NOT_FLAGGED must never read as "Gaia confirms not variable": DR3
+          has no CONSTANT value, so the inline clarification is load-bearing
+          and stays even without a tooltip. */}
+      {gaia.photVariable === 'FLAGGED_VARIABLE' ? (
+        <GaiaRow label="PHOTOMETRIC VARIABILITY" tone="alertPhot">
+          Flagged as variable in Gaia DR3&apos;s photometric variability
+          processing.
+        </GaiaRow>
+      ) : gaia.photVariable === 'NOT_FLAGGED' ? (
+        <GaiaRow label="PHOTOMETRIC VARIABILITY" tone="muted">
+          Not flagged as variable in Gaia DR3&apos;s variability processing.
+          DR3 makes no &quot;constant&quot; determination, so this is not a
+          statement that the star is steady — many known variables (Tabby&apos;s
+          Star among them) are unflagged here.
+        </GaiaRow>
+      ) : null}
+
+      {/* Bonus ML classifier — shown ONLY when present, exactly like
+          SIMBAD's alt-names. No empty state, no "no classifier" row. */}
+      {gaia.classifier && (
+        <GaiaRow label="GAIA VARIABLE-STAR CLASS" tone="neutral">
+          Gaia&apos;s variability classifier labeled this source{' '}
+          <span style={{ color: 'white', fontWeight: 700 }}>{gaia.classifier.className}</span>
+          {gaia.classifier.score !== null
+            ? ` (confidence ${(gaia.classifier.score * 100).toFixed(0)}%).`
+            : '.'}
+        </GaiaRow>
+      )}
+
+      {/* Supplementary photometric context — plain, unbanded, no flags. */}
+      {(gaia.photGMeanMag !== null || gaia.bpRp !== null) && (
+        <div style={{ fontSize: 8.5, color: 'rgba(255,255,255,0.4)', letterSpacing: 0.2, lineHeight: 1.5, marginTop: 2 }}>
+          {gaia.photGMeanMag !== null ? `G ${gaia.photGMeanMag.toFixed(2)}` : ''}
+          {gaia.photGMeanMag !== null && gaia.bpRp !== null ? ' · ' : ''}
+          {gaia.bpRp !== null ? `BP−RP ${gaia.bpRp.toFixed(2)}` : ''}
+        </div>
+      )}
+
+      <div style={{ fontSize: 8, color: 'rgba(255,255,255,0.25)', letterSpacing: 0.3, marginTop: 6 }}>
+        via Gaia DR3 (ESA/CDS) · independent of the NASA score and the local detectors above
       </div>
     </div>
   )

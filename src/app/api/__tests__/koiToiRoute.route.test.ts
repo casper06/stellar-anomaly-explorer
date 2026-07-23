@@ -1,8 +1,9 @@
 /**
  * @description Route-level tests for the KOI and TOI catalog handlers —
  * exercising the ACTUAL `GET` route functions (not just the
- * `catalogCache.ts` helper) to pin the TTL + stale-while-revalidate
- * wiring end to end:
+ * `catalogCache.ts` helper) to pin two things end to end:
+ *
+ * 1. TTL + stale-while-revalidate wiring:
  *   - a FRESH cache entry is served straight from disk with no TAP fetch
  *     and no `stale` flag;
  *   - a STALE entry (past the route's TTL) is served immediately WITH
@@ -10,6 +11,27 @@
  *   - the two routes' different TTLs are each respected — an entry aged
  *     between 24 h and 7 days is STALE for TOI (24 h TTL) but still FRESH
  *     for KOI (7-day TTL).
+ *
+ * 2. Host-star DEDUP, against the real multi-row-per-host shape NASA
+ *    returns (frozen in `src/lib/__tests__/fixtures/koitoi/`) — the debt
+ *    tracked since the 2026-07-20 sprint, i.e. the coverage the merge-side
+ *    `assertUniqueByHostStar()` mitigation was built around but never had.
+ *    Two layers are exercised together so they are proven to agree:
+ *    the ROUTE's disposition filter (`parseTapRow` drops FALSE POSITIVE /
+ *    FA etc. and stamps `KIC{kepid}` / `TIC{tid}`) and the FETCH-side dedup
+ *    in `fetchKOICatalog` / `fetchTOICatalog` (collapse to one row per host
+ *    id). Deduped rows are then run through the real merge functions and
+ *    their `assertUniqueByHostStar()` is asserted NOT to fire.
+ *    DEDUP KEY (verified in code, C-DEDUP.3): both the fetch dedup and the
+ *    merge assertion key on `row.id` = `KIC{kepid}` / `TIC{tid}`, the
+ *    host-star catalog id — not the per-candidate name.
+ *
+ * These live in ONE file (not two) on purpose: the routes hardcode fixed
+ * cache filenames (`koi-catalog.json` / `toi-catalog.json`), and
+ * `node --test` runs separate files CONCURRENTLY — so a second file
+ * touching those same fixed paths races this one on disk (observed: the
+ * fresh-cache test intermittently failed). Same-file tests run
+ * sequentially, sharing the one backup/restore, which removes the race.
  *
  * The routes hardcode their cache file path under the OS temp dir; these
  * tests write that exact file with a controlled `fetchedAt`, stub
@@ -22,10 +44,12 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { promises as fs } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { GET as koiGET } from '@/app/api/koi/route'
 import { GET as toiGET } from '@/app/api/toi/route'
+import { fetchKOICatalog, fetchTOICatalog, mergeKoiIntoHipparcos, mergeToiIntoCatalog } from '@/lib/starCatalog'
 
 const CACHE_DIR = path.join(os.tmpdir(), 'stellar-cache')
 const KOI_FILE = path.join(CACHE_DIR, 'koi-catalog.json')
@@ -168,5 +192,168 @@ describe('the two routes honor DIFFERENT TTLs (7 days vs 24 hours)', () => {
 
     const toiBody = await (await toiGET()).json()
     assert.equal(toiBody.stale, true, 'TOI: 3 days > 24h TTL → stale')
+  })
+})
+
+/* ────────────────────────── host-star dedup ────────────────────────── */
+
+const FIXDIR = path.join(import.meta.dirname, '..', '..', '..', 'lib', '__tests__', 'fixtures', 'koitoi')
+
+/** @description Loads a frozen fixture's raw TAP rows array. */
+function tapRows(file: string): unknown[] {
+  return JSON.parse(readFileSync(path.join(FIXDIR, file), 'utf8')).rows
+}
+
+const KOI_MULTI = tapRows('koi-multi-KIC3832474.json') // 3 CONFIRMED + 2 FALSE POSITIVE
+const KOI_SINGLE = tapRows('koi-single-KIC10666592.json') // single CONFIRMED (HAT-P-7)
+const TOI_MULTI = tapRows('toi-multi-TIC29781292.json') // 3 CP + 1 FA
+const TOI_SINGLE = tapRows('toi-single-TIC25155310.json') // single KP (WASP-126)
+
+/**
+ * @description Installs a `globalThis.fetch` stub returning `body` as a
+ * JSON response. Used two ways: to feed the route a raw TAP JSON array,
+ * and to feed `fetchKOICatalog`/`fetchTOICatalog` a route-shaped
+ * `{source, rows}` body. Restored by the file-wide `afterEach`.
+ * @param body The JSON payload to serve for any fetch.
+ */
+function installJsonFetch(body: unknown): void {
+  fetchStub.restore()
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+}
+
+/**
+ * @description Runs a raw TAP fixture through the real KOI route GET,
+ * returning the parsed body. Clears the cache FIRST because the route
+ * writes a cache on success — without this a second call in one test would
+ * be served the first call's cached rows instead of the new fixture.
+ * @param rawTap Raw TAP rows to serve as the upstream response.
+ * @returns Parsed route response (`source` + filtered/shaped `rows`).
+ */
+async function runKoiRoute(rawTap: unknown[]): Promise<{ source: string; rows: Array<Record<string, unknown>> }> {
+  await fs.rm(KOI_FILE, { force: true })
+  installJsonFetch(rawTap)
+  return (await koiGET()).json()
+}
+/**
+ * @description TOI counterpart of `runKoiRoute`.
+ * @param rawTap Raw TAP rows to serve as the upstream response.
+ * @returns Parsed route response.
+ */
+async function runToiRoute(rawTap: unknown[]): Promise<{ source: string; rows: Array<Record<string, unknown>> }> {
+  await fs.rm(TOI_FILE, { force: true })
+  installJsonFetch(rawTap)
+  return (await toiGET()).json()
+}
+
+/** @description Captures console.error lines during `fn` — the channel `assertUniqueByHostStar` logs on. */
+async function captureErrors(fn: () => void | Promise<void>): Promise<string[]> {
+  const lines: string[] = []
+  const original = console.error
+  console.error = (...args: unknown[]) => { lines.push(args.join(' ')) }
+  try { await fn() } finally { console.error = original }
+  return lines
+}
+
+describe('KOI dedup — real multi-candidate host (KIC 3832474)', () => {
+  it('route filters excluded dispositions: 3 CONFIRMED survive, 2 FALSE POSITIVE dropped', async () => {
+    const body = await runKoiRoute(KOI_MULTI)
+    assert.equal(body.source, 'real')
+    assert.equal(body.rows.length, 3, 'only CONFIRMED/CANDIDATE rows survive the route filter')
+    for (const r of body.rows) {
+      assert.equal(r.disposition, 'CONFIRMED')
+      assert.equal(r.id, 'KIC3832474', 'host-star id stamped as KIC{kepid}')
+    }
+    assert.ok(!body.rows.some(r => r.disposition === 'FALSE POSITIVE'), 'the FALSE POSITIVE rows are gone')
+  })
+
+  it('fetchKOICatalog collapses the 3 surviving rows to ONE host entry', async () => {
+    const routeBody = await runKoiRoute(KOI_MULTI)
+    installJsonFetch(routeBody)
+    const { rows, source } = await fetchKOICatalog()
+    assert.equal(source, 'real')
+    assert.equal(rows.length, 1, 'three KOIs on one host → one deduped entry')
+    assert.equal(rows[0].id, 'KIC3832474')
+    // Highest koi_score wins: .01 = 1.0 (vs .02 0.745, .03 null→0).
+    assert.equal(rows[0].score, 1, 'the highest-scoring candidate is the survivor')
+  })
+
+  it('the deduped rows do NOT trip the merge-side assertUniqueByHostStar', async () => {
+    const routeBody = await runKoiRoute(KOI_MULTI)
+    installJsonFetch(routeBody)
+    const { rows } = await fetchKOICatalog()
+    const errs = await captureErrors(() => { mergeKoiIntoHipparcos([], rows) })
+    assert.deepEqual(errs, [], 'fetch-side dedup and merge-side assertion agree: no INVARIANT VIOLATED log')
+  })
+})
+
+describe('KOI dedup — single-candidate host (KIC 10666592) is untouched', () => {
+  it('one candidate stays one entry and does not merge with an unrelated host', async () => {
+    // Route each host separately (as production does across the catalog),
+    // then dedup the union — the single host must remain distinct.
+    const multiBody = await runKoiRoute(KOI_MULTI)
+    const singleBody = await runKoiRoute(KOI_SINGLE)
+    installJsonFetch({ source: 'real', rows: [...multiBody.rows, ...singleBody.rows], fetchedAt: Date.now() })
+    const { rows } = await fetchKOICatalog()
+    const ids = rows.map(r => r.id).sort()
+    assert.deepEqual(ids, ['KIC10666592', 'KIC3832474'], 'two distinct hosts stay two entries')
+    const single = rows.find(r => r.id === 'KIC10666592')!
+    assert.equal(single.name, 'K00002.01', 'the lone candidate is unchanged, not merged into the other host')
+  })
+})
+
+describe('TOI dedup — real multi-candidate host (TIC 29781292)', () => {
+  it('route filters the excluded FA disposition: 3 CP survive, 1 FA dropped', async () => {
+    const body = await runToiRoute(TOI_MULTI)
+    assert.equal(body.source, 'real')
+    assert.equal(body.rows.length, 3, 'only CP/KP/PC rows survive the route filter')
+    for (const r of body.rows) {
+      assert.equal(r.disposition, 'CP')
+      assert.equal(r.id, 'TIC29781292', 'host-star id stamped as TIC{tid}')
+    }
+    assert.ok(!body.rows.some(r => r.disposition === 'FA'), 'the FA row is filtered out')
+  })
+
+  it('fetchTOICatalog collapses the 3 surviving rows to ONE host entry', async () => {
+    const routeBody = await runToiRoute(TOI_MULTI)
+    installJsonFetch(routeBody)
+    const { rows, source } = await fetchTOICatalog()
+    assert.equal(source, 'real')
+    assert.equal(rows.length, 1, 'three TOIs on one host → one deduped entry')
+    assert.equal(rows[0].id, 'TIC29781292')
+  })
+
+  it('the deduped rows do NOT trip the merge-side assertUniqueByHostStar', async () => {
+    const routeBody = await runToiRoute(TOI_MULTI)
+    installJsonFetch(routeBody)
+    const { rows } = await fetchTOICatalog()
+    const errs = await captureErrors(() => { mergeToiIntoCatalog([], rows) })
+    assert.deepEqual(errs, [], 'fetch-side dedup and merge-side assertion agree: no INVARIANT VIOLATED log')
+  })
+})
+
+describe('TOI dedup — single-candidate host (TIC 25155310) is untouched', () => {
+  it('one candidate stays one entry and does not merge with an unrelated host', async () => {
+    const multiBody = await runToiRoute(TOI_MULTI)
+    const singleBody = await runToiRoute(TOI_SINGLE)
+    installJsonFetch({ source: 'real', rows: [...multiBody.rows, ...singleBody.rows], fetchedAt: Date.now() })
+    const { rows } = await fetchTOICatalog()
+    const ids = rows.map(r => r.id).sort()
+    assert.deepEqual(ids, ['TIC25155310', 'TIC29781292'], 'two distinct hosts stay two entries')
+  })
+})
+
+describe('dedup cross-check — the frozen raw fixtures actually contain excluded rows', () => {
+  it('KOI multi fixture carries FALSE POSITIVE rows for the same host (else the filter test is vacuous)', () => {
+    const rows = KOI_MULTI as Array<Record<string, unknown>>
+    const dispositions = rows.map(r => r.koi_disposition)
+    assert.ok(dispositions.includes('FALSE POSITIVE'), 'fixture must include an excluded disposition')
+    assert.ok(dispositions.filter(d => d === 'CONFIRMED').length >= 2, 'and multiple kept rows')
+    assert.equal(new Set(rows.map(r => r.kepid)).size, 1, 'all one host')
+  })
+  it('TOI multi fixture carries an excluded (FA) row for the same host', () => {
+    const rows = TOI_MULTI as Array<Record<string, unknown>>
+    assert.ok(rows.map(r => r.tfopwg_disp).includes('FA'), 'fixture must include an excluded disposition')
+    assert.equal(new Set(rows.map(r => r.tid)).size, 1, 'all one host')
   })
 })

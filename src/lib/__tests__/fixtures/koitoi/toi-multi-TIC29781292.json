@@ -1,0 +1,52 @@
+{
+ "capturedAt": "2026-07-23T02:58:11.631Z",
+ "mission": "TOI",
+ "note": "3 CP + 1 FA, one host",
+ "adql": "select toi,tid,ra,dec,tfopwg_disp,pl_trandep,pl_trandurh,pl_orbper,st_tmag from toi where tid=29781292 order by toi",
+ "rows": [
+  {
+   "toi": "282.01",
+   "tid": 29781292,
+   "ra": 65.238307,
+   "dec": -68.102688,
+   "tfopwg_disp": "CP",
+   "pl_trandep": 767.9192527,
+   "pl_trandurh": 10.4337079,
+   "pl_orbper": 56.0045056,
+   "st_tmag": 8.9387
+  },
+  {
+   "toi": "282.02",
+   "tid": 29781292,
+   "ra": 65.238307,
+   "dec": -68.102688,
+   "tfopwg_disp": "FA",
+   "pl_trandep": 385,
+   "pl_trandurh": 1.541,
+   "pl_orbper": 31.32312,
+   "st_tmag": 8.9387
+  },
+  {
+   "toi": "282.03",
+   "tid": 29781292,
+   "ra": 65.238307,
+   "dec": -68.102688,
+   "tfopwg_disp": "CP",
+   "pl_trandep": 440.1660616,
+   "pl_trandurh": 10.925059,
+   "pl_orbper": 84.2607645,
+   "st_tmag": 8.9387
+  },
+  {
+   "toi": "282.04",
+   "tid": 29781292,
+   "ra": 65.238307,
+   "dec": -68.102688,
+   "tfopwg_disp": "CP",
+   "pl_trandep": 226.3518918,
+   "pl_trandurh": 2.3187085,
+   "pl_orbper": 22.8909897,
+   "st_tmag": 8.9387
+  }
+ ]
+}

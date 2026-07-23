@@ -10,7 +10,7 @@
  * the plain-Node health-check harness can import it without pulling in the
  * Next.js server bundle.
  *
- * Seven external contracts are represented, matching the seven health
+ * Eight external contracts are represented, matching the eight health
  * checks:
  *   1. VizieR (Hipparcos catalog)                → `VIZIER_HIP_URL`
  *   2. NASA Exoplanet Archive KOI (Kepler)       → `KOI_TAP_URL`
@@ -24,6 +24,10 @@
  *      never-build-on-an-unwatched-assumption rule.
  *   7. SIMBAD TAP identity resolution            → `simbadIdsQueryUrl()`
  *      — used by /api/identity's cross-identifier lookup.
+ *   8. Gaia DR3 TAP `gaia_source`                → `gaiaSourceQueryUrl()`
+ *      — used by /api/gaia's descriptive engine (RUWE + RV-variability +
+ *      phot-variable reading). The health check body-sniffs for the C1
+ *      HTTP-200-HTML outage mode, not just the status code.
  */
 
 /**
@@ -262,3 +266,126 @@ export function simbadIdsQueryUrl(identifier: string): string {
  * a rich cross-id record (13 identifiers as of 2026-07-17).
  */
 export const SIMBAD_HEALTH_PROBE_IDENTIFIER = 'KIC8462852'
+
+/** @description Base of the ESA Gaia Archive synchronous TAP query service (primary). */
+export const GAIA_TAP_SYNC_URL = 'https://gea.esac.esa.int/tap-server/tap/sync'
+
+/**
+ * @description Base of the AIP (Leibniz-Institut für Astrophysik Potsdam)
+ * partner Gaia mirror's synchronous TAP service — the documented fallback
+ * for the ESAC-outage failure mode C1 hit mid-session. It serves the
+ * identical `gaiadr3.gaia_source` / `vari_classifier_result` schema; the
+ * route swaps ONLY the base URL and labels the served-by front. Confirmed
+ * during C1 to return byte-identical values for Tabby. Same `votable_plain`
+ * / VOTable-parse path works against it.
+ */
+export const GAIA_AIP_TAP_SYNC_URL = 'https://gaia.aip.de/tap/sync'
+
+/**
+ * @description The exact `gaiadr3.gaia_source` columns the Gaia descriptive
+ * engine consumes, by name. Kept as a shared constant so the query builder,
+ * the VOTable parser's expected-column check, and the health check all agree
+ * on one list — the VizieR lesson, applied to Gaia. Order is the SELECT
+ * order; the parser locates each BY NAME, not by position.
+ *
+ * The set is exactly what C1.2's measured table needs, plus `rv_template_teff`
+ * (required by the C1.3 four-part RV-variability criterion — it was measured
+ * during C1 but not in the summary table). `phot_variable_flag` is the
+ * NOT_AVAILABLE-trap column.
+ */
+export const GAIA_SOURCE_COLUMNS = [
+  'source_id',
+  'ra',
+  'dec',
+  'phot_g_mean_mag',
+  'phot_bp_mean_mag',
+  'phot_rp_mean_mag',
+  'bp_rp',
+  'phot_variable_flag',
+  'ruwe',
+  'astrometric_excess_noise',
+  'ipd_frac_multi_peak',
+  'non_single_star',
+  'radial_velocity',
+  'radial_velocity_error',
+  'rv_nb_transits',
+  'rv_template_teff',
+  'rv_chisq_pvalue',
+  'rv_renormalised_gof',
+  'has_rvs',
+  'has_epoch_photometry',
+] as const
+
+/**
+ * @description Builds the Gaia Archive TAP query URL that fetches one
+ * source's `gaia_source` row by `source_id` — the direct-lookup pattern
+ * confirmed in C1.1 (we already hold the source_id from SIMBAD, so a cone
+ * search would only re-introduce the ambiguity SIMBAD resolved).
+ *
+ * ⚠ Contract notes measured in C1/C2, load-bearing for the caller:
+ *   - We request `FORMAT=votable_plain`, NOT `votable`. Measured 2026-07-21:
+ *     ESAC's default VOTable serialization is `BINARY2` (base64-encoded
+ *     typed columns with a null-mask), which is a heavy parse; `votable_plain`
+ *     forces the human-readable `<TABLEDATA><TR><TD>` serialization the
+ *     AIP mirror returned during C1. Both are valid VOTable — this just
+ *     picks the tabular form so one small XML parser covers primary + mirror.
+ *   - Gaia returns VOTable XML even when `FORMAT=json` is requested for an
+ *     ERROR, and mirrors disagree on `FORMAT` handling — so we PARSE
+ *     VOTable and never assume JSON.
+ *   - An OUTAGE is served as HTTP 200 + an HTML downtime page, NOT a 5xx.
+ *     The caller must body-sniff (does it parse as VOTable with our
+ *     columns?) rather than trust the status code.
+ * @param sourceId Gaia DR3 source_id (bare integer, as a string to avoid
+ * JS number precision loss on the 19-digit id). Digits-only is enforced
+ * by the route before this is called; also defensively stripped here.
+ * @returns Fully-formed GET URL against `GAIA_TAP_SYNC_URL`.
+ */
+export function gaiaSourceQueryUrl(sourceId: string): string {
+  const safe = String(sourceId).replace(/[^0-9]/g, '')
+  const adql = `SELECT ${GAIA_SOURCE_COLUMNS.join(', ')} FROM gaiadr3.gaia_source WHERE source_id = ${safe}`
+  const params = new URLSearchParams({
+    REQUEST: 'doQuery',
+    LANG: 'ADQL',
+    FORMAT: 'votable_plain',
+    QUERY: adql,
+  })
+  return `${GAIA_TAP_SYNC_URL}?${params.toString()}`
+}
+
+/** @description Columns fetched from `gaiadr3.vari_classifier_result` (bonus layer). */
+export const GAIA_CLASSIFIER_COLUMNS = [
+  'source_id',
+  'classifier_name',
+  'best_class_name',
+  'best_class_score',
+] as const
+
+/**
+ * @description Builds the Gaia TAP query for one source's
+ * `vari_classifier_result` row — the ML variable-star classification. This
+ * is the BONUS layer (C1.2): most sources are NOT in this table (only 1 of
+ * C1's 4 test objects, HAT-P-7, is), so an empty result is the normal,
+ * silent answer, never an error.
+ * @param sourceId Gaia DR3 source_id (digits-only enforced).
+ * @returns Fully-formed GET URL against `GAIA_TAP_SYNC_URL`.
+ */
+export function gaiaClassifierQueryUrl(sourceId: string): string {
+  const safe = String(sourceId).replace(/[^0-9]/g, '')
+  const adql = `SELECT ${GAIA_CLASSIFIER_COLUMNS.join(', ')} FROM gaiadr3.vari_classifier_result WHERE source_id = ${safe}`
+  const params = new URLSearchParams({
+    REQUEST: 'doQuery',
+    LANG: 'ADQL',
+    FORMAT: 'votable_plain',
+    QUERY: adql,
+  })
+  return `${GAIA_TAP_SYNC_URL}?${params.toString()}`
+}
+
+/**
+ * @description source_id used by the health check's Gaia probe — Tabby's
+ * Star, exactly what the C1.4 identity chain produces for KIC 8462852.
+ * Guaranteed present in `gaiadr3.gaia_source` with populated RUWE + RV
+ * columns and `phot_variable_flag = NOT_AVAILABLE` (the trap value), so a
+ * successful probe also confirms the columns the parser reads by name.
+ */
+export const GAIA_HEALTH_PROBE_SOURCE_ID = '2081900940499099136'

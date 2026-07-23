@@ -43,6 +43,8 @@ next-env.d.ts
 # Playwright transient output
 /test-results/
 /playwright-report/
+# Visual-verification captures (regenerate via e2e/tooltip-screenshots.spec.ts)
+e2e/screenshots/
 
 # extracted engine package (own install + build output)
 packages/*/node_modules/
