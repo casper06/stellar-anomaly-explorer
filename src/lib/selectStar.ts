@@ -193,11 +193,17 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
     // responsive. Because it awaits, a NEWER selection can supersede
     // this one mid-classify — re-check the generation afterwards, same
     // rule as the fetch above.
-    const profile =
+    const classification =
       source === 'unavailable' || times.length === 0
         ? null
         : await classifyCurveAsync(times, flux, dips)
     if (generation !== selectionGeneration) return
+    // A worker HANG resolves `{ status: 'timeout' }` (never an inline
+    // fallback — see classifyAsync). Map it to a null profile plus a flag
+    // so the panel can say "could not classify" instead of silently
+    // rendering nothing (which reads identically to the no-data case).
+    const profile = classification?.status === 'ok' ? classification.profile : null
+    const profileTimedOut = classification?.status === 'timeout'
     setLightcurve({
       times,
       flux,
@@ -205,6 +211,7 @@ export async function selectStarAndFetchCurve(star: Star): Promise<void> {
       source,
       provenance,
       profile,
+      profileTimedOut,
       mission: mission ?? null,
       gapDays: gapDays ?? 5,
       partial: partial ?? false,

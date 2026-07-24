@@ -84,6 +84,15 @@ export interface LightcurveData {
    */
   profile?: CurveProfile | null
   /**
+   * @description True when off-thread classification was abandoned after
+   * the worker hung past its timeout (see `classifyCurveAsync`). `profile`
+   * is null in this case, same as the no-data case, but this flag lets the
+   * UI say "could not classify this light curve" rather than silently
+   * omitting the readout. Undefined/false = classification ran normally
+   * (or there was no data to classify).
+   */
+  profileTimedOut?: boolean
+  /**
    * @description Which mission archive actually served the data, or
    * null when the curve is synthetic / unavailable. Surfaced so the
    * UI can label the time axis correctly (BKJD for Kepler, TJD for

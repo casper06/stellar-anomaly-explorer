@@ -455,6 +455,7 @@ function LightCurveFullscreen({
   dips,
   provenance,
   profile,
+  profileTimedOut,
   gapDays,
   timeUnit,
   partial,
@@ -470,6 +471,8 @@ function LightCurveFullscreen({
   dips: Anomaly[]
   provenance?: LightcurveProvenance
   profile: CurveProfile | null
+  /** True when classification was abandoned after the worker hung (profile is null). */
+  profileTimedOut?: boolean
   gapDays?: number
   timeUnit?: string
   partial?: boolean
@@ -570,6 +573,33 @@ function LightCurveFullscreen({
               profile.bls.sde >= BLS_SDE_THRESHOLD && (
                 <PixelVettingPanel key={starId} starId={starId} mission={mission} bls={profile.bls} />
               )}
+          </div>
+        )}
+        {/* Classification abandoned: the off-thread classifier hung past its
+            timeout and was terminated (see `classifyCurveAsync`). The chart
+            still renders — only the descriptive readout is missing — so say
+            so plainly rather than leaving the corner silently empty, which
+            reads identically to a curve that simply wasn't classified. */}
+        {!profile && profileTimedOut && (
+          <div
+            style={{
+              position: 'absolute',
+              top: 72,
+              left: 16,
+              zIndex: 5,
+              maxWidth: 280,
+              padding: '8px 10px',
+              borderRadius: 6,
+              background: 'rgba(0,0,0,0.55)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              fontSize: 10,
+              lineHeight: 1.6,
+              color: 'rgba(255,255,255,0.6)',
+              pointerEvents: 'none',
+            }}
+          >
+            Could not classify this light curve — the analysis timed out. The
+            data is shown below unchanged.
           </div>
         )}
         {/* Top bar — fixed-height header */}
@@ -1858,6 +1888,7 @@ export default function AnomalyPanel() {
         dips={lightcurve.dips}
         provenance={lightcurve.provenance}
         profile={lightcurve.profile ?? null}
+        profileTimedOut={lightcurve.profileTimedOut}
         gapDays={lightcurve.gapDays}
         timeUnit={lightcurve.mission === 'TESS' ? 'TJD' : 'BKJD'}
         partial={lightcurve.partial}
