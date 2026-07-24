@@ -1799,7 +1799,9 @@ export default function AnomalyPanel() {
                   DATA UNAVAILABLE
                 </strong>
                 {' — '}
-                This star has not been observed by Kepler or TESS.
+                No light curve is currently available for this star. It may
+                not have been observed by Kepler or TESS, or the archive may
+                be temporarily rate-limited. Try again in a moment.
               </>
             ) : (
               <>
