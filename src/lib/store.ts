@@ -3,6 +3,7 @@ import { FLAGGED_KEY, VISITED_KEY, loadIdSet, saveIdSet } from './persistence'
 import type { CurveProfile, CurvePattern } from './curveClassifier'
 import type { SimbadIdentity } from './simbadIds'
 import type { GaiaDescription } from './gaiaSource'
+import type { LightcurveFailureReason } from './anomalyDetector'
 
 /**
  * @description Catalog of origin for a star. Used by the renderer to pick
@@ -84,6 +85,15 @@ export interface LightcurveData {
    */
   profile?: CurveProfile | null
   /**
+   * @description True when off-thread classification was abandoned after
+   * the worker hung past its timeout (see `classifyCurveAsync`). `profile`
+   * is null in this case, same as the no-data case, but this flag lets the
+   * UI say "could not classify this light curve" rather than silently
+   * omitting the readout. Undefined/false = classification ran normally
+   * (or there was no data to classify).
+   */
+  profileTimedOut?: boolean
+  /**
    * @description Which mission archive actually served the data, or
    * null when the curve is synthetic / unavailable. Surfaced so the
    * UI can label the time axis correctly (BKJD for Kepler, TJD for
@@ -112,6 +122,19 @@ export interface LightcurveData {
    * Undefined when not real MAST data.
    */
   segments?: { recovered: number; expected: number }
+  /**
+   * @description Why there is no data, when `source` is `'unavailable'`.
+   * The panel branches its explanatory copy on this instead of inferring
+   * a coverage gap from the star id's shape. Only `'no-coverage'` (an
+   * empty archive listing) supports "not observed by Kepler or TESS";
+   * `'no-product'` means the star WAS observed but carries no plottable
+   * light curve, and `'rate-limited'` / `'fetch-error'` are transient
+   * failures that must not be described as non-observation at all.
+   * Undefined for real/synthetic data.
+   */
+  reason?: LightcurveFailureReason
+  /** @description Human-readable amplification of `reason` (diagnostics, not user copy). */
+  error?: string
 }
 
 /**

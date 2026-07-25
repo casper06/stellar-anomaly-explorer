@@ -8,6 +8,7 @@ import {
   SYNTHETIC_PROVENANCE,
   TESS_PROVENANCE,
   UNAVAILABLE_PROVENANCE,
+  type LightcurveFailureReason,
 } from '@/lib/anomalyDetector'
 import { readMastLightcurveColumns } from '@/lib/fitsReader'
 import {
@@ -286,6 +287,41 @@ async function writeDiskCache(
 }
 
 /**
+ * Failure granularity (`LightcurveFailureReason`, imported from
+ * `@/lib/anomalyDetector` so client and server share one definition) is
+ * bounded by what the TAP response can actually distinguish. Issue #18:
+ * this function used to return a bare `null` on every failure, so a 429, a
+ * parse failure and a genuine coverage gap were indistinguishable and all
+ * rendered as "not observed by Kepler or TESS" in the panel.
+ *
+ * Mapping used throughout this route:
+ *   - `rate-limited` — HTTP 429 from TAP or the cone search.
+ *   - `no-coverage` — a SUCCESSFUL query that returned NO rows at all.
+ *     The archive knows of nothing here. Strongest confirmed absence.
+ *   - `no-product` — a SUCCESSFUL query that DID return rows, but none is
+ *     a usable PDC light curve (or, on the cone-search path, none names a
+ *     Kepler/TESS target we can follow up on). The target was observed;
+ *     we just have nothing plottable. Split out from `no-coverage`
+ *     because "not observed" would overstate what the listing proves.
+ *   - `fetch-error` — everything else: non-429 HTTP errors, JSON parse
+ *     failures, a missing `access_url` column, all segments failing to
+ *     download, below-floor segment coverage, or a thrown exception.
+ *
+ * Both absence reasons are decided from `rows.length`, which is already in
+ * scope at each site — the split costs no extra query.
+ */
+
+/**
+ * @description Result of `tryFetchRealLightcurve`: either the parsed curve
+ * or a discriminated failure carrying WHY. `detail` is a short
+ * human-readable amplification for logs/telemetry (never user-facing
+ * copy — the UI keys off `reason`).
+ */
+type FetchOutcome =
+  | { ok: true; curve: CachedCurve }
+  | { ok: false; reason: LightcurveFailureReason; detail: string }
+
+/**
  * @description Identifies which MAST archive collection (if any) a star id
  * should be fetched against. Returns `null` for ids that don't carry a
  * direct mission cross-reference — those go through the position-based
@@ -495,18 +531,26 @@ function isPdcLightcurveUrl(url: string, mission: 'Kepler' | 'TESS'): boolean {
  * The returned `expectedSegments` is how many PDC segments TAP LISTED
  * for the target; `segmentFiles.length` is how many actually downloaded.
  * When they differ the curve is PARTIAL and the caller flags it. Below
- * `MIN_SEGMENT_COVERAGE_TO_SERVE` coverage we return null instead of a
- * badly-truncated curve.
+ * `MIN_SEGMENT_COVERAGE_TO_SERVE` coverage we report a failure instead of
+ * a badly-truncated curve.
+ *
+ * On failure this returns a DISCRIMINATED result carrying the reason
+ * rather than a bare null, so the caller can tell an empty archive
+ * listing (`no-coverage`) apart from a listing with no plottable product
+ * (`no-product`), throttling (`rate-limited`), or an indeterminate
+ * transport/parse failure (`fetch-error`). Only `no-coverage` licenses
+ * "neither mission pointed at it" copy in the UI.
  * @param mission The mission whose collection to query.
  * @param targetName Archive target name (mission-specific format).
- * @returns Concatenated multi-segment light curve, the archive filenames
- * of the segments that parsed, and the expected segment count — or null
- * on failure / below-floor coverage.
+ * @returns `{ ok: true, curve }` with the concatenated light curve, the
+ * archive filenames of the segments that parsed, and the expected segment
+ * count — or `{ ok: false, reason, detail }` on failure / below-floor
+ * coverage.
  */
 async function tryFetchRealLightcurve(
   mission: 'Kepler' | 'TESS',
   targetName: string,
-): Promise<CachedCurve | null> {
+): Promise<FetchOutcome> {
   const tag = '[lightcurve]'
   try {
     const tapUrl = mastTapQueryUrl(mission, targetName)
@@ -516,7 +560,12 @@ async function tryFetchRealLightcurve(
     if (!tapRes.ok) {
       const body = await tapRes.text().catch(() => '<unreadable>')
       console.error(`${tag} TAP body (first 500): ${body.slice(0, 500)}`)
-      return null
+      // 429 is the one status that names its own cause: MAST is throttling
+      // us, so coverage is UNKNOWN — never report it as "not observed".
+      if (tapRes.status === 429) {
+        return { ok: false, reason: 'rate-limited', detail: `TAP HTTP 429 ${tapRes.statusText}` }
+      }
+      return { ok: false, reason: 'fetch-error', detail: `TAP HTTP ${tapRes.status} ${tapRes.statusText}` }
     }
     const tapText = await tapRes.text()
     let tap: TapResponse
@@ -524,13 +573,15 @@ async function tryFetchRealLightcurve(
       tap = JSON.parse(tapText) as TapResponse
     } catch (e) {
       console.error(`${tag} TAP JSON parse error:`, e)
-      return null
+      return { ok: false, reason: 'fetch-error', detail: 'TAP response was not valid JSON' }
     }
     const colIdx = Object.fromEntries((tap.info ?? []).map((c, i) => [c.name, i]))
     const accessUrlIdx = colIdx['access_url']
     if (accessUrlIdx === undefined) {
       console.error(`${tag} TAP response missing 'access_url' column; have: ${Object.keys(colIdx).join(', ')}`)
-      return null
+      // A schema change on MAST's side — we cannot read the listing, so we
+      // learned nothing about coverage.
+      return { ok: false, reason: 'fetch-error', detail: "TAP response missing 'access_url' column" }
     }
     const rows = tap.data ?? []
     console.error(`${tag} ${mission} TAP returned ${rows.length} rows for ${targetName}`)
@@ -558,7 +609,25 @@ async function tryFetchRealLightcurve(
     console.error(
       `${tag} ${expectedSegments} ${segmentLabel} to download (pool of ${SEGMENT_DOWNLOAD_CONCURRENCY}): ${lcFilenames.join(', ')}`,
     )
-    if (expectedSegments === 0) return null
+    // The confirmed-absence branches: MAST answered successfully and we
+    // still have no PDC light curve. Everything else in this function is
+    // "we could not find out". Which absence it is turns on whether the
+    // listing was empty or merely held no plottable product — the archive
+    // returning rows means the target WAS observed, so that case must not
+    // be reported as non-observation.
+    if (expectedSegments === 0) {
+      return rows.length === 0
+        ? {
+            ok: false,
+            reason: 'no-coverage',
+            detail: `${mission} TAP listed no observations at all for ${targetName}`,
+          }
+        : {
+            ok: false,
+            reason: 'no-product',
+            detail: `${mission} TAP listed ${rows.length} observation rows for ${targetName}, none a PDC light curve`,
+          }
+    }
 
     // Download + parse through the bounded pool with per-segment retry.
     // Pair each success with its archive filename — the successful list is
@@ -577,19 +646,32 @@ async function tryFetchRealLightcurve(
     } else {
       console.error(`${tag} ${ok.length}/${expectedSegments} segments parsed successfully`)
     }
-    if (ok.length === 0) return null
+    // MAST listed segments but none downloaded/parsed — the products exist,
+    // so this is a transport failure, NOT a coverage gap.
+    if (ok.length === 0) {
+      return {
+        ok: false,
+        reason: 'fetch-error',
+        detail: `all ${expectedSegments} listed segments failed to download or parse`,
+      }
+    }
 
     // Coverage gate: if we recovered too small a fraction of the listed
-    // segments, don't serve a badly-truncated curve — return null so the
-    // caller falls through to unavailable/synthetic. Above the floor we
-    // serve it and let the caller flag PARTIAL.
+    // segments, don't serve a badly-truncated curve — report a failure so
+    // the caller falls through to unavailable/synthetic. Above the floor we
+    // serve it and let the caller flag PARTIAL. Again a transport problem:
+    // MAST says the data exists, we just couldn't get enough of it.
     const coverage = ok.length / expectedSegments
     if (coverage < MIN_SEGMENT_COVERAGE_TO_SERVE) {
       console.error(
         `${tag} ${mission} coverage ${ok.length}/${expectedSegments} (${(coverage * 100).toFixed(0)}%) below floor ` +
           `${(MIN_SEGMENT_COVERAGE_TO_SERVE * 100).toFixed(0)}%; treating as fetch failure`,
       )
-      return null
+      return {
+        ok: false,
+        reason: 'fetch-error',
+        detail: `only ${ok.length}/${expectedSegments} segments recovered (below ${(MIN_SEGMENT_COVERAGE_TO_SERVE * 100).toFixed(0)}% floor)`,
+      }
     }
 
     // Sort segments by first timestamp, then flatten. Within each segment
@@ -611,10 +693,11 @@ async function tryFetchRealLightcurve(
       `${tag} ${mission} success: ${segmentFiles.length}/${expectedSegments} segments concatenated → ${times.length} samples, ` +
         `time range ${tUnit} ${times[0].toFixed(1)} → ${times[times.length - 1].toFixed(1)}${partial ? ' [PARTIAL]' : ''}`,
     )
-    return { times, flux, segmentFiles, expectedSegments }
+    return { ok: true, curve: { times, flux, segmentFiles, expectedSegments } }
   } catch (e) {
     console.error(`${tag} caught error in tryFetchRealLightcurve:`, e)
-    return null
+    // Connection-level failure / timeout — coverage indeterminate.
+    return { ok: false, reason: 'fetch-error', detail: e instanceof Error ? e.message : String(e) }
   }
 }
 
@@ -623,16 +706,24 @@ async function tryFetchRealLightcurve(
  * near (ra, dec). Used by the on-demand path for stars without a
  * KIC/TIC catalog id — we check whether MAST has observed that
  * patch of sky and, if so, route to the same fetch pipeline.
- * Returns the first MAST target found (with mission tag), or null
- * if nothing was observed within the search radius.
+ * Returns the first MAST target found (with mission tag), or a
+ * discriminated failure — `no-coverage` only when the cone search
+ * SUCCEEDED and came back EMPTY (a confirmed absence of observation at
+ * that position). A search that returned rows but no usable Kepler/TESS
+ * target is `no-product` (something was observed there, just nothing we
+ * can plot), so the on-demand path can tell both apart from a throttled
+ * or broken query.
  * @param ra Right ascension in degrees.
  * @param dec Declination in degrees.
- * @returns Resolved target spec, or null on miss / TAP failure.
+ * @returns Resolved target spec, or `{ ok: false, reason, detail }`.
  */
 async function resolveTargetByPosition(
   ra: number,
   dec: number,
-): Promise<{ mission: 'Kepler' | 'TESS'; targetName: string } | null> {
+): Promise<
+  | { ok: true; mission: 'Kepler' | 'TESS'; targetName: string }
+  | { ok: false; reason: LightcurveFailureReason; detail: string }
+> {
   const tag = '[lightcurve]'
   try {
     const url = mastConeSearchUrl(ra, dec)
@@ -640,37 +731,61 @@ async function resolveTargetByPosition(
     const res = await fetch(url, { signal: AbortSignal.timeout(30000) })
     if (!res.ok) {
       console.error(`${tag} cone search failed: HTTP ${res.status}`)
-      return null
+      if (res.status === 429) {
+        return { ok: false, reason: 'rate-limited', detail: `cone search HTTP 429 ${res.statusText}` }
+      }
+      return { ok: false, reason: 'fetch-error', detail: `cone search HTTP ${res.status} ${res.statusText}` }
     }
-    const tap = (await res.json()) as TapResponse
+    let tap: TapResponse
+    try {
+      tap = (await res.json()) as TapResponse
+    } catch (e) {
+      console.error(`${tag} cone search JSON parse error:`, e)
+      return { ok: false, reason: 'fetch-error', detail: 'cone search response was not valid JSON' }
+    }
     const colIdx = Object.fromEntries((tap.info ?? []).map((c, i) => [c.name, i]))
     const collIdx = colIdx['obs_collection']
     const tnameIdx = colIdx['target_name']
     if (collIdx === undefined || tnameIdx === undefined) {
       console.error(`${tag} cone search missing expected columns`)
-      return null
+      return { ok: false, reason: 'fetch-error', detail: 'cone search response missing expected columns' }
     }
     const rows = tap.data ?? []
     console.error(`${tag} cone search returned ${rows.length} rows at (${ra}, ${dec})`)
-    if (rows.length === 0) return null
+    // Successful query, ZERO rows = MAST has genuinely not observed this
+    // patch of sky. This is the only absence strong enough for the
+    // "neither mission pointed at it" copy. (Rows-but-unusable is handled
+    // below as `no-product`.)
+    if (rows.length === 0) {
+      return { ok: false, reason: 'no-coverage', detail: `no MAST observation within the search radius of (${ra}, ${dec})` }
+    }
     // Prefer TESS if both missions have data — broader sky coverage
     // and shorter cadence make it the better default for the
     // on-demand path, where the user clicked something the catalogs
     // didn't already index.
-    let kepler: { mission: 'Kepler'; targetName: string } | null = null
-    let tess: { mission: 'TESS'; targetName: string } | null = null
+    let kepler: { ok: true; mission: 'Kepler'; targetName: string } | null = null
+    let tess: { ok: true; mission: 'TESS'; targetName: string } | null = null
     for (const row of rows) {
       const coll = row[collIdx]
       const tname = row[tnameIdx]
       if (typeof tname !== 'string' || tname === '') continue
-      if (coll === 'Kepler' && !kepler) kepler = { mission: 'Kepler', targetName: tname }
-      if (coll === 'TESS' && !tess) tess = { mission: 'TESS', targetName: tname }
+      if (coll === 'Kepler' && !kepler) kepler = { ok: true, mission: 'Kepler', targetName: tname }
+      if (coll === 'TESS' && !tess) tess = { ok: true, mission: 'TESS', targetName: tname }
       if (kepler && tess) break
     }
-    return tess ?? kepler
+    const resolved = tess ?? kepler
+    if (resolved) return resolved
+    // Rows came back but none named a usable Kepler/TESS target. Something
+    // WAS observed at this position, so this is `no-product`, not the
+    // stronger "nothing here" — the distinction the panel copy relies on.
+    return {
+      ok: false,
+      reason: 'no-product',
+      detail: `cone search returned ${rows.length} rows but no usable Kepler/TESS target_name`,
+    }
   } catch (e) {
     console.error(`${tag} cone search caught:`, e)
-    return null
+    return { ok: false, reason: 'fetch-error', detail: e instanceof Error ? e.message : String(e) }
   }
 }
 
@@ -729,9 +844,18 @@ function realResponse(data: CachedCurve, mission: 'Kepler' | 'TESS') {
  *   - Catalog-driven requests (default) get the existing behavior:
  *     synthetic in dev, unavailable in production.
  *
+ * An `unavailable` response also carries `reason`
+ * (`'rate-limited' | 'no-coverage' | 'no-product' | 'fetch-error'`) plus
+ * a human-readable `error` detail, so the panel can say what actually
+ * happened rather than inferring a coverage gap from the id's shape.
+ * `no-coverage` means MAST was consulted and reported nothing at all;
+ * `no-product` means it reported observations but no plottable light
+ * curve — only the former supports "not observed" copy.
+ *
  * @param req Request — we read `ra`/`dec`/`onDemand` from the query string.
  * @param ctx Route context carrying the dynamic `id` segment.
- * @returns JSON `{ times, flux, source, provenance, mission, gapDays }`.
+ * @returns JSON `{ times, flux, source, provenance, mission, gapDays }`,
+ * plus `{ reason, error }` when `source` is `'unavailable'`.
  */
 export async function GET(
   req: Request,
@@ -751,6 +875,15 @@ export async function GET(
       ` (onDemand=${onDemand}, pos=${havePos ? `${ra},${dec}` : 'none'}, NODE_ENV=${process.env.NODE_ENV})`,
   )
 
+  // Why we ended up with no data, threaded into the unavailable response
+  // so the UI can describe the actual cause. Starts as the "we never even
+  // asked MAST" case (no mission id and no position to cone-search with),
+  // and is overwritten by whichever stage actually failed.
+  let failure: { reason: LightcurveFailureReason; detail: string } = {
+    reason: 'fetch-error',
+    detail: 'no mission id and no position supplied; MAST was not queried',
+  }
+
   // Dispatch the id to a mission archive when possible.
   let target = identifyMastTarget(id)
   // If we couldn't infer a mission from the id and the caller supplied
@@ -759,9 +892,15 @@ export async function GET(
   // stars (Hipparcos clicks, etc).
   if (!target && havePos) {
     console.error(`${tag} ${id} has no mission id; cone-searching at ${ra}, ${dec}`)
-    target = await resolveTargetByPosition(ra, dec)
-    if (target) {
+    const resolved = await resolveTargetByPosition(ra, dec)
+    if (resolved.ok) {
+      target = { mission: resolved.mission, targetName: resolved.targetName }
       console.error(`${tag} cone search resolved ${id} → ${target.mission}/${target.targetName}`)
+    } else {
+      // Carries `no-coverage` only when the cone search genuinely came back
+      // empty — that's what licenses the "not observed" copy downstream.
+      failure = { reason: resolved.reason, detail: resolved.detail }
+      console.error(`${tag} cone search did not resolve ${id}: ${resolved.reason} (${resolved.detail})`)
     }
   }
 
@@ -785,14 +924,15 @@ export async function GET(
 
     console.error(`${tag} ${id} → ${target.mission} target_name='${target.targetName}'; querying MAST TAP`)
     const real = await tryFetchRealLightcurve(target.mission, target.targetName)
-    if (real) {
+    if (real.ok) {
       console.error(`${tag} returning REAL ${target.mission} data for ${id}`)
-      cache.set(cacheKey, real)
-      void writeDiskCache(cacheKey, real, tag)
-      return realResponse(real, target.mission)
+      cache.set(cacheKey, real.curve)
+      void writeDiskCache(cacheKey, real.curve, tag)
+      return realResponse(real.curve, target.mission)
     }
-    console.error(`${tag} MAST fetch returned null for ${id} (${target.mission})`)
-  } else {
+    failure = { reason: real.reason, detail: real.detail }
+    console.error(`${tag} MAST fetch failed for ${id} (${target.mission}): ${real.reason} — ${real.detail}`)
+  } else if (!havePos) {
     console.error(`${tag} ${id} is not a parseable KIC/TIC id and no position supplied; skipping MAST`)
   }
 
@@ -812,7 +952,9 @@ export async function GET(
     })
   }
 
-  console.error(`${tag} returning UNAVAILABLE for ${id}${onDemand ? ' (onDemand)' : ''}`)
+  console.error(
+    `${tag} returning UNAVAILABLE for ${id}${onDemand ? ' (onDemand)' : ''} — ${failure.reason}: ${failure.detail}`,
+  )
   return NextResponse.json({
     times: [],
     flux: [],
@@ -820,5 +962,11 @@ export async function GET(
     provenance: UNAVAILABLE_PROVENANCE,
     mission: null,
     gapDays: GAP_DAYS_KEPLER,
+    // Why there's no data. The UI branches its copy on this instead of
+    // guessing from the star's id shape (issue #18). `error` mirrors the
+    // convention the Gaia/identity routes already use for the
+    // human-readable amplification.
+    reason: failure.reason,
+    error: failure.detail,
   })
 }

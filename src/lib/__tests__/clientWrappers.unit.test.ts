@@ -15,9 +15,9 @@
  *
  * Run via `npm run test:unit`.
  */
-import { describe, it, before, after, afterEach } from 'node:test'
+import { describe, it, before, after, afterEach, mock } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyCurveAsync } from '../classifyAsync.ts'
+import { classifyCurveAsync, CLASSIFY_WORKER_TIMEOUT_MS } from '../classifyAsync.ts'
 import { classifyCurve } from '../curveClassifier.ts'
 import { detectDips } from '../anomalyDetector.ts'
 import { fetchIdentity, fetchIdentityByName } from '../identityClient.ts'
@@ -81,14 +81,21 @@ describe('classifyCurveAsync — worker unavailable (Node path)', () => {
   it('falls back to a direct call and matches classifyCurve exactly', async () => {
     assert.equal(typeof (globalThis as { Worker?: unknown }).Worker, 'undefined', 'no Worker in Node')
     const { times, flux, dips } = sample()
-    const viaAsync = await classifyCurveAsync(times, flux, dips)
-    assert.deepEqual(viaAsync, classifyCurve(times, flux, dips))
+    const result = await classifyCurveAsync(times, flux, dips)
+    assert.equal(result.status, 'ok', 'inline classification is a success outcome')
+    assert.deepEqual(
+      result.status === 'ok' ? result.profile : null,
+      classifyCurve(times, flux, dips),
+    )
   })
 
   it('resolves rather than rejecting on an empty curve', async () => {
-    const profile = await classifyCurveAsync([], [], [])
-    assert.ok(profile, 'a profile object is still produced')
-    assert.deepEqual(profile, classifyCurve([], [], []))
+    const result = await classifyCurveAsync([], [], [])
+    assert.equal(result.status, 'ok', 'a profile is still produced')
+    assert.deepEqual(
+      result.status === 'ok' ? result.profile : null,
+      classifyCurve([], [], []),
+    )
   })
 })
 
@@ -97,7 +104,9 @@ describe('classifyCurveAsync — worker available', () => {
    * @description Installs a fake `Worker` class.
    * @param behavior How the fake worker should respond.
    */
-  function stubWorker(behavior: 'message' | 'error' | 'construct-throws'): { terminated: number } {
+  function stubWorker(
+    behavior: 'message' | 'error' | 'construct-throws' | 'silent',
+  ): { terminated: number } {
     const stats = { terminated: 0 }
     class FakeWorker {
       onmessage: ((e: { data: unknown }) => void) | null = null
@@ -106,6 +115,9 @@ describe('classifyCurveAsync — worker available', () => {
         if (behavior === 'construct-throws') throw new Error('spawn blocked (CSP)')
       }
       postMessage(payload: { times: number[]; flux: number[]; dips: unknown[] }): void {
+        // 'silent' models a HUNG worker: it never posts a message or an
+        // error, so only the timeout can settle the promise.
+        if (behavior === 'silent') return
         // Reply asynchronously, as a real worker does.
         setTimeout(() => {
           if (behavior === 'error') this.onerror?.()
@@ -127,24 +139,74 @@ describe('classifyCurveAsync — worker available', () => {
   it('uses the worker result when the worker replies', async () => {
     const stats = stubWorker('message')
     const { times, flux, dips } = sample()
-    const profile = await classifyCurveAsync(times, flux, dips)
-    assert.deepEqual(profile, classifyCurve(times, flux, dips))
+    const result = await classifyCurveAsync(times, flux, dips)
+    assert.equal(result.status, 'ok')
+    assert.deepEqual(result.status === 'ok' ? result.profile : null, classifyCurve(times, flux, dips))
     assert.equal(stats.terminated, 1, 'worker is terminated, not leaked')
   })
 
   it('falls back inline when the worker errors — same result, different thread', async () => {
     const stats = stubWorker('error')
     const { times, flux, dips } = sample()
-    const profile = await classifyCurveAsync(times, flux, dips)
-    assert.deepEqual(profile, classifyCurve(times, flux, dips), 'fallback matches the worker path')
+    const result = await classifyCurveAsync(times, flux, dips)
+    assert.equal(result.status, 'ok', 'a clean worker error is still a successful classification')
+    assert.deepEqual(
+      result.status === 'ok' ? result.profile : null,
+      classifyCurve(times, flux, dips),
+      'fallback matches the worker path',
+    )
     assert.equal(stats.terminated, 1)
   })
 
   it('falls back inline when the worker cannot even be constructed', async () => {
     stubWorker('construct-throws')
     const { times, flux, dips } = sample()
-    const profile = await classifyCurveAsync(times, flux, dips)
-    assert.deepEqual(profile, classifyCurve(times, flux, dips))
+    const result = await classifyCurveAsync(times, flux, dips)
+    assert.equal(result.status, 'ok')
+    assert.deepEqual(result.status === 'ok' ? result.profile : null, classifyCurve(times, flux, dips))
+  })
+
+  it('times out and terminates a hung worker — distinct outcome, no inline fallback', async () => {
+    // Mock timers so the 15 s ceiling is crossed by ticking, never by a
+    // real wall-clock wait. Only `setTimeout` is faked; the promise
+    // machinery still runs on real microtasks.
+    mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+      const stats = stubWorker('silent')
+      const { times, flux, dips } = sample()
+      const pending = classifyCurveAsync(times, flux, dips)
+      // Advance past the ceiling so the watchdog fires.
+      mock.timers.tick(CLASSIFY_WORKER_TIMEOUT_MS + 1)
+      const result = await pending
+      assert.equal(result.status, 'timeout', 'a hang resolves as a distinct timeout, not ok')
+      assert.equal('profile' in result, false, 'no profile is fabricated on timeout')
+      assert.equal(stats.terminated, 1, 'the hung worker is terminated')
+    } finally {
+      mock.timers.reset()
+    }
+  })
+
+  it('a fast success leaves no dangling timer', async () => {
+    // With mock timers on, any timer the success path forgot to clear would
+    // still be pending after resolution. Assert the timer count returns to
+    // zero once the worker replies.
+    mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+      const stats = stubWorker('message')
+      const { times, flux, dips } = sample()
+      const pending = classifyCurveAsync(times, flux, dips)
+      // The fake worker replies via a 0-ms setTimeout (now mocked); tick it.
+      mock.timers.tick(0)
+      const result = await pending
+      assert.equal(result.status, 'ok')
+      assert.equal(stats.terminated, 1)
+      // If the 15 s watchdog were still armed, ticking past it would try to
+      // terminate a second time. It must have been cleared on success.
+      mock.timers.tick(CLASSIFY_WORKER_TIMEOUT_MS + 1)
+      assert.equal(stats.terminated, 1, 'watchdog was cleared; no second terminate')
+    } finally {
+      mock.timers.reset()
+    }
   })
 })
 
