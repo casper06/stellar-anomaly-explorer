@@ -8,6 +8,7 @@ import { fetchCentroidVet, type CentroidVetPayload, type CentroidVetFailure } fr
 import { constellationAt, describeVisibilityStory } from '@/lib/constellations'
 import { selectDisplayNames, type SimbadIdentity } from '@/lib/simbadIds'
 import type { GaiaDescription } from '@/lib/gaiaSource'
+import type { LightcurveFailureReason } from '@/lib/anomalyDetector'
 import LightCurve from './LightCurve'
 
 /**
@@ -1398,12 +1399,99 @@ function LoadingProgress() {
  * id — i.e. the user clicked a Hipparcos background star or a synthetic
  * filler and we need to cone-search MAST. Used by the panel to pick
  * between the pipeline narration (`LoadingProgress`) and the lighter
- * spinner (`SearchingMAST`), and to swap the "unavailable" copy between
- * "transient MAST failure" and "not observed by Kepler or TESS".
+ * spinner (`SearchingMAST`).
+ *
+ * NOTE: this is deliberately NOT used to choose the "unavailable" copy
+ * anymore (issue #18). The id's shape says which REQUEST we made, never
+ * why it came back empty — a rate-limited KIC star and an unobserved
+ * Hipparcos star both failed, for entirely different reasons.
+ * `<UnavailableNotice>` branches on the route's reported `reason` instead.
  * @param id Catalog id.
  */
 function isOnDemandId(id: string): boolean {
   return !/^(KIC|TIC|EPIC)\d+$/.test(id)
+}
+
+/**
+ * @description Explains why no light curve is being shown, keyed off the
+ * reason the route actually reported rather than an inference from the
+ * star's id (issue #18).
+ *
+ * Each branch says exactly as much as the archive actually told us:
+ * - `'no-coverage'` — MAST returned an EMPTY listing. The only branch
+ *   allowed to say neither mission pointed at the star.
+ * - `'no-product'` — MAST returned observations but no plottable PDC
+ *   light curve. The star WAS observed, so this copy claims only that we
+ *   have nothing to show; asserting non-observation here would overstate
+ *   the listing (the precision rule the project already applies to Gaia's
+ *   NOT_AVAILABLE ≠ a constant).
+ * - `'rate-limited'` / `'fetch-error'` — our failure to get an answer;
+ *   they say so without implying anything about the sky.
+ *
+ * When `reason` is missing (an older cached response, or a client-side
+ * fallback that couldn't classify) the copy stays deliberately
+ * non-committal. Unknown values land in that same catch-all branch, which
+ * is the safe direction: vaguer, never a stronger claim.
+ * @param reason Failure reason from the lightcurve response, if present.
+ * @returns A bordered notice card.
+ */
+function UnavailableNotice({ reason }: { reason?: LightcurveFailureReason }) {
+  const body =
+    reason === 'no-coverage' ? (
+      <>
+        <strong style={{ color: 'rgba(255,255,255,0.85)', letterSpacing: 1 }}>
+          NOT OBSERVED
+        </strong>
+        {' — '}
+        The MAST archive has no Kepler or TESS record for this star.
+        Neither mission pointed at it.
+      </>
+    ) : reason === 'no-product' ? (
+      <>
+        <strong style={{ color: 'rgba(255,255,255,0.85)', letterSpacing: 1 }}>
+          NO LIGHT CURVE
+        </strong>
+        {' — '}
+        MAST has observations of this star, but no usable light-curve
+        product among them. It was observed; there is just nothing here
+        to plot.
+      </>
+    ) : reason === 'rate-limited' ? (
+      <>
+        <strong style={{ color: 'rgba(255,255,255,0.85)', letterSpacing: 1 }}>
+          ARCHIVE BUSY
+        </strong>
+        {' — '}
+        MAST is temporarily rate-limiting requests, so the light curve
+        could not be retrieved. This says nothing about whether the star
+        was observed. Try again in a moment.
+      </>
+    ) : (
+      <>
+        <strong style={{ color: 'rgba(255,255,255,0.85)', letterSpacing: 1 }}>
+          DATA UNAVAILABLE
+        </strong>
+        {' — '}
+        The light curve could not be retrieved from NASA/MAST just now.
+        This is a problem reaching the archive, not a statement about the
+        star. Try again in a moment.
+      </>
+    )
+  return (
+    <div
+      style={{
+        background: 'rgba(255,255,255,0.03)',
+        border: '1px solid rgba(255,255,255,0.1)',
+        borderRadius: 6,
+        padding: '12px 14px',
+        fontSize: 10,
+        lineHeight: 1.6,
+        color: 'rgba(255,255,255,0.6)',
+      }}
+    >
+      {body}
+    </div>
+  )
 }
 
 /**
@@ -1803,44 +1891,12 @@ export default function AnomalyPanel() {
 
         {/* Light curve toggle + button. Always visible so any clicked star
             can be inspected — Hipparcos background clicks trigger an
-            on-demand MAST cone search via `selectStar`. Three states:
-            - Data available (real or synthetic): button opens the fullscreen chart.
-            - `unavailable` for a catalog star: MAST fetch failed for a
-              documented target; probably transient, tell the user that.
-            - `unavailable` for an on-demand star: MAST cone search found
-              no observation at that position; the star hasn't been
-              looked at by either mission. Different copy — this isn't
-              a temporary failure, it's a real coverage gap. */}
+            on-demand MAST cone search via `selectStar`. Either the data is
+            available (real or synthetic) and the button opens the
+            fullscreen chart, or it isn't and `<UnavailableNotice>` explains
+            why, keyed off the route's reported `reason`. */}
         {lightcurveLoading ? null : lightcurve?.source === 'unavailable' ? (
-          <div
-            style={{
-              background: 'rgba(255,255,255,0.03)',
-              border: '1px solid rgba(255,255,255,0.1)',
-              borderRadius: 6,
-              padding: '12px 14px',
-              fontSize: 10,
-              lineHeight: 1.6,
-              color: 'rgba(255,255,255,0.6)',
-            }}
-          >
-            {isOnDemandId(selectedStar.id) ? (
-              <>
-                <strong style={{ color: 'rgba(255,255,255,0.85)', letterSpacing: 1 }}>
-                  DATA UNAVAILABLE
-                </strong>
-                {' — '}
-                No light curve is currently available for this star. It may
-                not have been observed by Kepler or TESS, or the archive may
-                be temporarily rate-limited. Try again in a moment.
-              </>
-            ) : (
-              <>
-                Real light curve data could not be fetched from NASA/MAST.
-                This star exists and has documented anomalies, but the raw
-                data is temporarily unavailable.
-              </>
-            )}
-          </div>
+          <UnavailableNotice reason={lightcurve.reason} />
         ) : (
           <ActionButton
             label="VIEW LIGHT CURVE"

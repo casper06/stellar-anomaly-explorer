@@ -29,6 +29,34 @@ export {
 export type LightcurveSource = 'real' | 'unavailable' | 'synthetic'
 
 /**
+ * @description Why a light-curve fetch produced no data, accompanying
+ * `source: 'unavailable'`. Declared here (client-safe module) rather than
+ * in the route so the browser-side types and the server can share one
+ * definition — the route imports this.
+ *
+ * - `'rate-limited'`: MAST answered HTTP 429. Coverage is UNKNOWN; the
+ *   data may exist. Retryable.
+ * - `'no-coverage'`: MAST was successfully consulted and reported NOTHING
+ *   at all for this target/position — an empty listing. The strongest
+ *   confirmed absence, and the ONLY reason that licenses "neither mission
+ *   pointed at it" copy.
+ * - `'no-product'`: MAST was successfully consulted and DID return
+ *   observation rows, but none of them is a usable PDC light curve for
+ *   this target. The star WAS observed; we just have nothing plottable.
+ *   Distinct from `'no-coverage'` because saying "not observed" here would
+ *   assert more than the archive told us (same precision rule the project
+ *   applies to Gaia's NOT_AVAILABLE ≠ a constant).
+ * - `'fetch-error'`: anything else (non-429 HTTP errors, parse failures,
+ *   segment downloads failing, timeouts). We could not establish coverage
+ *   either way, so the UI must not claim the star was unobserved.
+ */
+export type LightcurveFailureReason =
+  | 'rate-limited'
+  | 'no-coverage'
+  | 'no-product'
+  | 'fetch-error'
+
+/**
  * @description Where the light curve data came from. Surfaced per-dip in
  * the UI so the user can cite/trust the source. All three fields are
  * short, display-ready strings.
@@ -70,6 +98,20 @@ export interface LightcurveResult {
   partial?: boolean
   /** @description Segment coverage `{ recovered, expected }`; drives the "N/M" in the PARTIAL badge. */
   segments?: { recovered: number; expected: number }
+  /**
+   * @description Why there is no data, when `source` is `'unavailable'`.
+   * Set by the route from what the MAST query actually reported — see
+   * {@link LightcurveFailureReason} for the full contract. In short:
+   * `'no-coverage'` is an empty listing (the only confirmed non-
+   * observation), `'no-product'` is observations without a plottable
+   * light curve, `'rate-limited'` is throttling, and `'fetch-error'`
+   * covers every indeterminate transport/parse failure. The panel
+   * branches its copy on this so it never asserts "not observed" off a
+   * transient failure. Undefined for real/synthetic data.
+   */
+  reason?: LightcurveFailureReason
+  /** @description Human-readable amplification of `reason` (logs/diagnostics, not user copy). */
+  error?: string
 }
 
 /**
@@ -135,6 +177,8 @@ export async function fetchLightcurve(
         gapDays: 5,
       }
     }
+    // We never reached our own route, so we learned nothing about MAST
+    // coverage — `fetch-error`, never `no-coverage`.
     return {
       times: [],
       flux: [],
@@ -142,6 +186,8 @@ export async function fetchLightcurve(
       provenance: UNAVAILABLE_PROVENANCE,
       mission: null,
       gapDays: 5,
+      reason: 'fetch-error',
+      error: err instanceof Error ? err.message : String(err),
     }
   }
 }
