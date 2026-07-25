@@ -33,6 +33,66 @@ const GLOSSARY: Record<string, string> = {
 }
 
 /**
+ * @description Plain-English expansions for Gaia DR3 variable-star class
+ * codes (`best_class_name` in `gaiadr3.vari_classifier_result`). The panel
+ * prints the raw code; this turns it into something readable.
+ *
+ * DELIBERATELY PARTIAL. DR3's `nTransits:5+` classifier publishes 24 class
+ * names, several of which are GROUPED labels carrying a literal pipe
+ * (`DSCT|GDOR|SXPHE`) rather than one type — so the key here must be the
+ * exact published string, never a split component. Codes absent from this
+ * map fall back to {@link GAIA_CLASS_FALLBACK}: the row still shows the
+ * code, just without an invented meaning. Do NOT add an entry unless its
+ * meaning is sourced from Gaia's own documentation — a wrong expansion of
+ * an astronomical class code is worse than no expansion.
+ *
+ * Coverage is weighted toward what a transit-search target list actually
+ * produces: KOI/TOI hosts are selected for photometric quietness, so the
+ * classifier table rarely contains them at all, and those that do appear
+ * skew to transit/rotation/eclipse types rather than pulsators.
+ *
+ * @see https://gea.esac.esa.int/archive/documentation/GDR3/Gaia_archive/chap_datamodel/sec_dm_variability_tables/ssec_dm_vari_classifier_result.html
+ * (published class-name list for the `nTransits:5+` classifier)
+ * @see Rimoldini, L., et al. 2023, A&A 674, A14 — *Gaia DR3: All-sky
+ * classification of 12.4 million variable sources into 25 classes*
+ * (arXiv:2211.17238); the classifier behind these labels.
+ */
+const GAIA_CLASS_GLOSSARY: Record<string, string> = {
+  EP: 'Star with exoplanet transits — Gaia’s classifier recognized the repeating dimming pattern of a transiting planet. Expected on a confirmed transit host, and not an independent confirmation: it is another pipeline reading the same kind of signal.',
+  RS: 'RS Canum Venaticorum variable — a close binary of late spectral type whose brightness varies from large starspots carried around by rotation, not from anything crossing in front of the star.',
+  SOLAR_LIKE: 'Solar-like variable — brightness changes driven by magnetic activity (spots, flares, rotation) of the kind our own Sun shows.',
+  ECL: 'Eclipsing binary — two stars orbiting so that one passes in front of the other, producing repeated dimmings. A classic look-alike for a planetary transit, at much greater depth.',
+  ELL: 'Ellipsoidal variable — a star tidally distorted into a non-spherical shape by a close companion, so the visible area (and brightness) changes through the orbit, with no eclipse required.',
+  'DSCT|GDOR|SXPHE': 'Pulsating star of the δ Scuti, γ Doradus, or SX Phoenicis type — the star itself swells and contracts. DR3 publishes these three as one grouped label rather than separating them.',
+  RR: 'RR Lyrae variable — an old, regularly pulsating star, long used as a standard candle for measuring distances.',
+  CEP: 'Cepheid variable — a luminous pulsating star whose pulse period tracks its true brightness; the classical distance indicator.',
+  LPV: 'Long-period variable — an evolved, cool giant varying slowly and with large amplitude over months to years.',
+  YSO: 'Young stellar object — a still-forming star, typically varying irregularly as surrounding material accretes onto it.',
+  CV: 'Cataclysmic variable — a close binary in which one star pulls material from its companion, producing sudden, dramatic brightenings.',
+  AGN: 'Active galactic nucleus — not a star at all, but the luminous accreting center of a distant galaxy.',
+  WD: 'White dwarf — the dense, Earth-sized remnant left when a star like the Sun exhausts its fuel.',
+}
+
+/**
+ * @description Shown for a Gaia class code we have no sourced expansion
+ * for. States the honest position — the code is real and belongs to a
+ * known finite list — without inventing a meaning for it.
+ */
+const GAIA_CLASS_FALLBACK =
+  'One of the 24 variable-star class labels published by Gaia DR3’s variability classifier. This app only expands the codes whose official definitions it carries; see the Gaia DR3 documentation for the full list.'
+
+/**
+ * @description Looks up the plain-English expansion for a Gaia class code.
+ * Matching is exact against the published class name (grouped labels such
+ * as `DSCT|GDOR|SXPHE` included), with case/whitespace normalization only.
+ * @param code Raw `best_class_name` from Gaia DR3.
+ * @returns The sourced expansion, or the honest fallback for unknown codes.
+ */
+function gaiaClassDescription(code: string): string {
+  return GAIA_CLASS_GLOSSARY[code.trim().toUpperCase()] ?? GAIA_CLASS_FALLBACK
+}
+
+/**
  * @description Color used to fill the central glow of the SVG star visualization, based on
  * the B-V color index. Mirrors the palette used in StarField but tuned for the
  * larger sphere where saturation reads stronger.
@@ -232,18 +292,31 @@ function tooltipShiftFor(badge: HTMLElement | null): TooltipShift {
  * @returns Inline badge, or null if the term has no glossary entry.
  */
 function InfoBadge({ term }: { term: string }) {
+  const text = GLOSSARY[term]
+  if (!text) return null
+  return <InfoBadgeText text={text} />
+}
+
+/**
+ * @description The (?) hover badge itself, taking its tooltip copy
+ * directly instead of looking it up in {@link GLOSSARY}. Split out from
+ * {@link InfoBadge} so copy computed at render time — a Gaia class-code
+ * expansion, which depends on the fetched value — can reuse the exact
+ * same badge, tooltip styling, and edge-collision handling rather than
+ * duplicating them.
+ * @param text Tooltip body. Callers must pass non-empty text.
+ * @returns The (?) badge with a hover/focus tooltip.
+ */
+function InfoBadgeText({ text }: { text: string }) {
   const [open, setOpen] = useState(false)
   const [shift, setShift] = useState<TooltipShift>(0)
   const badgeRef = useRef<HTMLSpanElement>(null)
-  const text = GLOSSARY[term]
 
   /** Measures the needed offset, then reveals the tooltip. */
   const reveal = () => {
     setShift(tooltipShiftFor(badgeRef.current))
     setOpen(true)
   }
-
-  if (!text) return null
 
   return (
     <span
@@ -2270,11 +2343,16 @@ function GaiaProfile({
       ) : null}
 
       {/* Bonus ML classifier — shown ONLY when present, exactly like
-          SIMBAD's alt-names. No empty state, no "no classifier" row. */}
+          SIMBAD's alt-names. No empty state, no "no classifier" row.
+          The raw code (`EP`, `RS`, `DSCT|GDOR|SXPHE`, …) is meaningless
+          without expansion, so it carries a (?) badge; unknown codes still
+          render the code and get an honest "we don't expand this one"
+          tooltip rather than a fabricated meaning. */}
       {gaia.classifier && (
         <GaiaRow label="GAIA VARIABLE-STAR CLASS" tone="neutral">
           Gaia&apos;s variability classifier labeled this source{' '}
           <span style={{ color: 'white', fontWeight: 700 }}>{gaia.classifier.className}</span>
+          <InfoBadgeText text={gaiaClassDescription(gaia.classifier.className)} />
           {gaia.classifier.score !== null
             ? ` (confidence ${(gaia.classifier.score * 100).toFixed(0)}%).`
             : '.'}
