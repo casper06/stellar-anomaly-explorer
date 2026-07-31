@@ -9,7 +9,7 @@
  * FLUX-column WCS, the aperture bitmask, the gzip path, and the
  * documented error paths.
  *
- * Run via `npm run test:unit` (plain Node ≥ 22.6, node:test + native
+ * Run via `npm run test:unit` (plain Node ≥ 22.15, node:test + native
  * type stripping — no framework).
  */
 import { describe, it } from 'node:test'

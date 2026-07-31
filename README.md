@@ -105,7 +105,7 @@ First load fetches the catalogs (~1 s for Hipparcos, ~5–15 s per mission catal
 npm run test:data
 ```
 
-Runs the dip detector + curve classifier against frozen real-data fixtures (Tabby's Star and three KOIs) with hand-verified expected values, and fails loudly on any drift. **Run it before and after touching** `anomalyDetector.ts`, `curveClassifier.ts`, `fitsReader.ts`, or the `/api/lightcurve` fetch/normalization layer. Requires Node ≥ 22.6 (runs TypeScript via native type stripping — no test framework).
+Runs the dip detector + curve classifier against frozen real-data fixtures (Tabby's Star and three KOIs) with hand-verified expected values, and fails loudly on any drift. **Run it before and after touching** `anomalyDetector.ts`, `curveClassifier.ts`, `fitsReader.ts`, or the `/api/lightcurve` fetch/normalization layer. Requires Node ≥ 22.15 (runs TypeScript via native type stripping, and the test resolver hooks need `module.registerHooks()`, added in 22.15.0 — no test framework). Development and CI pin 24.18.0 via `.nvmrc`.
 
 ## Data integrity principles
 

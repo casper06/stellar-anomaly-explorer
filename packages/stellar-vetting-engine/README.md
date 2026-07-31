@@ -33,7 +33,7 @@ Not yet published to npm. From this repo:
 cd packages/stellar-vetting-engine
 npm install        # dev tooling only (tsup, typescript)
 npm run build      # dist/index.js (ESM) + dist/index.cjs (CJS) + dist/index.d.ts
-npm test           # unit + frozen real-data regression suites (offline, Node ≥ 22.6)
+npm test           # unit + frozen real-data regression suites (offline, Node ≥ 22.15)
 ```
 
 ## Quick start
@@ -151,7 +151,10 @@ baseline). `NaN` entries are tolerated everywhere and skipped.
 recovery tests, and two frozen real-data regression suites (Kepler PDC
 curves and TPF pixel stamps captured from NASA/MAST, with the NASA
 ground-truth values embedded in each fixture). Everything runs offline on
-plain Node ≥ 22.6 (`node --test` + native type stripping — no framework).
+plain Node ≥ 22.15 (`node --test` + native type stripping — no framework).
+The floor is 22.15 rather than 22.6 (which covers type stripping alone)
+because `scripts/register-ts-resolver.mjs` calls `module.registerHooks()`,
+added in 22.15.0 / 24.0.0. Development and CI pin 24.18.0.
 
 ## License
 

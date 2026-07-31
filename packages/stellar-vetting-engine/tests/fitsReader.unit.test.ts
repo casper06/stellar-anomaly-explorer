@@ -7,7 +7,7 @@
  * arithmetic, NaN→null propagation, multi-block headers, and the two
  * documented error paths.
  *
- * Run via `npm run test:unit` (plain Node ≥ 22.6, node:test + native
+ * Run via `npm run test:unit` (plain Node ≥ 22.15, node:test + native
  * type stripping — no framework).
  */
 import { describe, it } from 'node:test'

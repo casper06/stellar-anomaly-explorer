@@ -4,7 +4,7 @@
  * idempotence short-circuits, cursor resets, and localStorage
  * persistence via a shimmed global. No browser required.
  *
- * Run via `npm run test:unit` (plain Node ≥ 22.6, node:test + native
+ * Run via `npm run test:unit` (plain Node ≥ 22.15, node:test + native
  * type stripping — no framework).
  */
 import { describe, it, beforeEach, afterEach } from 'node:test'

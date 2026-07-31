@@ -33,7 +33,7 @@
  * measured values, re-verify them by hand (against the `nasa` block each
  * fixture embeds), then update EXPECTED below.
  *
- * Run via `npm run test:data` (plain Node ≥ 22.6, no framework, offline).
+ * Run via `npm run test:data` (plain Node ≥ 22.15, no framework, offline).
  */
 import { readFileSync } from 'node:fs'
 import { gunzipSync } from 'node:zlib'
