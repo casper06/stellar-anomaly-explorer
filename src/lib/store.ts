@@ -147,6 +147,14 @@ export interface FlyToCommand {
   dec: number
   // Monotonic id so the camera reacts even when target coords repeat
   id: number
+  /**
+   * Whether the fly-to should also ease the zoom in on arrival. `'target'`
+   * (the default) means the destination is a specific star, so the camera
+   * settles at a close-up FOV; `'region'` means the destination is an area
+   * (a quadrant cell, a minimap position) where zooming past the region's
+   * own extent would be wrong, so the current FOV is held.
+   */
+  zoomMode?: 'target' | 'region'
 }
 
 interface AppState {
@@ -337,7 +345,7 @@ interface AppState {
   setToiError: (err: string | null) => void
   setAnomalyStars: (stars: Star[]) => void
   setNextAnomalyCursor: (i: number) => void
-  requestFlyTo: (ra: number, dec: number) => void
+  requestFlyTo: (ra: number, dec: number, zoomMode?: 'target' | 'region') => void
   /**
    * @description Adds a star id to `visitedIds` (no-op if already
    * present) and persists the updated set to localStorage.
@@ -447,7 +455,8 @@ export const useStore = create<AppState>((set) => ({
   setToiError: (err) => set({ toiError: err }),
   setAnomalyStars: (stars) => set({ anomalyStars: stars, nextAnomalyCursor: -1 }),
   setNextAnomalyCursor: (i) => set({ nextAnomalyCursor: i }),
-  requestFlyTo: (ra, dec) => set({ flyTo: { ra, dec, id: ++flyToCounter } }),
+  requestFlyTo: (ra, dec, zoomMode = 'target') =>
+    set({ flyTo: { ra, dec, id: ++flyToCounter, zoomMode } }),
   markVisited: (starId) => set(state => {
     if (state.visitedIds.has(starId)) return state
     // New Set so React-subscribed components see a referential change
