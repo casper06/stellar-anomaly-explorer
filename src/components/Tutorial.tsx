@@ -325,6 +325,52 @@ const SLIDES: Slide[] = [
     ),
   },
   {
+    title: 'FOUR INSTRUMENTS, NEVER MERGED',
+    body: (
+      <>
+        <p style={P}>
+          Some of what the panel shows you does not come from the light
+          curve at all. <Em>NASA&apos;s score</Em>{' '}is that archive&apos;s
+          own vetting verdict, computed by a different pipeline from the dip
+          detector and period search in this app.
+        </p>
+        <p style={P}>
+          They are deliberately <Em>never combined into one number</Em>. A
+          low NASA score sitting next to busy local detections is not a
+          contradiction — it is two instruments measuring different things,
+          and collapsing them would destroy the meaning of both.
+        </p>
+        <p style={P}>
+          <Em>Gaia DR3</Em>{' '}adds a third reading, when the star has one:
+          how well its position fits a single star moving alone{' '}
+          <Em>(RUWE)</Em>, whether its velocity shifts between visits, and
+          whether Gaia&apos;s own variability processing flagged it.
+        </p>
+        <p style={P}>
+          Read the Gaia rows as <Em color="#f4a261">prompts, not verdicts</Em>.
+          An elevated RUWE is consistent with an unseen companion without
+          confirming one — and &quot;not flagged as variable&quot; is{' '}
+          <Em>not</Em>{' '}a statement that the star is steady. Gaia DR3 makes
+          no &quot;constant&quot; determination, and several famous variables
+          sit unflagged there.
+        </p>
+        <p style={P}>
+          Where a reading is <Em>missing</Em>{' '}it says so in those words.
+          &quot;Not evaluated — no spectroscopic data&quot; means{' '}
+          <Em>the check could not run</Em>, which is a different thing from
+          the check running and finding nothing.
+        </p>
+        <p style={P}>
+          Occasionally the automatic classification of a curve{' '}
+          <Em color="#f4a261">gives up</Em>{' '}— you will see &quot;could not
+          classify this light curve — the analysis timed out.&quot; The
+          measurement is abandoned, never guessed at; the curve itself is
+          still shown to you unchanged, exactly as the archive served it.
+        </p>
+      </>
+    ),
+  },
+  {
     title: 'REPORT WHAT YOU FIND',
     body: (
       <>
