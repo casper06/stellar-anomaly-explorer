@@ -289,6 +289,42 @@ const SLIDES: Slide[] = [
     ),
   },
   {
+    title: 'A SECOND KIND OF EVIDENCE',
+    body: (
+      <>
+        <p style={P}>
+          A light curve tells you <Em>when</Em>{' '}the star dimmed and{' '}
+          <Em>how much</Em>. It cannot tell you <Em>where</Em>{' '}the dimming
+          came from. In a crowded field the light of several stars falls
+          into the same pixels, so a dip recorded on your target may
+          actually belong to a neighbor blended with it.
+        </p>
+        <p style={P}>
+          <Em>Pixel-level vetting</Em>{' '}answers that second question. It
+          downloads the raw camera pixels around the star and compares
+          images taken during the dimming against images taken outside it,
+          measuring whether the light that went missing came from the
+          target&apos;s own position or from somewhere slightly offset.
+        </p>
+        <p style={P}>
+          It runs <Em>only when you ask</Em>{' '}— the button in the light
+          curve viewer. Each check pulls tens of megabytes of pixel data
+          from NASA&apos;s archive and takes ten seconds to a minute, which
+          is far too heavy to run automatically on every star you click.
+        </p>
+        <p style={P}>
+          Sometimes it <Em color="#f4a261">refuses to answer</Em>. On a very
+          bright star the pixels saturate and light bleeds along the
+          detector&apos;s columns, making any position measurement
+          meaningless. The check reports that it declined rather than
+          returning a number it can&apos;t stand behind — the same rule as
+          the rest of the app: <Em>say what is missing, never fill the gap
+          with something invented</Em>.
+        </p>
+      </>
+    ),
+  },
+  {
     title: 'REPORT WHAT YOU FIND',
     body: (
       <>
