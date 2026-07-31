@@ -1615,10 +1615,13 @@ label / peak time / depth, best-fit period, odd/even verdict +
 relative depth difference, secondary-eclipse verdict + depth). Fails
 loudly (per-field diff + exit 1) on any drift.
 
-Plain Node ≥ 22.6 executes the TS via native type stripping — no
+Plain Node ≥ 22.15 executes the TS via native type stripping — no
 test framework, no extra deps (`allowImportingTsExtensions` was
-added to tsconfig for the `.ts` imports). When to run it: see the
-**pre-change checklist** in the Testing section below.
+added to tsconfig for the `.ts` imports). The floor is 22.15, not
+22.6 (which covers type stripping alone), because the resolver hooks
+call `module.registerHooks()`, added in 22.15.0 / 24.0.0; dev and CI
+pin 24.18.0 via `.nvmrc`. When to run it: see the **pre-change
+checklist** in the Testing section below.
 
 After an INTENTIONAL algorithm change: `npm run test:data -- --print`
 dumps the newly-measured values; re-verify them by hand, then update
@@ -1687,7 +1690,7 @@ Engine tests and the frozen fixtures LIVE in the package
 
 **Layer 1 — unit (`npm run test:unit`)**: `node --test` over
 `src/lib/__tests__/*.unit.test.ts`. Zero dependencies — plain Node
-≥ 22.6 native type stripping plus `scripts/register-ts-resolver.mjs`,
+≥ 22.15 native type stripping plus `scripts/register-ts-resolver.mjs`,
 a module hook that retries the app's bundler-style extensionless
 relative imports with `.ts` (Node's ESM loader alone rejects them;
 `test:data` uses the same hook since the classifier now imports

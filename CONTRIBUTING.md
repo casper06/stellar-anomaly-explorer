@@ -14,8 +14,11 @@ operational quick-reference used during day-to-day development).
 
 Requirements:
 
-- **Node.js ≥ 22.6** — the test layers run TypeScript through Node's
-  native type stripping, no build step or test framework needed.
+- **Node.js ≥ 22.15** — the test layers run TypeScript through Node's
+  native type stripping, no build step or test framework needed. The
+  floor is 22.15 (not 22.6, which covers type stripping alone) because
+  the test resolver hooks call `module.registerHooks()`, added in
+  22.15.0 / 24.0.0. Development and CI pin **24.18.0** via `.nvmrc`.
 - npm (bundled with Node).
 
 ```bash
@@ -42,9 +45,9 @@ Three layers, all runnable locally:
 
 | Command | Layer | Needs |
 |---|---|---|
-| `npm run test:unit` | Unit tests (`node --test`, zero deps) | Node ≥ 22.6 |
-| `npm run test:data` | Data regression against frozen real-data fixtures | Node ≥ 22.6 |
-| `npm test` | `test:unit` + `test:data` — the fast offline gate (~5 s) | Node ≥ 22.6 |
+| `npm run test:unit` | Unit tests (`node --test`, zero deps) | Node ≥ 22.15 |
+| `npm run test:data` | Data regression against frozen real-data fixtures | Node ≥ 22.15 |
+| `npm test` | `test:unit` + `test:data` — the fast offline gate (~5 s) | Node ≥ 22.15 |
 | `npm run test:e2e` | Playwright end-to-end (boots or reuses the dev server) | one-time `npx playwright install chromium` |
 | `npm run test:external-health` | Live probe of the 5 external services (contract checks) | network |
 

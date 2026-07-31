@@ -6,7 +6,7 @@
  * the stale response resolving AFTER the newer pick must be discarded
  * (no lightcurve overwrite, no premature clearing of the loading flag).
  *
- * Run via `npm run test:unit` (plain Node ≥ 22.6, node:test + native
+ * Run via `npm run test:unit` (plain Node ≥ 22.15, node:test + native
  * type stripping — no framework, no browser).
  */
 import { describe, it, beforeEach, afterEach } from 'node:test'

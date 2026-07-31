@@ -6,7 +6,7 @@
  * Any drift — an edit to `anomalyDetector.ts`, `curveClassifier.ts`, or a
  * change in how the MAST fetch layer normalizes segments — fails loudly.
  *
- * Run with: `npm run test:data` (plain Node ≥ 22.6; TypeScript runs via
+ * Run with: `npm run test:data` (plain Node ≥ 22.15; TypeScript runs via
  * Node's native type stripping, no test framework needed).
  *
  * To inspect the currently-measured values (e.g. after an INTENTIONAL

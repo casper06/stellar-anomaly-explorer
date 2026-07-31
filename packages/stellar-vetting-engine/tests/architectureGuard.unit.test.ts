@@ -23,7 +23,7 @@
  * - `require(...)` / dynamic `import(...)` are scanned too, so the rule
  *   can't be dodged.
  *
- * Run via the package's `npm test` (plain Node ≥ 22.6, node:test).
+ * Run via the package's `npm test` (plain Node ≥ 22.15, node:test).
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
