@@ -9,16 +9,22 @@ import { useStore } from '@/lib/store'
 import { selectStarAndFetchCurve } from '@/lib/selectStar'
 import type { CurvePattern } from '@/lib/curveClassifier'
 import { RADAR_COLOR_HEX } from '@/lib/radarPalette'
+import {
+  FOV_MAX,
+  FOV_MIN,
+  AUTO_SELECT_FOV,
+  FLY_TO_ARRIVAL_FOV,
+  shouldFlyToZoom,
+} from '@/lib/flyToZoom'
 
 const STAR_SPHERE_RADIUS = 500
 // Camera orbits the origin at a fixed radius — "zoom" is done via FOV, not by
 // moving the camera. This matches how telescopes/binoculars work: narrowing the
 // field of view brings distant objects apparently closer without translation.
 const CAMERA_RADIUS = 0.1
-const FOV_MAX = 75   // widest field — "naked eye"
-const FOV_MIN = 20   // narrowest field — "binoculars"
-// FOV at or below this triggers auto-selection of a centered anomaly
-const AUTO_SELECT_FOV = 28
+// FOV_MAX / FOV_MIN / AUTO_SELECT_FOV / FLY_TO_ARRIVAL_FOV and the
+// `shouldFlyToZoom` policy live in @/lib/flyToZoom so the plain-Node unit
+// suite can exercise them without importing this Three.js module.
 // Pixel radius around cursor (in screen space) inside which a label appears
 const LABEL_HOVER_RADIUS_PX = 80
 
@@ -1285,10 +1291,32 @@ function CameraSync({ stars }: { stars: CatalogStar[] }) {
 // ─── FOV-based zoom: wheel changes camera.fov instead of moving the camera ──
 
 /**
+ * @description Shared handle onto `FovZoomController`'s zoom target, so a
+ * fly-to can steer the zoom without writing `camera.fov` itself.
+ *
+ * `FovZoomController` owns `camera.fov`: its `useFrame` chases `targetFov`
+ * every frame and is mounted AFTER `FlyToController`, so it runs second and
+ * would overwrite any direct `camera.fov` write from the fly-to within the
+ * same frame. Routing the fly-to's zoom through the same target keeps one
+ * writer, and means the wheel and the fly-to can never disagree about where
+ * the zoom is heading — a mid-flight scroll simply retargets both.
+ */
+const fovZoomHandle: {
+  /** Reads the current zoom target, or null before the controller mounts. */
+  getTarget: (() => number) | null
+  /** Sets the zoom target (clamped by the controller's own limits). */
+  setTarget: ((fov: number) => void) | null
+} = { getTarget: null, setTarget: null }
+
+/**
  * @description Implements telescope-style zoom: wheel events modify `camera.fov` between
  * FOV_MIN and FOV_MAX instead of translating the camera. Each frame the
  * actual FOV interpolates toward the target so the zoom feels smooth and
  * continuous instead of stepped.
+ *
+ * Also publishes its zoom target through {@link fovZoomHandle} so
+ * `FlyToController` can ease the zoom in as part of a fly-to without
+ * competing for ownership of `camera.fov`.
  * @param containerRef Element to attach the `wheel` listener to.
  * @returns Null — pure side effects.
  */
@@ -1311,7 +1339,19 @@ function FovZoomController({ containerRef }: { containerRef: React.RefObject<HTM
       targetFovRef.current = Math.min(FOV_MAX, Math.max(FOV_MIN, targetFovRef.current * factor))
     }
     el.addEventListener('wheel', onWheel, { passive: false })
-    return () => { el.removeEventListener('wheel', onWheel) }
+
+    // Publish the zoom target so FlyToController can drive it. Clamping
+    // lives here, with the wheel path, so every writer obeys the same limits.
+    fovZoomHandle.getTarget = () => targetFovRef.current
+    fovZoomHandle.setTarget = (fov: number) => {
+      targetFovRef.current = Math.min(FOV_MAX, Math.max(FOV_MIN, fov))
+    }
+
+    return () => {
+      el.removeEventListener('wheel', onWheel)
+      fovZoomHandle.getTarget = null
+      fovZoomHandle.setTarget = null
+    }
   }, [camera, containerRef])
 
   useFrame(() => {
@@ -1425,6 +1465,15 @@ function AnomalyHoverTracker({
  * direction (spherical theta/phi, radius held constant) toward the target
  * RA/Dec over ~1 second with easeInOutCubic. Theta is wrapped into the
  * shortest arc so the camera never spins the long way around.
+ *
+ * The same tween also eases the ZOOM in, so arriving somewhere reads as one
+ * coordinated motion instead of a pan at constant magnification. The zoom is
+ * driven through {@link fovZoomHandle} rather than by writing `camera.fov`
+ * directly — see that handle's note on why. Zoom easing applies only to
+ * `zoomMode: 'target'` commands (flying to a specific star); `'region'`
+ * commands (quadrant cell, minimap position) hold the current FOV, since
+ * zooming past a region's own extent would overshoot what the user asked
+ * to look at.
  * @param controlsRef Ref to the OrbitControls instance, updated each frame so it stays in sync with the tweened camera.
  * @returns Null — pure side effects.
  */
@@ -1446,6 +1495,10 @@ function FlyToController({
     startTime: number
     duration: number
     id: number
+    /** Zoom target at tween start; null when this fly-to leaves zoom alone. */
+    fromFov: number | null
+    /** Zoom target on arrival; null when this fly-to leaves zoom alone. */
+    toFov: number | null
   } | null>(null)
 
   // The camera orbits the origin at a tiny CAMERA_RADIUS and OrbitControls
@@ -1469,6 +1522,16 @@ function FlyToController({
     let dTheta = tgt.theta - cur.theta
     while (dTheta > Math.PI) dTheta -= 2 * Math.PI
     while (dTheta < -Math.PI) dTheta += 2 * Math.PI
+    // Zoom leg. Read the live zoom TARGET (not camera.fov) as the start
+    // point: if the user is mid-wheel when the fly-to begins, the target is
+    // where the zoom is actually heading, so starting there avoids a visible
+    // hitch back to the in-flight value.
+    const curFovTarget = fovZoomHandle.getTarget?.() ?? (camera as THREE.PerspectiveCamera).fov
+    // Policy (mode + only-ever-tighten) lives in @/lib/flyToZoom and is unit
+    // tested there; the handle check is this module's own wiring concern.
+    const shouldZoom =
+      fovZoomHandle.setTarget !== null && shouldFlyToZoom(curFovTarget, flyTo.zoomMode)
+
     tweenRef.current = {
       fromTheta: cur.theta,
       fromPhi: cur.phi,
@@ -1478,6 +1541,8 @@ function FlyToController({
       startTime: performance.now(),
       duration: 1000,
       id: flyTo.id,
+      fromFov: shouldZoom ? curFovTarget : null,
+      toFov: shouldZoom ? FLY_TO_ARRIVAL_FOV : null,
     }
   }, [flyTo, camera])
 
@@ -1496,6 +1561,14 @@ function FlyToController({
     camera.position.setFromSpherical(s)
     camera.lookAt(0, 0, 0)
     controlsRef.current?.update()
+
+    // Zoom rides the SAME eased t as the pan, so the two read as one motion
+    // rather than two animations that happen to overlap. Writing the target
+    // (not camera.fov) leaves FovZoomController's own smoothing in the path,
+    // which is what makes the arrival settle instead of stopping dead.
+    if (tween.fromFov !== null && tween.toFov !== null) {
+      fovZoomHandle.setTarget?.(tween.fromFov + (tween.toFov - tween.fromFov) * eased)
+    }
 
     if (t >= 1) {
       tweenRef.current = null

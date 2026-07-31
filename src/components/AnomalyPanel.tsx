@@ -673,7 +673,8 @@ function LightCurveFullscreen({
             }}
           >
             Could not classify this light curve — the analysis timed out. The
-            data is shown below unchanged.
+            data is shown below unchanged, and no partial result was guessed
+            at.
           </div>
         )}
         {/* Top bar — fixed-height header */}

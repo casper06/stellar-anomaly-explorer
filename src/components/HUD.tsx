@@ -8,6 +8,7 @@ import TutorialLauncher from './Tutorial'
 import { constellationAt } from '@/lib/constellations'
 import { selectStarAndFetchCurve } from '@/lib/selectStar'
 import { RADAR_COLOR_HEX } from '@/lib/radarPalette'
+import { findNearestAnomalyIndex } from '@/lib/nearestAnomaly'
 import type { CurvePattern } from '@/lib/curveClassifier'
 
 /**
@@ -234,21 +235,25 @@ export default function HUD() {
   }
 
   function goToNearestAnomaly() {
-    // Angular nearest on the celestial sphere: pick the anomaly whose
-    // direction has the highest dot product with the camera's current
-    // pointing vector. Scans the full catalog (NOT view-filtered) —
-    // this button is for "take me to the nearest anomaly even if I
-    // can't see one from here".
+    // Angular nearest on the celestial sphere (see `findNearestAnomalyIndex`).
+    // Scans the full catalog, NOT view-filtered — this button is for "take
+    // me to the nearest anomaly even if I can't see one from here".
+    //
+    // The currently-selected star is excluded: "nearest" is measured against
+    // `cameraTarget`, which CameraSync rewrites every frame from where the
+    // camera actually points, so without the exclusion the answer in a dense
+    // field is usually the star already selected and the button flies to
+    // where it already is (issue #22, bug 1).
     if (navTargets.length === 0) return
-    const cam = toUnit(cameraTarget.ra, cameraTarget.dec)
-    let bestIdx = 0
-    let bestDot = -Infinity
-    for (let i = 0; i < navTargets.length; i++) {
-      const s = navTargets[i]
-      const v = toUnit(s.ra, s.dec)
-      const dot = v.x * cam.x + v.y * cam.y + v.z * cam.z
-      if (dot > bestDot) { bestDot = dot; bestIdx = i }
-    }
+    const bestIdx = findNearestAnomalyIndex(
+      navTargets,
+      cameraTarget.ra,
+      cameraTarget.dec,
+      selectedStar?.id,
+    )
+    // -1 means every candidate was excluded — i.e. the selected star is the
+    // only anomaly there is. Nowhere else to go, so do nothing.
+    if (bestIdx === -1) return
     const best = navTargets[bestIdx]
     requestFlyTo(best.ra, best.dec)
     // Sync cursor to this position so a subsequent NEXT click advances
@@ -609,7 +614,9 @@ export default function HUD() {
           anomalyStars={anomalyStars}
           visitedIds={visitedIds}
           flaggedIds={flaggedIds}
-          onPick={(ra, dec) => requestFlyTo(ra, dec)}
+          // A quadrant is an AREA, not a target: zooming to a star-level FOV
+          // would overshoot the cell the user asked to see.
+          onPick={(ra, dec) => requestFlyTo(ra, dec, 'region')}
         />
       </div>
 
@@ -617,7 +624,9 @@ export default function HUD() {
       <Minimap
         ra={cameraTarget.ra}
         dec={cameraTarget.dec}
-        onPick={(targetRa, targetDec) => requestFlyTo(targetRa, targetDec)}
+        // Same reasoning as the quadrant panel: the minimap picks a REGION of
+        // sky to look at, not a specific star to close in on.
+        onPick={(targetRa, targetDec) => requestFlyTo(targetRa, targetDec, 'region')}
         panelOpen={selectedStar !== null}
       />
 
