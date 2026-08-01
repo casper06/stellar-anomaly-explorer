@@ -1,5 +1,5 @@
 'use client'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, type Star } from '@/lib/store'
 import { KNOWN_ANOMALIES } from '@/lib/starCatalog'
 import { ALL_QUADRANT_IDS, quadrantCenter } from '@/lib/quadrants'
@@ -8,7 +8,10 @@ import TutorialLauncher from './Tutorial'
 import { constellationAt } from '@/lib/constellations'
 import { selectStarAndFetchCurve } from '@/lib/selectStar'
 import { RADAR_COLOR_HEX } from '@/lib/radarPalette'
-import { findNearestAnomalyIndex } from '@/lib/nearestAnomaly'
+import { angularSeparationDeg, findNearestAnomalyIndex, pushNavHistory } from '@/lib/nearestAnomaly'
+// Read-only here: the NEXT diagnostic reports what the fly-to WILL do with
+// the zoom; it does not change it.
+import { FLY_TO_ARRIVAL_FOV, FLY_TO_ZOOM_MARGIN_FOV } from '@/lib/flyToZoom'
 import type { CurvePattern } from '@/lib/curveClassifier'
 
 /**
@@ -30,6 +33,31 @@ const QUADRANT_PANEL_FOV_THRESHOLD = 45
  * instead). 300px panel + the standard 24px gutter.
  */
 const PANEL_CLEARANCE_RIGHT = 324
+
+/**
+ * @description Zoom behavior for NEXT ANOMALY ▸ — deliberately `'region'`,
+ * i.e. pan without touching the zoom, matching the quadrant panel and the
+ * minimap rather than the `'target'` default used by GO TO NEAREST, the
+ * flagged list, and search.
+ *
+ * NEXT is a TOUR button: it surveys what is already in view, cycling by
+ * score rank, rather than closing in on one chosen star. Two reasons it
+ * must not re-zoom:
+ *
+ * 1. Its candidate set is FOV-dependent (`visibleAnomalyIndices` filters to
+ *    a cone of `halfFov × 1.3`). Easing the zoom in would shrink the very
+ *    set the next press picks from — a self-narrowing funnel: from a 50°
+ *    overview, one press collapses the visible sky area to ~28% of what it
+ *    was, and each further press narrows it again.
+ * 2. It changes the button's character between presses, which reads as
+ *    "jumping around" on top of the score-rank ordering it has always had.
+ *
+ * This was NOT a considered choice when `'region'` was introduced for the
+ * quadrant panel and minimap (issue #22, bug 2) — NEXT was swept into the
+ * `'target'` default without being opened. Naming the constant here so the
+ * decision is explicit and testable rather than implicit in an argument.
+ */
+export const NEXT_ANOMALY_ZOOM_MODE = 'region' as const
 
 const ONBOARDING_KEY = 'sae:onboarded:v1'
 
@@ -192,6 +220,17 @@ export default function HUD() {
   // the merge lands.
   const navTargets = anomalyStars.length > 0 ? anomalyStars : KNOWN_ANOMALIES
 
+  // Rolling buffer of the last stars GO TO NEAREST ANOMALY flew to, so
+  // the button can't ping-pong between two mutually-nearest stars (or
+  // cycle among three). Written ONLY by `goToNearestAnomaly` — a manual
+  // search, a sky click, or a flagged-list pick must never feed it, or
+  // this quietly becomes the visited-history tracking that #22 descoped.
+  //
+  // A ref, not state: nothing renders from it, and re-rendering on nav
+  // would be wasted work. In-memory only — a reload starting fresh is
+  // fine, this is a UX nicety and not app state worth persisting.
+  const nearestNavHistoryRef = useRef<string[]>([])
+
   /**
    * @description Computes the unit-vector for a celestial position.
    * Pulled out so both nav handlers and the in-view filter share one
@@ -244,17 +283,57 @@ export default function HUD() {
     // camera actually points, so without the exclusion the answer in a dense
     // field is usually the star already selected and the button flies to
     // where it already is (issue #22, bug 1).
+    // Anchored to the SELECTED STAR's catalog position, not to
+    // `cameraTarget`. `cameraTarget` is a pointing DIRECTION, not a star:
+    // it coincides with one only when something explicitly flew the camera
+    // there (search pick, flagged list). A direct sky click never moves the
+    // camera, so anchoring to it measured from wherever the camera happened
+    // to point — observed live as "from RA 290.287°/Dec 46.432° (empty
+    // sky)" right after clicking TOI 5281.01.
+    //
+    // Reference and exclusion now key off the SAME source, so they cannot
+    // diverge the way camera-vs-selection did. Consequence, and it is the
+    // intended product behavior: repeated presses without re-selecting keep
+    // measuring from the ORIGINAL star, walking outward through its nearest
+    // neighbours via the history buffer, instead of drifting with wherever
+    // each fly-to left the camera. Deterministic and repeatable.
+    //
+    // The buffer is what stops an isolated mutually-nearest pair from
+    // ping-ponging forever (TOI 3518.01 ↔ TOI 3516.01) and breaks 3-cycles.
     if (navTargets.length === 0) return
+    const origin = selectedStar ?? cameraTarget
     const bestIdx = findNearestAnomalyIndex(
       navTargets,
-      cameraTarget.ra,
-      cameraTarget.dec,
-      selectedStar?.id,
+      origin.ra,
+      origin.dec,
+      [selectedStar?.id, ...nearestNavHistoryRef.current],
     )
-    // -1 means every candidate was excluded — i.e. the selected star is the
-    // only anomaly there is. Nowhere else to go, so do nothing.
+    // -1 means every candidate was excluded — the selection plus the
+    // recent-nav buffer cover the whole (tiny) catalog. Nowhere new to go,
+    // so do nothing, exactly as when the selection was the only anomaly.
+    // Never fall back to an arbitrary star.
     if (bestIdx === -1) return
     const best = navTargets[bestIdx]
+    // Dev-only verification aid. A surprising-looking jump is usually the
+    // exclusion buffer pushing the search outward once the near neighbours
+    // are used up, not a bad pick — this line makes that readable at a
+    // glance (true separation, whether the full catalog or the 11-seed
+    // fallback was in play, and exactly what was excluded on this press)
+    // instead of needing a manual catalog investigation. Logged BEFORE the
+    // history push, so `excluded` reflects the search that just ran.
+    if (process.env.NODE_ENV === 'development') {
+      // Origin label matches the actual search anchor, so the distance
+      // printed is always the distance FROM the star named here.
+      const originLabel = selectedStar
+        ? selectedStar.name
+        : `RA ${cameraTarget.ra.toFixed(3)}° / Dec ${cameraTarget.dec.toFixed(3)}° (no selection, using camera)`
+      console.log(
+        `[nav] NEAREST from ${originLabel} → ${best.name} · ` +
+        `${angularSeparationDeg(origin, best).toFixed(3)}° · candidates=${navTargets.length} · ` +
+        `excluded=[${[selectedStar?.id, ...nearestNavHistoryRef.current].filter(Boolean).join(', ')}]`
+      )
+    }
+    nearestNavHistoryRef.current = pushNavHistory(nearestNavHistoryRef.current, best.id)
     requestFlyTo(best.ra, best.dec)
     // Sync cursor to this position so a subsequent NEXT click advances
     // from the visible target rather than jumping somewhere arbitrary.
@@ -296,8 +375,20 @@ export default function HUD() {
     let pick = visible.find(i => i > nextAnomalyCursor)
     if (pick === undefined) pick = visible[0]
     const target = anomalyStars[pick]
+    // Dev-only diagnostic (matches the NEAREST log). NEXT holds the zoom
+    // (see NEXT_ANOMALY_ZOOM_MODE), so FOV is reported as held rather than
+    // easing; the jump distance and in-view count remain the interesting
+    // numbers when the cycle feels large.
+    if (process.env.NODE_ENV === 'development') {
+      console.log(
+        `[nav] NEXT → ${target.name} · ` +
+        `jump ${angularSeparationDeg(cameraTarget, target).toFixed(3)}° · ` +
+        `fov ${zoom.toFixed(1)}° (held, zoomMode=region) · ` +
+        `inView=${visible.length} · rank=${pick} of ${anomalyStars.length}`
+      )
+    }
     setNextAnomalyCursor(pick)
-    requestFlyTo(target.ra, target.dec)
+    requestFlyTo(target.ra, target.dec, NEXT_ANOMALY_ZOOM_MODE)
   }
 
   const statusColor =
