@@ -24,6 +24,8 @@
  */
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import * as path from 'node:path'
 import {
   shouldFlyToZoom,
   FLY_TO_ARRIVAL_FOV,
@@ -126,6 +128,94 @@ describe('fly-to zoom constants — relationships the behavior depends on', () =
 
   it('the margin is positive, so the tighten-only guard has a real band', () => {
     assert.ok(FLY_TO_ZOOM_MARGIN_FOV > 0)
+  })
+})
+
+describe('HUD nav call sites — which zoomMode each one uses', () => {
+  /**
+   * @description Reads HUD.tsx as text and asserts the zoomMode each nav
+   * entry point passes.
+   *
+   * A source-level check, deliberately: HUD.tsx is a `.tsx` module the
+   * plain-Node suite cannot import (the resolver hook handles `.ts` only,
+   * and there is no React test renderer in this project), so the call
+   * sites cannot be exercised. Re-declaring the expected values in the
+   * test would assert nothing about the real code. Matching the actual
+   * `requestFlyTo(...)` text at least fails loudly if a call site's mode
+   * changes without the decision being revisited.
+   *
+   * What this canNOT catch: a behavioral regression inside
+   * `requestFlyTo` or `FlyToController`. Those are covered by the
+   * `shouldFlyToZoom` policy tests above and the store plumbing tests
+   * below.
+   */
+  const HUD_SRC = readFileSync(
+    path.join(import.meta.dirname, '..', '..', 'components', 'HUD.tsx'),
+    'utf8',
+  )
+
+  it("NEXT ANOMALY passes 'region' — it must not re-zoom (tour button, FOV-dependent candidate set)", () => {
+    // The constant carries the reasoning; the call site must use it.
+    assert.match(
+      HUD_SRC,
+      /export const NEXT_ANOMALY_ZOOM_MODE = 'region'/,
+      'NEXT_ANOMALY_ZOOM_MODE must be region',
+    )
+    assert.match(
+      HUD_SRC,
+      /requestFlyTo\(target\.ra,\s*target\.dec,\s*NEXT_ANOMALY_ZOOM_MODE\)/,
+      'goToNextAnomaly must pass the zoom mode, not fall through to the target default',
+    )
+  })
+
+  it("quadrant panel and minimap keep 'region'", () => {
+    assert.match(HUD_SRC, /requestFlyTo\(ra,\s*dec,\s*'region'\)/, 'quadrant panel')
+    assert.match(
+      HUD_SRC,
+      /requestFlyTo\(targetRa,\s*targetDec,\s*'region'\)/,
+      'minimap',
+    )
+  })
+
+  it("GO TO NEAREST and the flagged list keep the 'target' default (they close in on one star)", () => {
+    assert.match(HUD_SRC, /requestFlyTo\(best\.ra,\s*best\.dec\)/, 'GO TO NEAREST')
+    assert.match(HUD_SRC, /requestFlyTo\(star\.ra,\s*star\.dec\)/, 'flagged list')
+  })
+
+  it('GO TO NEAREST anchors to the SELECTED star, not the camera direction', () => {
+    // Fixed after the TOI 5281.01 report: `cameraTarget` is a pointing
+    // direction, not a star position, and a sky click never moves the
+    // camera — so anchoring there measured from empty sky.
+    assert.match(
+      HUD_SRC,
+      /const origin = selectedStar \?\? cameraTarget/,
+      'anchor must be the selection, with the camera only as a fallback',
+    )
+    assert.match(
+      HUD_SRC,
+      /findNearestAnomalyIndex\(\s*navTargets,\s*origin\.ra,\s*origin\.dec,/,
+      'the search must use the anchored origin',
+    )
+    assert.match(
+      HUD_SRC,
+      /\[selectedStar\?\.id, \.\.\.nearestNavHistoryRef\.current\]/,
+      'reference and exclusion must key off the same source (selectedStar)',
+    )
+    // The replaced camera-positional approach must be fully gone.
+    assert.doesNotMatch(HUD_SRC, /starAtCamera/, 'starAtCamera must no longer be used')
+  })
+
+  it('every requestFlyTo call site in HUD is accounted for by this test', () => {
+    // Guards against a NEW nav entry point being added and silently
+    // inheriting the zoom-easing default the way NEXT did.
+    const calls = HUD_SRC.match(/requestFlyTo\((?!ra: number)/g) ?? []
+    // 5 call sites + the destructure from the store (`requestFlyTo,`) is
+    // not a call, so expect exactly the 5 known ones.
+    assert.equal(
+      calls.length,
+      5,
+      `HUD has ${calls.length} requestFlyTo calls; update this test and decide the new one's zoomMode`,
+    )
   })
 })
 

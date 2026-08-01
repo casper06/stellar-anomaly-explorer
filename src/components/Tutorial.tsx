@@ -223,6 +223,15 @@ const SLIDES: Slide[] = [
           Visited anomalies dim so unexplored ones stand out.
         </p>
         <p style={P}>
+          Two buttons chase different goals.{' '}
+          <Em>GO TO NEAREST ANOMALY</Em>{' '}finds the mathematically closest
+          anomaly to whatever star you have selected, anywhere in the sky —
+          it will fly you across the map if that is where the nearest one
+          is. <Em>NEXT ANOMALY ▸</Em>{' '}stays local: it cycles through
+          anomalies already visible on screen, ranked by NASA&apos;s score,
+          keeping your current zoom rather than closing in on each one.
+        </p>
+        <p style={P}>
           The <Em>constellation name</Em>{' '}in the header (top right) tells
           you where you&apos;re pointed in the real sky.
         </p>
