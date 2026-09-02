@@ -142,12 +142,54 @@ const EXPECTED: Record<string, Expected> = {
   },
   'centroid-TIC25155310': {
     status: 'measured',
-    verdict: 'NO_SIGNIFICANT_OFFSET', // drift pin only — NOT validated (no TESS ground truth)
+    // Drift pin AND — since the 2026-08-01 re-capture — cross-checked
+    // against SPOC's own DV value (0.11″ ± 2.50, a non-detection), which
+    // agrees with this NO_SIGNIFICANT_OFFSET. See tessGroundTruth.test.ts.
+    verdict: 'NO_SIGNIFICANT_OFFSET',
     referenceFrame: 'catalog-wcs',
     quartersUsed: 4,
-    offsetArcsec: 2.352,
-    sigma: 0.74,
+    // Re-frozen 2026-08-01. The values moved (2.352″/0.74σ → 3.715″/1.63σ)
+    // because the re-capture's evenly-spread picker now selects sectors
+    // [6,29,63,93] — MAST has published further sectors since the original
+    // 2026-07-10 capture, so "evenly spread over all available" resolves
+    // differently. Not an algorithm change: status, verdict, reference
+    // frame, segment count and floor are all unchanged, and every Kepler
+    // fixture is bit-identical.
+    offsetArcsec: 3.715,
+    sigma: 1.63,
     floorArcsec: 10.166, // TESS half-pixel (0.5 × |CDELT2| × 3600, sector 6's WCS)
+    nasaAgreementSigmaMax: null,
+  },
+  'centroid-TIC167754523': {
+    status: 'measured',
+    // TOI 409.01 — TFOPWG FALSE POSITIVE, the TESS offset ANCHOR (issue
+    // #27). SPOC's own DV reports 63.78″ ± 2.51 (25.5σ); we measure a
+    // smaller magnitude off a different 4-sector subset but reach the SAME
+    // verdict. Numeric agreement is NOT asserted — see
+    // tessGroundTruth.test.ts for why (different estimator, different
+    // sector set, SPOC's ~2.5″ systematic floor).
+    verdict: 'OFFSET_DETECTED',
+    referenceFrame: 'catalog-wcs',
+    quartersUsed: 4,
+    offsetArcsec: 31.831,
+    sigma: 6.81,
+    floorArcsec: 10.302,
+    nasaAgreementSigmaMax: null,
+  },
+  'centroid-TIC281979481': {
+    status: 'measured',
+    // TOI 274.01 — TFOPWG FALSE POSITIVE whose SPOC offset (14.04″ ±
+    // 2.95, 4.8σ) IS a detection, while we read 6.27″ ± 7.46 (0.8σ),
+    // below the ~9.8″ TESS floor. This fixture therefore pins a REAL
+    // DISAGREEMENT, deliberately: it is the TESS analogue of K01075.01
+    // (a genuine offset our sensitivity cannot resolve), and freezing it
+    // keeps that limitation visible instead of unrecorded.
+    verdict: 'NO_SIGNIFICANT_OFFSET',
+    referenceFrame: 'catalog-wcs',
+    quartersUsed: 4,
+    offsetArcsec: 6.267,
+    sigma: 0.84,
+    floorArcsec: 9.759,
     nasaAgreementSigmaMax: null,
   },
 }

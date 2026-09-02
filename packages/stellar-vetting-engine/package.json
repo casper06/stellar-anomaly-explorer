@@ -32,7 +32,7 @@
     "build": "tsup src/index.ts --format esm,cjs --dts --platform node --target node18 --clean",
     "test": "npm run test:unit && npm run test:data",
     "test:unit": "node --import ./scripts/register-ts-resolver.mjs --test tests/*.unit.test.ts",
-    "test:data": "node --import ./scripts/register-ts-resolver.mjs tests/dataRegression.test.ts && node --import ./scripts/register-ts-resolver.mjs tests/centroidRegression.test.ts"
+    "test:data": "node --import ./scripts/register-ts-resolver.mjs tests/dataRegression.test.ts && node --import ./scripts/register-ts-resolver.mjs tests/centroidRegression.test.ts && node --import ./scripts/register-ts-resolver.mjs tests/tessGroundTruth.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20",
