@@ -164,6 +164,15 @@ const SLIDES: Slide[] = [
           counters answer &quot;how many stars have a documented candidate
           worth investigating?&quot;, not &quot;how many stars exist here?&quot;.
         </p>
+        <p style={P}>
+          Both catalogs are filtered to objects still considered{' '}
+          <Em>viable candidates</Em>. Entries the archives have since ruled
+          out — false positives, false alarms, eclipsing binaries — are
+          excluded from the counters <Em>and from search</Em>. So a specific
+          KOI or TOI number you look up from an external source may simply
+          not be here, and that absence is itself the archive&apos;s verdict,
+          not a gap in the data.
+        </p>
       </>
     ),
   },
