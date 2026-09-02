@@ -79,8 +79,8 @@ export const KNOWN_ANOMALIES: CatalogStar[] = [
   {
     id: 'EPIC201637175',
     name: 'EPIC 201637175',
-    ra: 174.32,
-    dec: -4.67,
+    ra: 169.4827,
+    dec: 2.6190,
     magnitude: 12.1,
     colorIndex: 0.55,
     hasAnomaly: true,
